@@ -139,13 +139,18 @@ contains
 
     allocate(divv_arr(n), grad_t_arr(n, 3), grad_s_arr(n, 3), valid_arr(n), candidate(n))
 
+    !$omp parallel do schedule(static) private(i)
     do i = 1, n
       call local_quantities(pos, vel, dx, temp, rho, neighbors, n, gamma, i, &
            divv_arr(i), grad_t_arr(i, :), grad_s_arr(i, :), valid_arr(i))
       candidate(i) = valid_arr(i) .and. divv_arr(i) < 0.0_dp .and. &
            dot_product(grad_t_arr(i, :), grad_s_arr(i, :)) > 0.0_dp
     end do
+    !$omp end parallel do
 
+    !$omp parallel do schedule(dynamic, 256) private(i, face, nb, axis, direction, step_count, &
+    !$omp& center, trial, upstream, downstream, best_divv, grad_t, t_pre, t_post, &
+    !$omp& rho_pre, rho_post, ratio, m)
     do i = 1, n
       if (.not. candidate(i)) cycle
 
@@ -201,14 +206,18 @@ contains
       ratio = t_post / t_pre
       m = mach_from_temperature_jump(ratio)
       if (m < min_mach) cycle
-      if (m <= mach(center)) cycle
 
-      mach(center) = m
-      shock(center) = 1
-      center_index(center) = center
-      upstream_index(center) = upstream
-      downstream_index(center) = downstream
+      !$omp critical(shock_update)
+      if (m > mach(center)) then
+        mach(center) = m
+        shock(center) = 1
+        center_index(center) = center
+        upstream_index(center) = upstream
+        downstream_index(center) = downstream
+      end if
+      !$omp end critical(shock_update)
     end do
+    !$omp end parallel do
 
     deallocate(divv_arr, grad_t_arr, grad_s_arr, valid_arr, candidate)
   end subroutine find_shocks

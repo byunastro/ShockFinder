@@ -14,6 +14,25 @@ The command writes the compiled extension into `shocktest/`. Run it with the
 same Python environment that will import `shocktest`; compiled NumPy/f2py
 extensions are Python-version specific.
 
+For large datasets, build with OpenMP:
+
+```bash
+cd shocktest
+python3 -m numpy.f2py -c fortran/shockfinder.f90 -m _shockfinder \
+  --f90flags="-O3 -fopenmp" --opt="-O3 -fopenmp" -lgomp
+```
+
+At runtime, set the number of threads before starting Python:
+
+```bash
+export OMP_NUM_THREADS=40
+export OMP_PROC_BIND=spread
+export OMP_PLACES=cores
+```
+
+If the OpenMP build fails on a particular compiler stack, the non-OpenMP build
+above still works; it is just single-threaded in the Fortran shock scan.
+
 The package supports NumPy 1.26 or later.
 
 ## Use
