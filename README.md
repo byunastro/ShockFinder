@@ -103,3 +103,25 @@ filter.
 
 Neighbor links are built from AMR cell centers and widths. Same-level face
 neighbors are preferred; if absent, a same-or-coarser AMR neighbor is used.
+
+## Shock Dissipation Map
+
+```python
+from examples.plot_shock_dissipation import compute_dissipation, plot_dissipation_and_mach
+
+diss = compute_dissipation(cell, result, mu=0.59)
+plot_dissipation_and_mach(
+    cell,
+    result,
+    diss,
+    plane="xy",
+    min_mach=1.0,
+    log_ediss_range=(37, 42),
+    log_mach_range=(0.3, 1.7),
+    output="shock_dissipation_mach.png",
+)
+```
+
+The left panel shows `log10(E_diss/A)` in `erg s^-1 kpc^-2`, using
+`E_diss/A = 0.5 rho_1 (M c_s,1)^3 delta(M)`. The right panel shows
+`log10(Mach)`.
