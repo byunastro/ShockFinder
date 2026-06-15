@@ -126,9 +126,10 @@ contains
 
     integer :: i, face, nb, axis, direction, step_count
     integer :: center, trial, upstream, downstream
-    real(8) :: divv, nb_divv, best_divv, grad_t(3), grad_s(3), nb_grad_t(3), nb_grad_s(3)
+    real(8) :: best_divv, grad_t(3)
     real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m
-    logical :: valid, nb_valid
+    real(8), allocatable :: divv_arr(:), grad_t_arr(:, :), grad_s_arr(:, :)
+    logical, allocatable :: valid_arr(:), candidate(:)
 
     mach = 0.0_dp
     shock = 0
@@ -136,27 +137,28 @@ contains
     upstream_index = 0
     downstream_index = 0
 
-    do i = 1, n
-      if (.not. cell_is_candidate(pos, vel, dx, temp, rho, neighbors, n, gamma, i)) cycle
+    allocate(divv_arr(n), grad_t_arr(n, 3), grad_s_arr(n, 3), valid_arr(n), candidate(n))
 
+    do i = 1, n
       call local_quantities(pos, vel, dx, temp, rho, neighbors, n, gamma, i, &
-           divv, grad_t, grad_s, valid)
-      if (.not. valid) cycle
+           divv_arr(i), grad_t_arr(i, :), grad_s_arr(i, :), valid_arr(i))
+      candidate(i) = valid_arr(i) .and. divv_arr(i) < 0.0_dp .and. &
+           dot_product(grad_t_arr(i, :), grad_s_arr(i, :)) > 0.0_dp
+    end do
+
+    do i = 1, n
+      if (.not. candidate(i)) cycle
 
       center = i
-      best_divv = divv
+      best_divv = divv_arr(i)
+      grad_t = grad_t_arr(i, :)
       do face = 1, 6
         nb = neighbors(i, face)
         if (nb <= 0) cycle
-        call local_quantities(pos, vel, dx, temp, rho, neighbors, n, gamma, nb, &
-             nb_divv, nb_grad_t, nb_grad_s, nb_valid)
-        if (.not. nb_valid) cycle
-        if (nb_divv < best_divv .and. &
-             cell_is_candidate(pos, vel, dx, temp, rho, neighbors, n, gamma, nb)) then
+        if (candidate(nb) .and. divv_arr(nb) < best_divv) then
           center = nb
-          best_divv = nb_divv
-          grad_t = nb_grad_t
-          grad_s = nb_grad_s
+          best_divv = divv_arr(nb)
+          grad_t = grad_t_arr(nb, :)
         end if
       end do
 
@@ -172,7 +174,7 @@ contains
       do step_count = 1, max_steps
         trial = neighbors(upstream, face_for_step(axis, -direction))
         if (trial <= 0) exit
-        if (.not. cell_is_candidate(pos, vel, dx, temp, rho, neighbors, n, gamma, trial)) exit
+        if (.not. candidate(trial)) exit
         upstream = trial
       end do
       upstream = neighbors(upstream, face_for_step(axis, -direction))
@@ -182,7 +184,7 @@ contains
       do step_count = 1, max_steps
         trial = neighbors(downstream, face_for_step(axis, direction))
         if (trial <= 0) exit
-        if (.not. cell_is_candidate(pos, vel, dx, temp, rho, neighbors, n, gamma, trial)) exit
+        if (.not. candidate(trial)) exit
         downstream = trial
       end do
       downstream = neighbors(downstream, face_for_step(axis, direction))
@@ -207,6 +209,8 @@ contains
       upstream_index(center) = upstream
       downstream_index(center) = downstream
     end do
+
+    deallocate(divv_arr, grad_t_arr, grad_s_arr, valid_arr, candidate)
   end subroutine find_shocks
 
 end module shockfinder_kernel

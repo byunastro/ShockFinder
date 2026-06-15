@@ -192,7 +192,6 @@ class ShockFinder:
         lo = ShockFinder._quantize((pos - dx[:, None] * 0.5 - origin) / finest_dx)
         hi = ShockFinder._quantize((pos + dx[:, None] * 0.5 - origin) / finest_dx)
         widths = hi - lo
-        centers = 0.5 * (lo + hi)
 
         if np.any(widths <= 0):
             raise ValueError("cell boxes collapsed during AMR quantization")
@@ -200,40 +199,59 @@ class ShockFinder:
             raise ValueError("AMR cells must be cubic")
 
         same_level: dict[tuple[int, int, int, int], int] = {}
-        cells_by_level: dict[int, list[int]] = {}
+        boxes_by_width: dict[int, dict[tuple[int, int, int], int]] = {}
         for idx in range(n):
             key = (int(level[idx]), int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
             same_level[key] = idx
-            cells_by_level.setdefault(int(level[idx]), []).append(idx)
+            width = int(widths[idx, 0])
+            box_key = (int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
+            boxes_by_width.setdefault(width, {})[box_key] = idx
 
-        lower_levels = sorted(cells_by_level)
+        coarser_widths = sorted(boxes_by_width, reverse=True)
         for idx in range(n):
             width = int(widths[idx, 0])
+            center0 = 0.5 * (lo[idx, 0] + hi[idx, 0])
+            center1 = 0.5 * (lo[idx, 1] + hi[idx, 1])
+            center2 = 0.5 * (lo[idx, 2] + hi[idx, 2])
             for axis in range(3):
                 for direction, face_offset in ((-1, 0), (1, 1)):
                     face = axis * 2 + face_offset
-                    shifted_lo = lo[idx].copy()
-                    shifted_lo[axis] += direction * width
+                    shifted0 = int(lo[idx, 0])
+                    shifted1 = int(lo[idx, 1])
+                    shifted2 = int(lo[idx, 2])
+                    if axis == 0:
+                        shifted0 += direction * width
+                    elif axis == 1:
+                        shifted1 += direction * width
+                    else:
+                        shifted2 += direction * width
                     key = (
                         int(level[idx]),
-                        int(shifted_lo[0]),
-                        int(shifted_lo[1]),
-                        int(shifted_lo[2]),
+                        shifted0,
+                        shifted1,
+                        shifted2,
                     )
                     same = same_level.get(key)
                     if same is not None and np.all(widths[same] == widths[idx]):
                         neighbors[idx, face] = same + 1
                         continue
 
-                    sample = centers[idx].copy()
-                    sample[axis] += direction * (width * 0.5 + 0.25)
+                    sample0 = center0
+                    sample1 = center1
+                    sample2 = center2
+                    if axis == 0:
+                        sample0 += direction * (width * 0.5 + 0.25)
+                    elif axis == 1:
+                        sample1 += direction * (width * 0.5 + 0.25)
+                    else:
+                        sample2 += direction * (width * 0.5 + 0.25)
                     lower = ShockFinder._find_lower_level_neighbor(
-                        sample,
-                        int(level[idx]),
-                        lo,
-                        hi,
-                        lower_levels,
-                        cells_by_level,
+                        sample0,
+                        sample1,
+                        sample2,
+                        width,
+                        coarser_widths,
+                        boxes_by_width,
                     )
                     if lower >= 0:
                         neighbors[idx, face] = lower + 1
@@ -242,19 +260,24 @@ class ShockFinder:
 
     @staticmethod
     def _find_lower_level_neighbor(
-        sample: np.ndarray,
-        current_level: int,
-        lo: np.ndarray,
-        hi: np.ndarray,
-        levels: list[int],
-        cells_by_level: dict[int, list[int]],
+        sample0: float,
+        sample1: float,
+        sample2: float,
+        current_width: int,
+        coarser_widths: list[int],
+        boxes_by_width: dict[int, dict[tuple[int, int, int], int]],
     ) -> int:
-        for candidate_level in levels:
-            if candidate_level >= current_level:
+        for width in coarser_widths:
+            if width <= current_width:
                 continue
-            for idx in cells_by_level[candidate_level]:
-                if np.all(sample >= lo[idx]) and np.all(sample < hi[idx]):
-                    return idx
+            key = (
+                int(np.floor(sample0 / width)) * width,
+                int(np.floor(sample1 / width)) * width,
+                int(np.floor(sample2 / width)) * width,
+            )
+            idx = boxes_by_width[width].get(key)
+            if idx is not None:
+                return idx
         return -1
 
     @staticmethod
