@@ -1,4 +1,5 @@
 module shockfinder_kernel
+  use iso_fortran_env, only: output_unit
   implicit none
   integer, parameter :: dp = kind(1.0d0)
   private
@@ -112,20 +113,21 @@ contains
   end function dominant_axis
 
   subroutine find_shocks(pos, vel, dx, temp, rho, level, neighbors, n, gamma, &
-       temp_floor, min_mach, max_steps, mach, shock, center_index, upstream_index, &
-       downstream_index)
+       temp_floor, min_mach, max_steps, show_progress, progress_interval, mach, &
+       shock, center_index, upstream_index, downstream_index)
     !f2py intent(in) pos, vel, dx, temp, rho, level, neighbors, n
-    !f2py intent(in) gamma, temp_floor, min_mach, max_steps
+    !f2py intent(in) gamma, temp_floor, min_mach, max_steps, show_progress, progress_interval
     !f2py intent(out) mach, shock, center_index, upstream_index, downstream_index
-    integer, intent(in) :: n, max_steps
+    integer, intent(in) :: n, max_steps, show_progress, progress_interval
     integer, intent(in) :: level(n), neighbors(n, 6)
     real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
     real(8), intent(in) :: gamma, temp_floor, min_mach
     real(8), intent(out) :: mach(n)
     integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
 
-    integer :: i, face, nb, axis, direction, step_count
+    integer :: i, face, nb, axis, direction, step_count, done
     integer :: center, trial, upstream, downstream
+    integer :: progress_count, next_progress
     real(8) :: best_divv, grad_t(3)
     real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m
     real(8), allocatable :: divv_arr(:), grad_t_arr(:, :), grad_s_arr(:, :)
@@ -139,19 +141,69 @@ contains
 
     allocate(divv_arr(n), grad_t_arr(n, 3), grad_s_arr(n, 3), valid_arr(n), candidate(n))
 
-    !$omp parallel do schedule(static) private(i)
+    ! Precompute all local shock diagnostics once. This loop is independent for
+    ! each AMR cell and is therefore a good OpenMP target.
+    progress_count = 0
+    next_progress = progress_interval
+
+    !$omp parallel do schedule(static) private(i, done)
     do i = 1, n
       call local_quantities(pos, vel, dx, temp, rho, neighbors, n, gamma, i, &
            divv_arr(i), grad_t_arr(i, :), grad_s_arr(i, :), valid_arr(i))
       candidate(i) = valid_arr(i) .and. divv_arr(i) < 0.0_dp .and. &
            dot_product(grad_t_arr(i, :), grad_s_arr(i, :)) > 0.0_dp
+      if (show_progress /= 0 .and. progress_interval > 0) then
+        !$omp atomic capture
+        progress_count = progress_count + 1
+        done = progress_count
+        !$omp end atomic
+        if (done >= next_progress) then
+          !$omp critical(progress_write)
+          if (done >= next_progress) then
+            write(output_unit, '(A,I0,A,I0,A,F5.1,A)') "ShockFinder Fortran precompute: ", &
+                 done, "/", n, " (", 100.0_dp * real(done, 8) / real(max(n, 1), 8), "%)"
+            flush(output_unit)
+            do while (next_progress <= done)
+              next_progress = next_progress + progress_interval
+            end do
+          end if
+          !$omp end critical(progress_write)
+        end if
+      end if
     end do
     !$omp end parallel do
+    if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, progress_interval) /= 0)) then
+      write(output_unit, '(A,I0,A,I0,A)') "ShockFinder Fortran precompute: ", n, "/", n, " (100.0%)"
+      flush(output_unit)
+    end if
+
+    ! Candidate cells are independent except when several cells choose the same
+    ! maximum-convergence center. The small critical section protects that write.
+    progress_count = 0
+    next_progress = progress_interval
 
     !$omp parallel do schedule(dynamic, 256) private(i, face, nb, axis, direction, step_count, &
     !$omp& center, trial, upstream, downstream, best_divv, grad_t, t_pre, t_post, &
-    !$omp& rho_pre, rho_post, ratio, m)
+    !$omp& rho_pre, rho_post, ratio, m, done)
     do i = 1, n
+      if (show_progress /= 0 .and. progress_interval > 0) then
+        !$omp atomic capture
+        progress_count = progress_count + 1
+        done = progress_count
+        !$omp end atomic
+        if (done >= next_progress) then
+          !$omp critical(progress_write)
+          if (done >= next_progress) then
+            write(output_unit, '(A,I0,A,I0,A,F5.1,A)') "ShockFinder Fortran scan: ", &
+                 done, "/", n, " (", 100.0_dp * real(done, 8) / real(max(n, 1), 8), "%)"
+            flush(output_unit)
+            do while (next_progress <= done)
+              next_progress = next_progress + progress_interval
+            end do
+          end if
+          !$omp end critical(progress_write)
+        end if
+      end if
       if (.not. candidate(i)) cycle
 
       center = i
@@ -218,6 +270,10 @@ contains
       !$omp end critical(shock_update)
     end do
     !$omp end parallel do
+    if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, progress_interval) /= 0)) then
+      write(output_unit, '(A,I0,A,I0,A)') "ShockFinder Fortran scan: ", n, "/", n, " (100.0%)"
+      flush(output_unit)
+    end if
 
     deallocate(divv_arr, grad_t_arr, grad_s_arr, valid_arr, candidate)
   end subroutine find_shocks

@@ -43,12 +43,19 @@ import shocktest
 finder = shocktest.ShockFinder()
 finder.maxlevel = 20
 finder.minlevel = 13
+finder.show_progress = True
+finder.progress_interval = 0
 
 result = finder.ShockFinder(cell)
 
 mach = result.mach
 shock_mask = result.shock
 ```
+
+`show_progress=True` prints progress while fields are loaded, AMR neighbors are
+built, and the Fortran shock scan is running. `progress_interval=0` chooses an
+automatic interval of about 5%; set it to an integer number of retained cells if
+you want finer or coarser updates.
 
 These call styles are equivalent:
 

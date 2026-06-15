@@ -40,6 +40,8 @@ class ShockFinder:
         self.velocity_unit = "km/s"
         self.temperature_unit = "K"
         self.density_unit = "Msol/kpc3"
+        self.show_progress = False
+        self.progress_interval = 0
 
     def __call__(self, cell: Any) -> ShockResult:
         return self.find(cell)
@@ -56,11 +58,22 @@ class ShockFinder:
                 "-m _shockfinder` from the project root."
             ) from _IMPORT_ERROR
 
+        self._progress("ShockFinder: reading AMR cell fields")
         arrays = self._extract_amr_arrays(cell)
         selected_indices = arrays.pop("selected_indices")
-        neighbors = self._build_neighbors(arrays["pos"], arrays["dx"], arrays["level"])
-
         n = arrays["temp"].size
+        self._progress(f"ShockFinder: retained {n:,} cells after level filtering")
+
+        interval = self._resolved_progress_interval(n)
+        self._progress("ShockFinder: building AMR face-neighbor table")
+        neighbors = self._build_neighbors(
+            arrays["pos"],
+            arrays["dx"],
+            arrays["level"],
+            show_progress=self.show_progress,
+            progress_interval=interval,
+        )
+
         if n == 0:
             empty_float = np.empty(0, dtype=np.float64)
             empty_bool = np.empty(0, dtype=bool)
@@ -74,6 +87,7 @@ class ShockFinder:
                 selected_indices=selected_indices,
             )
 
+        self._progress("ShockFinder: running Fortran shock scan")
         mach, shock, center, upstream, downstream = _shockfinder.shockfinder_kernel.find_shocks(
             arrays["pos"],
             arrays["vel"],
@@ -86,8 +100,11 @@ class ShockFinder:
             float(self.temperature_floor),
             float(self.min_mach),
             int(self.max_steps),
+            int(bool(self.show_progress)),
+            int(interval),
             n,
         )
+        self._progress("ShockFinder: done")
 
         return ShockResult(
             mach=np.asarray(mach, dtype=np.float64),
@@ -128,9 +145,13 @@ class ShockFinder:
             if values.size != n:
                 raise ValueError(f"{name} has length {values.size}, expected {n}")
 
+        # Keep only the AMR refinement levels requested by the caller. Geometry
+        # still comes from dx, not from this level filter.
         mask = (level >= int(self.minlevel)) & (level <= int(self.maxlevel))
         selected_indices = np.nonzero(mask)[0].astype(np.int64)
 
+        # f2py passes Fortran-contiguous arrays to the compiled kernel without
+        # needing extra copies.
         pos = np.asfortranarray(np.column_stack((x[mask], y[mask], z[mask])), dtype=np.float64)
         vel = np.asfortranarray(np.column_stack((vx[mask], vy[mask], vz[mask])), dtype=np.float64)
         return {
@@ -178,7 +199,14 @@ class ShockFinder:
             raise
 
     @staticmethod
-    def _build_neighbors(pos: np.ndarray, dx: np.ndarray, level: np.ndarray) -> np.ndarray:
+    def _build_neighbors(
+        pos: np.ndarray,
+        dx: np.ndarray,
+        level: np.ndarray,
+        *,
+        show_progress: bool = False,
+        progress_interval: int = 0,
+    ) -> np.ndarray:
         n = dx.size
         neighbors = np.zeros((n, 6), dtype=np.int32, order="F")
         if n == 0:
@@ -189,6 +217,10 @@ class ShockFinder:
 
         finest_dx = float(np.min(dx))
         origin = np.min(pos - dx[:, None] * 0.5, axis=0)
+
+        # Convert floating-point AMR boxes into integer boxes measured in units
+        # of the finest retained cell width. This makes neighbor lookup exact
+        # enough for AMR grids while avoiding repeated floating comparisons.
         lo = ShockFinder._quantize((pos - dx[:, None] * 0.5 - origin) / finest_dx)
         hi = ShockFinder._quantize((pos + dx[:, None] * 0.5 - origin) / finest_dx)
         widths = hi - lo
@@ -201,14 +233,21 @@ class ShockFinder:
         same_level: dict[tuple[int, int, int, int], int] = {}
         boxes_by_width: dict[int, dict[tuple[int, int, int], int]] = {}
         for idx in range(n):
+            if show_progress and progress_interval > 0 and idx % progress_interval == 0:
+                ShockFinder._print_progress("ShockFinder: indexing AMR boxes", idx, n)
             key = (int(level[idx]), int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
             same_level[key] = idx
             width = int(widths[idx, 0])
             box_key = (int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
             boxes_by_width.setdefault(width, {})[box_key] = idx
 
+        if show_progress:
+            ShockFinder._print_progress("ShockFinder: indexing AMR boxes", n, n)
+
         coarser_widths = sorted(boxes_by_width, reverse=True)
         for idx in range(n):
+            if show_progress and progress_interval > 0 and idx % progress_interval == 0:
+                ShockFinder._print_progress("ShockFinder: linking AMR neighbors", idx, n)
             width = int(widths[idx, 0])
             center0 = 0.5 * (lo[idx, 0] + hi[idx, 0])
             center1 = 0.5 * (lo[idx, 1] + hi[idx, 1])
@@ -236,6 +275,8 @@ class ShockFinder:
                         neighbors[idx, face] = same + 1
                         continue
 
+                    # If a same-level neighbor is absent, sample just outside
+                    # the face and find the coarser AMR box containing it.
                     sample0 = center0
                     sample1 = center1
                     sample2 = center2
@@ -255,6 +296,9 @@ class ShockFinder:
                     )
                     if lower >= 0:
                         neighbors[idx, face] = lower + 1
+
+        if show_progress:
+            ShockFinder._print_progress("ShockFinder: linking AMR neighbors", n, n)
 
         return neighbors
 
@@ -283,3 +327,17 @@ class ShockFinder:
     @staticmethod
     def _quantize(values: np.ndarray) -> np.ndarray:
         return np.floor(values + 0.5).astype(np.int64)
+
+    def _resolved_progress_interval(self, n: int) -> int:
+        if self.progress_interval and self.progress_interval > 0:
+            return int(self.progress_interval)
+        return max(1, n // 20)
+
+    def _progress(self, message: str) -> None:
+        if self.show_progress:
+            print(message, flush=True)
+
+    @staticmethod
+    def _print_progress(label: str, done: int, total: int) -> None:
+        percent = 100.0 if total <= 0 else 100.0 * done / total
+        print(f"{label}: {done:,}/{total:,} ({percent:5.1f}%)", flush=True)
