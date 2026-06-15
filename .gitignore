@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.o
+*.mod
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+build/
+dist/
+*.egg-info/
+
+.DS_Store

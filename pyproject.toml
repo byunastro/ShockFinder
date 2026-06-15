@@ -1,0 +1,13 @@
+[build-system]
+requires = ["numpy>=1.26", "setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shocktest"
+version = "0.1.0"
+description = "Fortran-backed shock finder based on Skillman et al. 2008."
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26"]
+
+[tool.setuptools]
+packages = ["shocktest"]
