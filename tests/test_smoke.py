@@ -106,3 +106,17 @@ def test_missing_tuple_field_raises_clear_error():
 
     with pytest.raises(KeyError, match="missing required field"):
         finder.find(cell)
+
+
+def test_shock_result_clear_releases_arrays():
+    finder = shocktest.ShockFinder()
+    result = finder.ShockFinder(line_cell())
+
+    result.clear()
+    finder.clear()
+
+    assert result.mach.size == 0
+    assert result.shock.size == 0
+    assert result.selected_indices.size == 0
+    assert result.pos is None
+    assert result.dx is None

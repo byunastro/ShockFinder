@@ -50,6 +50,9 @@ result = finder.ShockFinder(cell)
 
 mach = result.mach
 shock_mask = result.shock
+
+# Free arrays explicitly when running many large regions in one process.
+result.clear()
 ```
 
 `show_progress=True` prints progress while fields are loaded, AMR neighbors are
@@ -151,6 +154,9 @@ machimg = painter.rgb_image(machmap, cmap="RdYlBu_r", log=True, vmin=0.3, vmax=1
 
 fig, ax = plt.subplots()
 ax.imshow(dissimg, origin="lower", extent=maps.extent)
+
+# Clears machmap, disspEmap, and nested result/dissipation arrays.
+maps.clear()
 ```
 
 For a ready-made two-panel figure:
@@ -166,7 +172,7 @@ painter.plot_shock_maps(
 )
 ```
 
-`make_mach_map` and `make_disspE_map` default to `method="area"`, which paints
+`make_mach_map` and `make_disspE_map` default to `method="amr"`, which paints
 each projected AMR shock-cell footprint into the image. This is better for
 figure-quality AMR maps than point-binning the cell centers. Use
 `method="point"` to recover the older center-binned behavior.

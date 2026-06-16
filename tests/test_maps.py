@@ -84,3 +84,20 @@ def test_area_sum_scales_by_pixel_coverage():
     area_map = painter._paint_cells_to_map(x, y, dx, values, bins=(1, 1), extent=(0.0, 1.0, 0.0, 1.0), statistic="sum")
 
     np.testing.assert_allclose(area_map, np.array([[2.0]]))
+
+
+def test_shock_map_result_clear_releases_nested_arrays():
+    maps = pyShockFinder.make_shock_maps(
+        grid_cell(),
+        minlevel=13,
+        maxlevel=20,
+        bins=(8, 8),
+        show_progress=False,
+    )
+
+    maps.clear()
+
+    assert maps.machmap.shape == (0, 0)
+    assert maps.disspEmap.shape == (0, 0)
+    assert maps.result is None
+    assert maps.dissipation is None

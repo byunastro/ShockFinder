@@ -22,13 +22,13 @@ def make_mach_map(
     z_width: float | None = None,
     min_mach: float = 1.0,
     statistic: Statistic = "max",
-    method: Literal["area", "point"] = "area",
+    method: Literal["amr", "point"] = "amr",
 ):
     """Make a regular 2D Mach map from a ``ShockResult``.
 
     This supports the workflow:
     ``machmap = painter.make_mach_map(result, plane="xy")``.
-    The default ``method="area"`` paints each projected AMR cell footprint into
+    The default ``method="amr"`` paints each projected AMR cell footprint into
     the image. ``method="point"`` keeps the older center-binning behavior.
     Empty pixels are returned as NaN.
     """
@@ -54,13 +54,13 @@ def make_disspE_map(
     z_width: float | None = None,
     min_mach: float = 1.0,
     statistic: Statistic = "max",
-    method: Literal["area", "point"] = "area",
+    method: Literal["amr", "point"] = "amr",
 ):
     """Make a regular 2D dissipation-flux map from a ``ShockResult``.
 
     The returned map is E_diss/A in ``erg s^-1 kpc^-2`` when ``dissipation`` is
     produced by ``pyShockFinder.compute_dissipation``. The default
-    ``method="area"`` paints each projected AMR shock-cell footprint into the
+    ``method="amr"`` paints each projected AMR shock-cell footprint into the
     image. ``method="point"`` keeps the older center-binning behavior.
     """
 
@@ -286,12 +286,12 @@ def _bin_shape(bins: int | tuple[int, int]):
     return int(bins[0]), int(bins[1])
 
 
-def _values_to_map(x, y, dx, values, bins, extent, statistic: Statistic, method: Literal["area", "point"]):
+def _values_to_map(x, y, dx, values, bins, extent, statistic: Statistic, method: Literal["amr", "point"]):
     if method == "point":
         return _bin_to_map(x, y, values, bins, extent, statistic)
-    if method == "area":
+    if method == "amr":
         return _paint_cells_to_map(x, y, dx, values, bins, extent, statistic)
-    raise ValueError("method must be one of: area, point")
+    raise ValueError("method must be one of: amr, point")
 
 
 def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,6 +23,16 @@ class DissipationResult:
     efficiency: np.ndarray
     sound_speed: np.ndarray
 
+    def clear(self) -> None:
+        """Release arrays held by this dissipation result."""
+
+        empty = np.empty(0, dtype=np.float64)
+        self.flux = empty
+        self.total = empty.copy()
+        self.efficiency = empty.copy()
+        self.sound_speed = empty.copy()
+        gc.collect()
+
 
 @dataclass(slots=True)
 class ShockMapResult:
@@ -30,8 +41,23 @@ class ShockMapResult:
     machmap: np.ndarray
     disspEmap: np.ndarray
     extent: tuple[float, float, float, float]
-    result: shocktest.ShockResult
-    dissipation: DissipationResult
+    result: shocktest.ShockResult | None
+    dissipation: DissipationResult | None
+
+    def clear(self) -> None:
+        """Release map arrays and nested shock/dissipation results."""
+
+        empty = np.empty((0, 0), dtype=np.float64)
+        self.machmap = empty
+        self.disspEmap = empty.copy()
+        self.extent = (0.0, 0.0, 0.0, 0.0)
+        if self.result is not None:
+            self.result.clear()
+            self.result = None
+        if self.dissipation is not None:
+            self.dissipation.clear()
+            self.dissipation = None
+        gc.collect()
 
 
 def compute_shock_result(
@@ -126,7 +152,7 @@ def make_shock_maps(
     z_width: float | None = None,
     min_mach: float = 1.0,
     statistic="max",
-    method="area",
+    method="amr",
     show_progress: bool = True,
     progress_interval: int = 0,
     gamma: float = 5.0 / 3.0,

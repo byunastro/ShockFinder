@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -27,6 +28,22 @@ class ShockResult:
     pos: np.ndarray | None = None
     dx: np.ndarray | None = None
 
+    def clear(self) -> None:
+        """Release arrays held by this result object."""
+
+        empty_float = np.empty(0, dtype=np.float64)
+        empty_bool = np.empty(0, dtype=bool)
+        empty_index = np.empty(0, dtype=np.int64)
+        self.mach = empty_float
+        self.shock = empty_bool
+        self.center_index = empty_index
+        self.upstream_index = empty_index.copy()
+        self.downstream_index = empty_index.copy()
+        self.selected_indices = empty_index.copy()
+        self.pos = None
+        self.dx = None
+        gc.collect()
+
 
 class ShockFinder:
     """Fortran-backed AMR shock finder based on Skillman et al. 2008."""
@@ -51,6 +68,16 @@ class ShockFinder:
     def ShockFinder(self, cell: Any) -> ShockResult:
         """Compatibility alias matching the requested example style."""
         return self.find(cell)
+
+    def clear(self) -> None:
+        """Compatibility cleanup hook.
+
+        ``ShockFinder`` does not keep large AMR arrays after each run; those are
+        owned by the returned ``ShockResult``. Call ``result.clear()`` to release
+        result arrays explicitly.
+        """
+
+        gc.collect()
 
     def find(self, cell: Any) -> ShockResult:
         if _shockfinder is None:
