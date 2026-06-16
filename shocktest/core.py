@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -138,6 +139,10 @@ class ShockFinder:
         )
         self._progress("ShockFinder: done")
 
+        result_pos = arrays["pos"]
+        result_dx = arrays["dx"]
+        del arrays, neighbors, fine_neighbors
+
         return ShockResult(
             mach=np.asarray(mach, dtype=np.float64),
             shock=np.asarray(shock, dtype=np.int32).astype(bool),
@@ -145,8 +150,8 @@ class ShockFinder:
             upstream_index=self._to_python_indices(upstream),
             downstream_index=self._to_python_indices(downstream),
             selected_indices=selected_indices,
-            pos=np.asarray(arrays["pos"], dtype=np.float64),
-            dx=np.asarray(arrays["dx"], dtype=np.float64),
+            pos=result_pos,
+            dx=result_dx,
         )
 
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:
@@ -182,19 +187,28 @@ class ShockFinder:
         # Keep only the AMR refinement levels requested by the caller. Geometry
         # still comes from dx, not from this level filter.
         mask = (level >= int(self.minlevel)) & (level <= int(self.maxlevel))
-        selected_indices = np.nonzero(mask)[0].astype(np.int64)
+        selected_indices = np.nonzero(mask)[0].astype(np.int64, copy=False)
+        del mask
 
         # f2py passes Fortran-contiguous arrays to the compiled kernel without
-        # needing extra copies.
-        pos = np.asfortranarray(np.column_stack((x[mask], y[mask], z[mask])), dtype=np.float64)
-        vel = np.asfortranarray(np.column_stack((vx[mask], vy[mask], vz[mask])), dtype=np.float64)
+        # needing extra copies. Fill the columns directly to avoid the
+        # additional dense temporary made by column_stack.
+        n_selected = selected_indices.size
+        pos = np.empty((n_selected, 3), dtype=np.float64, order="F")
+        vel = np.empty((n_selected, 3), dtype=np.float64, order="F")
+        pos[:, 0] = x[selected_indices]
+        pos[:, 1] = y[selected_indices]
+        pos[:, 2] = z[selected_indices]
+        vel[:, 0] = vx[selected_indices]
+        vel[:, 1] = vy[selected_indices]
+        vel[:, 2] = vz[selected_indices]
         return {
             "pos": pos,
             "vel": vel,
-            "dx": np.asfortranarray(dx[mask], dtype=np.float64),
-            "temp": np.asfortranarray(temp[mask], dtype=np.float64),
-            "rho": np.asfortranarray(rho[mask], dtype=np.float64),
-            "level": np.asfortranarray(level[mask], dtype=np.int32),
+            "dx": np.asfortranarray(dx[selected_indices], dtype=np.float64),
+            "temp": np.asfortranarray(temp[selected_indices], dtype=np.float64),
+            "rho": np.asfortranarray(rho[selected_indices], dtype=np.float64),
+            "level": np.asfortranarray(level[selected_indices], dtype=np.int32),
             "selected_indices": selected_indices,
         }
 
@@ -269,42 +283,57 @@ class ShockFinder:
             raise ValueError("dx must be positive for every retained cell")
 
         finest_dx = float(np.min(dx))
-        origin = np.min(pos - dx[:, None] * 0.5, axis=0)
+        half_dx = 0.5 * dx
+        box_work = np.empty(pos.shape, dtype=np.float64)
+        np.subtract(pos, half_dx[:, None], out=box_work)
+        origin = np.min(box_work, axis=0)
 
         # Convert floating-point AMR boxes into integer boxes measured in units
         # of the finest retained cell width. This makes neighbor lookup exact
         # enough for AMR grids while avoiding repeated floating comparisons.
-        lo = ShockFinder._quantize((pos - dx[:, None] * 0.5 - origin) / finest_dx)
-        hi = ShockFinder._quantize((pos + dx[:, None] * 0.5 - origin) / finest_dx)
+        box_work -= origin
+        box_work /= finest_dx
+        lo = ShockFinder._quantize_inplace(box_work)
+
+        np.add(pos, half_dx[:, None], out=box_work)
+        box_work -= origin
+        box_work /= finest_dx
+        hi = ShockFinder._quantize_inplace(box_work)
+        del box_work, half_dx
+
         widths = hi - lo
+        cell_width = widths[:, 0].copy()
 
         if np.any(widths <= 0):
             raise ValueError("cell boxes collapsed during AMR quantization")
         if np.any(np.max(widths, axis=1) != np.min(widths, axis=1)):
             raise ValueError("AMR cells must be cubic")
+        del hi, widths
 
         same_level: dict[tuple[int, int, int, int], int] = {}
         boxes_by_width: dict[int, dict[tuple[int, int, int], int]] = {}
+        stage_start = time.perf_counter()
         for idx in range(n):
             if show_progress and progress_interval > 0 and idx % progress_interval == 0:
-                ShockFinder._print_progress("ShockFinder: indexing AMR boxes", idx, n)
+                ShockFinder._print_progress("ShockFinder: indexing AMR boxes", idx, n, stage_start)
             key = (int(level[idx]), int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
             same_level[key] = idx
-            width = int(widths[idx, 0])
+            width = int(cell_width[idx])
             box_key = (int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
             boxes_by_width.setdefault(width, {})[box_key] = idx
 
         if show_progress:
-            ShockFinder._print_progress("ShockFinder: indexing AMR boxes", n, n)
+            ShockFinder._print_progress("ShockFinder: indexing AMR boxes", n, n, stage_start)
 
         coarser_widths = sorted(boxes_by_width, reverse=True)
+        stage_start = time.perf_counter()
         for idx in range(n):
             if show_progress and progress_interval > 0 and idx % progress_interval == 0:
-                ShockFinder._print_progress("ShockFinder: linking AMR neighbors", idx, n)
-            width = int(widths[idx, 0])
-            center0 = 0.5 * (lo[idx, 0] + hi[idx, 0])
-            center1 = 0.5 * (lo[idx, 1] + hi[idx, 1])
-            center2 = 0.5 * (lo[idx, 2] + hi[idx, 2])
+                ShockFinder._print_progress("ShockFinder: linking AMR neighbors", idx, n, stage_start)
+            width = int(cell_width[idx])
+            center0 = lo[idx, 0] + 0.5 * width
+            center1 = lo[idx, 1] + 0.5 * width
+            center2 = lo[idx, 2] + 0.5 * width
             for axis in range(3):
                 for direction, face_offset in ((-1, 0), (1, 1)):
                     face = axis * 2 + face_offset
@@ -324,7 +353,7 @@ class ShockFinder:
                         shifted2,
                     )
                     same = same_level.get(key)
-                    if same is not None and np.all(widths[same] == widths[idx]):
+                    if same is not None and cell_width[same] == width:
                         neighbors[idx, face] = same + 1
                         continue
 
@@ -350,11 +379,15 @@ class ShockFinder:
                     if lower >= 0:
                         neighbors[idx, face] = lower + 1
 
+        if show_progress:
+            ShockFinder._print_progress("ShockFinder: linking AMR neighbors", n, n, stage_start)
+
         fine_widths = sorted(boxes_by_width, reverse=True)
+        fine_stage_start = time.perf_counter()
         for idx in range(n):
             if show_progress and progress_interval > 0 and idx % progress_interval == 0:
-                ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", idx, n)
-            width = int(widths[idx, 0])
+                ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", idx, n, fine_stage_start)
+            width = int(cell_width[idx])
             finer_width = next((candidate for candidate in fine_widths if candidate < width), None)
             if finer_width is None:
                 continue
@@ -370,7 +403,7 @@ class ShockFinder:
                     for offset0 in range(ratio):
                         for offset1 in range(ratio):
                             key_parts = [int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2])]
-                            key_parts[axis] = int(lo[idx, axis] - finer_width if direction < 0 else hi[idx, axis])
+                            key_parts[axis] = int(lo[idx, axis] - finer_width if direction < 0 else lo[idx, axis] + width)
                             key_parts[other_axes[0]] = int(lo[idx, other_axes[0]] + offset0 * finer_width)
                             key_parts[other_axes[1]] = int(lo[idx, other_axes[1]] + offset1 * finer_width)
                             fine = boxes_by_width[finer_width].get(tuple(key_parts))
@@ -381,8 +414,7 @@ class ShockFinder:
                             fine_neighbors[idx, face, slot] = fine + 1
 
         if show_progress:
-            ShockFinder._print_progress("ShockFinder: linking AMR neighbors", n, n)
-            ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", n, n)
+            ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", n, n, fine_stage_start)
 
         return neighbors, fine_neighbors
 
@@ -412,6 +444,12 @@ class ShockFinder:
     def _quantize(values: np.ndarray) -> np.ndarray:
         return np.floor(values + 0.5).astype(np.int64)
 
+    @staticmethod
+    def _quantize_inplace(values: np.ndarray) -> np.ndarray:
+        np.add(values, 0.5, out=values)
+        np.floor(values, out=values)
+        return values.astype(np.int64)
+
     def _resolved_progress_interval(self, n: int) -> int:
         if self.progress_interval and self.progress_interval > 0:
             return int(self.progress_interval)
@@ -422,6 +460,26 @@ class ShockFinder:
             print(message, flush=True)
 
     @staticmethod
-    def _print_progress(label: str, done: int, total: int) -> None:
+    def _print_progress(label: str, done: int, total: int, started_at: float | None = None) -> None:
         percent = 100.0 if total <= 0 else 100.0 * done / total
-        print(f"{label}: {done:,}/{total:,} ({percent:5.1f}%)", flush=True)
+        if started_at is None:
+            print(f"{label}: {done:,}/{total:,} ({percent:5.1f}%)", flush=True)
+            return
+        elapsed = max(0.0, time.perf_counter() - started_at)
+        rate = done / elapsed if elapsed > 0.0 else 0.0
+        print(
+            f"{label}: {done:,}/{total:,} ({percent:5.1f}%) "
+            f"elapsed={ShockFinder._format_elapsed(elapsed)} rate={rate:,.0f} cell/s",
+            flush=True,
+        )
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        seconds_i = int(seconds)
+        hours, rem = divmod(seconds_i, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+        if minutes:
+            return f"{minutes:d}m{secs:02d}s"
+        return f"{seconds:.1f}s"

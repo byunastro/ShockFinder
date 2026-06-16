@@ -236,11 +236,12 @@ contains
     integer :: i, face, nb, step_count, done
     integer :: center, trial, upstream, downstream
     integer :: progress_count, next_progress
-    real(8) :: best_divv, grad_t(3), dirvec(3), xwalk(3), xnext(3)
-    real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m
-    real(8), allocatable :: divv_arr(:), grad_t_arr(:, :), grad_s_arr(:, :)
-    logical, allocatable :: valid_arr(:), candidate(:)
-    logical :: ok_direction
+    integer :: clock_rate, clock_now, pre_start, scan_start
+    real(8) :: best_divv, grad_t(3), grad_s(3), dirvec(3), xwalk(3), xnext(3)
+    real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m, elapsed
+    real(8), allocatable :: divv_arr(:), grad_t_arr(:, :)
+    logical, allocatable :: candidate(:)
+    logical :: valid, ok_direction
 
     mach = 0.0_dp
     shock = 0
@@ -248,19 +249,21 @@ contains
     upstream_index = 0
     downstream_index = 0
 
-    allocate(divv_arr(n), grad_t_arr(n, 3), grad_s_arr(n, 3), valid_arr(n), candidate(n))
+    allocate(divv_arr(n), grad_t_arr(n, 3), candidate(n))
 
     ! Precompute all local shock diagnostics once. This loop is independent for
     ! each AMR cell and is therefore a good OpenMP target.
     progress_count = 0
     next_progress = progress_interval
+    call system_clock(count_rate=clock_rate)
+    call system_clock(pre_start)
 
-    !$omp parallel do schedule(static) private(i, done)
+    !$omp parallel do schedule(static) private(i, done, grad_s, valid, clock_now, elapsed)
     do i = 1, n
       call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i, &
-           divv_arr(i), grad_t_arr(i, :), grad_s_arr(i, :), valid_arr(i))
-      candidate(i) = valid_arr(i) .and. divv_arr(i) < 0.0_dp .and. &
-           dot_product(grad_t_arr(i, :), grad_s_arr(i, :)) > 0.0_dp
+           divv_arr(i), grad_t_arr(i, :), grad_s, valid)
+      candidate(i) = valid .and. divv_arr(i) < 0.0_dp .and. &
+           dot_product(grad_t_arr(i, :), grad_s) > 0.0_dp
       if (show_progress /= 0 .and. progress_interval > 0) then
         !$omp atomic capture
         progress_count = progress_count + 1
@@ -269,8 +272,11 @@ contains
         if (done >= next_progress) then
           !$omp critical(progress_write)
           if (done >= next_progress) then
-            write(output_unit, '(A,I0,A,I0,A,F5.1,A)') "ShockFinder Fortran precompute: ", &
-                 done, "/", n, " (", 100.0_dp * real(done, 8) / real(max(n, 1), 8), "%)"
+            call system_clock(clock_now)
+            elapsed = real(clock_now - pre_start, 8) / real(max(clock_rate, 1), 8)
+            write(output_unit, '(A,I0,A,I0,A,F5.1,A,F10.1,A)') "ShockFinder Fortran precompute: ", &
+                 done, "/", n, " (", 100.0_dp * real(done, 8) / real(max(n, 1), 8), "%) elapsed=", &
+                 elapsed, " s"
             flush(output_unit)
             do while (next_progress <= done)
               next_progress = next_progress + progress_interval
@@ -282,7 +288,10 @@ contains
     end do
     !$omp end parallel do
     if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, progress_interval) /= 0)) then
-      write(output_unit, '(A,I0,A,I0,A)') "ShockFinder Fortran precompute: ", n, "/", n, " (100.0%)"
+      call system_clock(clock_now)
+      elapsed = real(clock_now - pre_start, 8) / real(max(clock_rate, 1), 8)
+      write(output_unit, '(A,I0,A,I0,A,F10.1,A)') "ShockFinder Fortran precompute: ", &
+           n, "/", n, " (100.0%) elapsed=", elapsed, " s"
       flush(output_unit)
     end if
 
@@ -290,10 +299,11 @@ contains
     ! maximum-convergence center. The small critical section protects that write.
     progress_count = 0
     next_progress = progress_interval
+    call system_clock(scan_start)
 
     !$omp parallel do schedule(dynamic, 256) private(i, face, nb, step_count, &
     !$omp& center, trial, upstream, downstream, best_divv, grad_t, t_pre, t_post, &
-    !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, done)
+    !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, done, clock_now, elapsed)
     do i = 1, n
       if (show_progress /= 0 .and. progress_interval > 0) then
         !$omp atomic capture
@@ -303,8 +313,11 @@ contains
         if (done >= next_progress) then
           !$omp critical(progress_write)
           if (done >= next_progress) then
-            write(output_unit, '(A,I0,A,I0,A,F5.1,A)') "ShockFinder Fortran scan: ", &
-                 done, "/", n, " (", 100.0_dp * real(done, 8) / real(max(n, 1), 8), "%)"
+            call system_clock(clock_now)
+            elapsed = real(clock_now - scan_start, 8) / real(max(clock_rate, 1), 8)
+            write(output_unit, '(A,I0,A,I0,A,F5.1,A,F10.1,A)') "ShockFinder Fortran scan: ", &
+                 done, "/", n, " (", 100.0_dp * real(done, 8) / real(max(n, 1), 8), "%) elapsed=", &
+                 elapsed, " s"
             flush(output_unit)
             do while (next_progress <= done)
               next_progress = next_progress + progress_interval
@@ -385,11 +398,14 @@ contains
     end do
     !$omp end parallel do
     if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, progress_interval) /= 0)) then
-      write(output_unit, '(A,I0,A,I0,A)') "ShockFinder Fortran scan: ", n, "/", n, " (100.0%)"
+      call system_clock(clock_now)
+      elapsed = real(clock_now - scan_start, 8) / real(max(clock_rate, 1), 8)
+      write(output_unit, '(A,I0,A,I0,A,F10.1,A)') "ShockFinder Fortran scan: ", &
+           n, "/", n, " (100.0%) elapsed=", elapsed, " s"
       flush(output_unit)
     end if
 
-    deallocate(divv_arr, grad_t_arr, grad_s_arr, valid_arr, candidate)
+    deallocate(divv_arr, grad_t_arr, candidate)
   end subroutine find_shocks
 
 end module shockfinder_kernel

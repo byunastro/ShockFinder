@@ -109,68 +109,7 @@ neighbors are preferred. Fine cells can fall back to coarser face neighbors, and
 coarse cells adjacent to refined regions pass the four finer face cells to the
 Fortran kernel so gradients can use their face-averaged state.
 
-## Shock Dissipation Map
-
-```python
-from examples.plot_shock_dissipation import compute_dissipation, plot_dissipation_and_mach
-
-diss = compute_dissipation(cell, result, mu=0.59)
-plot_dissipation_and_mach(
-    cell,
-    result,
-    diss,
-    plane="xy",
-    min_mach=1.0,
-    log_ediss_range=(37, 42),
-    log_mach_range=(0.3, 1.7),
-    output="shock_dissipation_mach.png",
-)
-```
-
-The left panel shows `log10(E_diss/A)` in `erg s^-1 kpc^-2`, using
-`E_diss/A = 0.5 rho_1 (M c_s,1)^3 delta(M)`. The right panel shows
-`log10(Mach)`.
-
-## Painter-Style Maps
-
-```python
-import matplotlib.pyplot as plt
-from shocktest import painter, pyShockFinder
-
-maps = pyShockFinder.make_shock_maps(
-    cell,
-    minlevel=13,
-    maxlevel=20,
-    bins=1024,
-    plane="xy",
-    show_progress=True,
-)
-
-machmap = maps.machmap
-disspEmap = maps.disspEmap
-
-dissimg = painter.rgb_image(disspEmap, cmap="plasma", log=True, vmin=37, vmax=42, qscale=4.0)
-machimg = painter.rgb_image(machmap, cmap="RdYlBu_r", log=True, vmin=0.3, vmax=1.7)
-
-fig, ax = plt.subplots()
-ax.imshow(dissimg, origin="lower", extent=maps.extent)
-
-# Clears machmap, disspEmap, and nested result/dissipation arrays.
-maps.clear()
-```
-
-For a ready-made two-panel figure:
-
-```python
-painter.plot_shock_maps(
-    machmap,
-    disspEmap,
-    extent=maps.extent,
-    log_ediss_range=(37, 42),
-    log_mach_range=(0.3, 1.7),
-    output="shock_maps.png",
-)
-```
+## Python Examples
 
 `make_mach_map` and `make_disspE_map` default to `method="amr"`, which paints
 each projected AMR shock-cell footprint into the image. This is better for
@@ -183,7 +122,7 @@ Available statistics are:
 - `mean`: overlap-area-weighted mean.
 - `sum`: overlap-area-weighted projected sum per output pixel area.
 
-You can also build only a Mach map directly from `ShockResult`:
+You can build mach map and shock dissipated energy map directly from `ShockResult`:
 
 ```python
 import matplotlib.pyplot as plt
@@ -197,12 +136,15 @@ finder.maxlevel = 20
 finder.show_progress = True
 
 result = finder.ShockFinder(cell)
-machmap = painter.make_mach_map(result, plane="xy", statistic="mean")
-
-plt.rcParams["font.family"] = "serif"
-plt.rcParams["mathtext.fontset"] = "dejavuserif"
+machmap = painter.make_mach_map(result, plane="xy", statistic="max")
+diss = pyShockFinder.compute_dissipation(cell, result)
+dissEmap = shockpainter.make_disspE_map(result,diss,plane="xz",bins=400,statistic="mean",method='amr')
 
 fig, ax = plt.subplots(figsize=(8, 6))
-ax.imshow(np.log10(machmap), origin="lower", cmap="inferno", interpolation="none", vmin=0.1, vmax=3)
+ax.imshow(np.log10(machmap))
+plt.show()
+
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.imshow(np.log10(dissEmap))
 plt.show()
 ```
