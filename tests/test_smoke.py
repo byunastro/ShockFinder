@@ -78,6 +78,27 @@ def test_fine_cell_finds_coarse_face_neighbor():
     assert neighbors[1, 0] == 1  # fine -x neighbor is the coarse cell, 1-based for Fortran
 
 
+def test_coarse_cell_records_finer_face_neighbors():
+    pos = np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [2.5, 0.5, 0.5],
+            [2.5, 0.5, 1.5],
+            [2.5, 1.5, 0.5],
+            [2.5, 1.5, 1.5],
+        ],
+        dtype=float,
+        order="F",
+    )
+    dx = np.array([2.0, 1.0, 1.0, 1.0, 1.0])
+    level = np.array([0, 1, 1, 1, 1], dtype=np.int32)
+
+    neighbors, fine_neighbors = shocktest.ShockFinder._build_neighbor_tables(pos, dx, level)
+
+    assert neighbors[0, 1] == 0
+    np.testing.assert_array_equal(np.sort(fine_neighbors[0, 1]), np.array([2, 3, 4, 5]))
+
+
 def test_missing_tuple_field_raises_clear_error():
     cell = line_cell()
     del cell[("T", "K")]

@@ -102,7 +102,9 @@ filter.
 - `selected_indices`: original input-row indices retained after level filtering.
 
 Neighbor links are built from AMR cell centers and widths. Same-level face
-neighbors are preferred; if absent, a same-or-coarser AMR neighbor is used.
+neighbors are preferred. Fine cells can fall back to coarser face neighbors, and
+coarse cells adjacent to refined regions pass the four finer face cells to the
+Fortran kernel so gradients can use their face-averaged state.
 
 ## Shock Dissipation Map
 

@@ -68,7 +68,7 @@ class ShockFinder:
 
         interval = self._resolved_progress_interval(n)
         self._progress("ShockFinder: building AMR face-neighbor table")
-        neighbors = self._build_neighbors(
+        neighbors, fine_neighbors = self._build_neighbor_tables(
             arrays["pos"],
             arrays["dx"],
             arrays["level"],
@@ -100,6 +100,7 @@ class ShockFinder:
             arrays["rho"],
             arrays["level"],
             neighbors,
+            fine_neighbors,
             float(self.gamma),
             float(self.temperature_floor),
             float(self.min_mach),
@@ -213,10 +214,29 @@ class ShockFinder:
         show_progress: bool = False,
         progress_interval: int = 0,
     ) -> np.ndarray:
+        neighbors, _ = ShockFinder._build_neighbor_tables(
+            pos,
+            dx,
+            level,
+            show_progress=show_progress,
+            progress_interval=progress_interval,
+        )
+        return neighbors
+
+    @staticmethod
+    def _build_neighbor_tables(
+        pos: np.ndarray,
+        dx: np.ndarray,
+        level: np.ndarray,
+        *,
+        show_progress: bool = False,
+        progress_interval: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray]:
         n = dx.size
         neighbors = np.zeros((n, 6), dtype=np.int32, order="F")
+        fine_neighbors = np.zeros((n, 6, 4), dtype=np.int32, order="F")
         if n == 0:
-            return neighbors
+            return neighbors, fine_neighbors
 
         if np.any(dx <= 0.0):
             raise ValueError("dx must be positive for every retained cell")
@@ -303,10 +323,41 @@ class ShockFinder:
                     if lower >= 0:
                         neighbors[idx, face] = lower + 1
 
+        fine_widths = sorted(boxes_by_width, reverse=True)
+        for idx in range(n):
+            if show_progress and progress_interval > 0 and idx % progress_interval == 0:
+                ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", idx, n)
+            width = int(widths[idx, 0])
+            finer_width = next((candidate for candidate in fine_widths if candidate < width), None)
+            if finer_width is None:
+                continue
+            ratio = width // finer_width
+            if ratio <= 0 or width % finer_width != 0:
+                continue
+
+            for axis in range(3):
+                other_axes = [other for other in range(3) if other != axis]
+                for direction, face_offset in ((-1, 0), (1, 1)):
+                    face = axis * 2 + face_offset
+                    face_cells: list[int] = []
+                    for offset0 in range(ratio):
+                        for offset1 in range(ratio):
+                            key_parts = [int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2])]
+                            key_parts[axis] = int(lo[idx, axis] - finer_width if direction < 0 else hi[idx, axis])
+                            key_parts[other_axes[0]] = int(lo[idx, other_axes[0]] + offset0 * finer_width)
+                            key_parts[other_axes[1]] = int(lo[idx, other_axes[1]] + offset1 * finer_width)
+                            fine = boxes_by_width[finer_width].get(tuple(key_parts))
+                            if fine is not None:
+                                face_cells.append(fine)
+                    if face_cells:
+                        for slot, fine in enumerate(face_cells[:4]):
+                            fine_neighbors[idx, face, slot] = fine + 1
+
         if show_progress:
             ShockFinder._print_progress("ShockFinder: linking AMR neighbors", n, n)
+            ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", n, n)
 
-        return neighbors
+        return neighbors, fine_neighbors
 
     @staticmethod
     def _find_lower_level_neighbor(
@@ -337,7 +388,7 @@ class ShockFinder:
     def _resolved_progress_interval(self, n: int) -> int:
         if self.progress_interval and self.progress_interval > 0:
             return int(self.progress_interval)
-        return max(1, n // 20)
+        return max(1, n // 10)
 
     def _progress(self, message: str) -> None:
         if self.show_progress:

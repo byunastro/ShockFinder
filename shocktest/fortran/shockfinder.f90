@@ -41,25 +41,68 @@ contains
     face = axis * 2 - 1
   end function minus_face
 
-  pure integer function face_for_step(axis, direction) result(face)
-    integer, intent(in) :: axis, direction
-    if (direction >= 0) then
-      face = plus_face(axis)
-    else
-      face = minus_face(axis)
-    end if
-  end function face_for_step
+  pure subroutine face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, &
+       i, face, axis, value_pos, value_vel, value_temp, value_entropy, ok)
+    integer, intent(in) :: n, i, face, axis
+    integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
+    real(8), intent(out) :: value_pos, value_vel, value_temp, value_entropy
+    logical, intent(out) :: ok
 
-  pure subroutine local_quantities(pos, vel, dx, temp, rho, neighbors, n, gamma, i, &
+    integer :: nb, k, count
+    real(8) :: sign
+
+    ok = .false.
+    value_pos = 0.0_dp
+    value_vel = 0.0_dp
+    value_temp = 0.0_dp
+    value_entropy = 0.0_dp
+
+    nb = neighbors(i, face)
+    if (nb > 0) then
+      value_pos = pos(nb, axis)
+      value_vel = vel(nb, axis)
+      value_temp = temp(nb)
+      value_entropy = entropy_value(temp(nb), rho(nb), gamma)
+      ok = temp(nb) > 0.0_dp .and. rho(nb) > 0.0_dp
+      return
+    end if
+
+    count = 0
+    do k = 1, 4
+      nb = fine_neighbors(i, face, k)
+      if (nb <= 0) cycle
+      if (temp(nb) <= 0.0_dp .or. rho(nb) <= 0.0_dp) cycle
+      count = count + 1
+      value_vel = value_vel + vel(nb, axis)
+      value_temp = value_temp + temp(nb)
+      value_entropy = value_entropy + entropy_value(temp(nb), rho(nb), gamma)
+    end do
+    if (count <= 0) return
+
+    if (mod(face, 2) == 0) then
+      sign = 1.0_dp
+    else
+      sign = -1.0_dp
+    end if
+    value_pos = pos(i, axis) + sign * 0.5_dp * dx(i)
+    value_vel = value_vel / real(count, 8)
+    value_temp = value_temp / real(count, 8)
+    value_entropy = value_entropy / real(count, 8)
+    ok = .true.
+  end subroutine face_sample
+
+  pure subroutine local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i, &
        divv, grad_t, grad_s, valid)
     integer, intent(in) :: n, i
-    integer, intent(in) :: neighbors(n, 6)
+    integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
     real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
     real(8), intent(out) :: divv, grad_t(3), grad_s(3)
     logical, intent(out) :: valid
 
-    integer :: axis, im, ip
-    real(8) :: dist, sm, sp
+    integer :: axis
+    real(8) :: dist, xm, xp, vm, vp, tm, tp, sm, sp
+    logical :: okm, okp
 
     divv = 0.0_dp
     grad_t = 0.0_dp
@@ -70,68 +113,134 @@ contains
     if (rho(i) <= 0.0_dp .or. temp(i) <= 0.0_dp .or. dx(i) <= 0.0_dp) return
 
     do axis = 1, 3
-      im = neighbors(i, minus_face(axis))
-      ip = neighbors(i, plus_face(axis))
-      if (im <= 0 .or. ip <= 0) cycle
-      dist = pos(ip, axis) - pos(im, axis)
+      call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, &
+           i, minus_face(axis), axis, xm, vm, tm, sm, okm)
+      call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, &
+           i, plus_face(axis), axis, xp, vp, tp, sp, okp)
+      if (.not. okm .or. .not. okp) cycle
+      dist = xp - xm
       if (abs(dist) <= 0.0_dp) cycle
 
-      sm = entropy_value(temp(im), rho(im), gamma)
-      sp = entropy_value(temp(ip), rho(ip), gamma)
-      grad_t(axis) = (temp(ip) - temp(im)) / dist
+      grad_t(axis) = (tp - tm) / dist
       grad_s(axis) = (sp - sm) / dist
-      divv = divv + (vel(ip, axis) - vel(im, axis)) / dist
+      divv = divv + (vp - vm) / dist
       valid = .true.
     end do
   end subroutine local_quantities
 
-  pure logical function cell_is_candidate(pos, vel, dx, temp, rho, neighbors, n, gamma, i)
+  pure logical function cell_is_candidate(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i)
     integer, intent(in) :: n, i
-    integer, intent(in) :: neighbors(n, 6)
+    integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
     real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
     real(8) :: divv, grad_t(3), grad_s(3)
     logical :: valid
 
-    call local_quantities(pos, vel, dx, temp, rho, neighbors, n, gamma, i, &
+    call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i, &
          divv, grad_t, grad_s, valid)
     cell_is_candidate = valid .and. divv < 0.0_dp .and. dot_product(grad_t, grad_s) > 0.0_dp
   end function cell_is_candidate
 
-  pure integer function dominant_axis(grad_t) result(axis)
-    real(8), intent(in) :: grad_t(3)
-    real(8) :: best
-    integer :: a
+  pure subroutine normalize_vector(vector, unit_vector, ok)
+    real(8), intent(in) :: vector(3)
+    real(8), intent(out) :: unit_vector(3)
+    logical, intent(out) :: ok
+    real(8) :: norm
 
-    axis = 0
-    best = 0.0_dp
-    do a = 1, 3
-      if (abs(grad_t(a)) > best) then
-        best = abs(grad_t(a))
-        axis = a
+    norm = sqrt(dot_product(vector, vector))
+    ok = norm > 0.0_dp
+    if (ok) then
+      unit_vector = vector / norm
+    else
+      unit_vector = 0.0_dp
+    end if
+  end subroutine normalize_vector
+
+  pure integer function choose_face_neighbor(pos, neighbors, fine_neighbors, n, i, face, xpoint) result(nb)
+    integer, intent(in) :: n, i, face
+    integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
+    real(8), intent(in) :: pos(n, 3), xpoint(3)
+
+    integer :: k, trial
+    real(8) :: best, dist2
+
+    nb = neighbors(i, face)
+    if (nb > 0) return
+
+    best = huge(1.0_dp)
+    do k = 1, 4
+      trial = fine_neighbors(i, face, k)
+      if (trial <= 0) cycle
+      dist2 = (pos(trial, 1) - xpoint(1))**2 + &
+              (pos(trial, 2) - xpoint(2))**2 + &
+              (pos(trial, 3) - xpoint(3))**2
+      if (dist2 < best) then
+        best = dist2
+        nb = trial
       end if
     end do
-  end function dominant_axis
+  end function choose_face_neighbor
 
-  subroutine find_shocks(pos, vel, dx, temp, rho, level, neighbors, n, gamma, &
+  pure subroutine next_along_gradient(pos, dx, neighbors, fine_neighbors, n, i, xold, direction, &
+       next_cell, xnew)
+    integer, intent(in) :: n, i
+    integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
+    real(8), intent(in) :: pos(n, 3), dx(n), xold(3), direction(3)
+    integer, intent(out) :: next_cell
+    real(8), intent(out) :: xnew(3)
+
+    integer :: axis, face
+    real(8) :: t, tbest, half_width, eps
+
+    next_cell = 0
+    face = 0
+    xnew = xold
+    tbest = huge(1.0_dp)
+    half_width = 0.5_dp * dx(i)
+
+    do axis = 1, 3
+      if (direction(axis) > 1.0e-14_dp) then
+        t = (pos(i, axis) + half_width - xold(axis)) / direction(axis)
+        if (t > 1.0e-14_dp .and. t < tbest) then
+          tbest = t
+          face = plus_face(axis)
+        end if
+      else if (direction(axis) < -1.0e-14_dp) then
+        t = (pos(i, axis) - half_width - xold(axis)) / direction(axis)
+        if (t > 1.0e-14_dp .and. t < tbest) then
+          tbest = t
+          face = minus_face(axis)
+        end if
+      end if
+    end do
+
+    if (tbest >= huge(1.0_dp) * 0.5_dp) return
+
+    eps = max(dx(i), 1.0_dp) * 1.0e-10_dp
+    xnew = xold + direction * (tbest + eps)
+    next_cell = choose_face_neighbor(pos, neighbors, fine_neighbors, n, i, face, xnew)
+  end subroutine next_along_gradient
+
+  subroutine find_shocks(pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n, gamma, &
        temp_floor, min_mach, max_steps, show_progress, progress_interval, mach, &
        shock, center_index, upstream_index, downstream_index)
-    !f2py intent(in) pos, vel, dx, temp, rho, level, neighbors, n
+    !f2py intent(in) pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n
     !f2py intent(in) gamma, temp_floor, min_mach, max_steps, show_progress, progress_interval
     !f2py intent(out) mach, shock, center_index, upstream_index, downstream_index
     integer, intent(in) :: n, max_steps, show_progress, progress_interval
-    integer, intent(in) :: level(n), neighbors(n, 6)
+    integer, intent(in) :: level(n), neighbors(n, 6), fine_neighbors(n, 6, 4)
     real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
     real(8), intent(in) :: gamma, temp_floor, min_mach
     real(8), intent(out) :: mach(n)
     integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
 
-    integer :: i, face, nb, axis, direction, step_count, done
+    integer :: i, face, nb, step_count, done
     integer :: center, trial, upstream, downstream
     integer :: progress_count, next_progress
-    real(8) :: best_divv, grad_t(3)
+    real(8) :: best_divv, grad_t(3), dirvec(3), xwalk(3), xnext(3)
     real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m
     real(8), allocatable :: divv_arr(:), grad_t_arr(:, :), grad_s_arr(:, :)
     logical, allocatable :: valid_arr(:), candidate(:)
+    logical :: ok_direction
 
     mach = 0.0_dp
     shock = 0
@@ -148,7 +257,7 @@ contains
 
     !$omp parallel do schedule(static) private(i, done)
     do i = 1, n
-      call local_quantities(pos, vel, dx, temp, rho, neighbors, n, gamma, i, &
+      call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i, &
            divv_arr(i), grad_t_arr(i, :), grad_s_arr(i, :), valid_arr(i))
       candidate(i) = valid_arr(i) .and. divv_arr(i) < 0.0_dp .and. &
            dot_product(grad_t_arr(i, :), grad_s_arr(i, :)) > 0.0_dp
@@ -182,9 +291,9 @@ contains
     progress_count = 0
     next_progress = progress_interval
 
-    !$omp parallel do schedule(dynamic, 256) private(i, face, nb, axis, direction, step_count, &
+    !$omp parallel do schedule(dynamic, 256) private(i, face, nb, step_count, &
     !$omp& center, trial, upstream, downstream, best_divv, grad_t, t_pre, t_post, &
-    !$omp& rho_pre, rho_post, ratio, m, done)
+    !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, done)
     do i = 1, n
       if (show_progress /= 0 .and. progress_interval > 0) then
         !$omp atomic capture
@@ -219,32 +328,37 @@ contains
         end if
       end do
 
-      axis = dominant_axis(grad_t)
-      if (axis <= 0) cycle
-      if (grad_t(axis) >= 0.0_dp) then
-        direction = 1
-      else
-        direction = -1
-      end if
+      call normalize_vector(grad_t, dirvec, ok_direction)
+      if (.not. ok_direction) cycle
 
       upstream = center
+      xwalk = pos(center, :)
       do step_count = 1, max_steps
-        trial = neighbors(upstream, face_for_step(axis, -direction))
+        call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, upstream, xwalk, -dirvec, &
+             trial, xnext)
         if (trial <= 0) exit
         if (.not. candidate(trial)) exit
         upstream = trial
+        xwalk = xnext
       end do
-      upstream = neighbors(upstream, face_for_step(axis, -direction))
+      call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, upstream, xwalk, -dirvec, &
+           trial, xnext)
+      upstream = trial
       if (upstream <= 0) cycle
 
       downstream = center
+      xwalk = pos(center, :)
       do step_count = 1, max_steps
-        trial = neighbors(downstream, face_for_step(axis, direction))
+        call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, downstream, xwalk, dirvec, &
+             trial, xnext)
         if (trial <= 0) exit
         if (.not. candidate(trial)) exit
         downstream = trial
+        xwalk = xnext
       end do
-      downstream = neighbors(downstream, face_for_step(axis, direction))
+      call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, downstream, xwalk, dirvec, &
+           trial, xnext)
+      downstream = trial
       if (downstream <= 0) cycle
 
       t_pre = max(temp(upstream), temp_floor)
