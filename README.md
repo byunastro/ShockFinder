@@ -166,6 +166,17 @@ painter.plot_shock_maps(
 )
 ```
 
+`make_mach_map` and `make_disspE_map` default to `method="area"`, which paints
+each projected AMR shock-cell footprint into the image. This is better for
+figure-quality AMR maps than point-binning the cell centers. Use
+`method="point"` to recover the older center-binned behavior.
+
+Available statistics are:
+
+- `max`: strongest value touching each pixel.
+- `mean`: overlap-area-weighted mean.
+- `sum`: overlap-area-weighted projected sum per output pixel area.
+
 You can also build only a Mach map directly from `ShockResult`:
 
 ```python

@@ -126,6 +126,7 @@ def make_shock_maps(
     z_width: float | None = None,
     min_mach: float = 1.0,
     statistic="max",
+    method="area",
     show_progress: bool = True,
     progress_interval: int = 0,
     gamma: float = 5.0 / 3.0,
@@ -157,6 +158,7 @@ def make_shock_maps(
         z_width=z_width,
         min_mach=min_mach,
         statistic=statistic,
+        method=method,
     )
     disspEmap = painter.make_disspE_map(
         result,
@@ -168,6 +170,7 @@ def make_shock_maps(
         z_width=z_width,
         min_mach=min_mach,
         statistic=statistic,
+        method=method,
     )
     return ShockMapResult(
         machmap=machmap,

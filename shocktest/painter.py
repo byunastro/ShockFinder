@@ -22,11 +22,14 @@ def make_mach_map(
     z_width: float | None = None,
     min_mach: float = 1.0,
     statistic: Statistic = "max",
+    method: Literal["area", "point"] = "area",
 ):
     """Make a regular 2D Mach map from a ``ShockResult``.
 
     This supports the workflow:
     ``machmap = painter.make_mach_map(result, plane="xy")``.
+    The default ``method="area"`` paints each projected AMR cell footprint into
+    the image. ``method="point"`` keeps the older center-binning behavior.
     Empty pixels are returned as NaN.
     """
 
@@ -37,7 +40,7 @@ def make_mach_map(
     draw = result.shock & (result.mach >= min_mach)
     if z_center is not None and z_width is not None:
         draw &= np.abs(normal - z_center) <= 0.5 * z_width
-    return _bin_to_map(x[draw], y[draw], result.mach[draw], bins, extent, statistic)
+    return _values_to_map(x[draw], y[draw], dx[draw], result.mach[draw], bins, extent, statistic, method)
 
 
 def make_disspE_map(
@@ -51,11 +54,14 @@ def make_disspE_map(
     z_width: float | None = None,
     min_mach: float = 1.0,
     statistic: Statistic = "max",
+    method: Literal["area", "point"] = "area",
 ):
     """Make a regular 2D dissipation-flux map from a ``ShockResult``.
 
     The returned map is E_diss/A in ``erg s^-1 kpc^-2`` when ``dissipation`` is
-    produced by ``pyShockFinder.compute_dissipation``.
+    produced by ``pyShockFinder.compute_dissipation``. The default
+    ``method="area"`` paints each projected AMR shock-cell footprint into the
+    image. ``method="point"`` keeps the older center-binning behavior.
     """
 
     x, y, normal, dx = _project_result_geometry(result, plane)
@@ -65,7 +71,7 @@ def make_disspE_map(
     draw = result.shock & (result.mach >= min_mach) & (dissipation.flux > 0.0)
     if z_center is not None and z_width is not None:
         draw &= np.abs(normal - z_center) <= 0.5 * z_width
-    return _bin_to_map(x[draw], y[draw], dissipation.flux[draw], bins, extent, statistic)
+    return _values_to_map(x[draw], y[draw], dx[draw], dissipation.flux[draw], bins, extent, statistic, method)
 
 
 def make_disspE_maps(*args, **kwargs):
@@ -280,6 +286,14 @@ def _bin_shape(bins: int | tuple[int, int]):
     return int(bins[0]), int(bins[1])
 
 
+def _values_to_map(x, y, dx, values, bins, extent, statistic: Statistic, method: Literal["area", "point"]):
+    if method == "point":
+        return _bin_to_map(x, y, values, bins, extent, statistic)
+    if method == "area":
+        return _paint_cells_to_map(x, y, dx, values, bins, extent, statistic)
+    raise ValueError("method must be one of: area, point")
+
+
 def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):
     ny, nx = _bin_shape(bins)
     out = np.full((ny, nx), np.nan, dtype=np.float64)
@@ -315,3 +329,89 @@ def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):
         work[~valid] = np.nan
         return work.reshape(ny, nx)
     raise ValueError("statistic must be one of: max, sum, mean")
+
+
+def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
+    ny, nx = _bin_shape(bins)
+    out = np.full((ny, nx), np.nan, dtype=np.float64)
+    if values.size == 0:
+        return out
+
+    xmin, xmax, ymin, ymax = extent
+    if xmax <= xmin or ymax <= ymin:
+        raise ValueError("extent must be (xmin, xmax, ymin, ymax) with positive width and height")
+
+    pixw = (xmax - xmin) / nx
+    pixh = (ymax - ymin) / ny
+    if pixw <= 0.0 or pixh <= 0.0:
+        raise ValueError("bins and extent produce non-positive pixel size")
+
+    if statistic == "max":
+        work = np.full((ny, nx), -np.inf, dtype=np.float64)
+        for xc, yc, width, value in zip(x, y, dx, values):
+            if not _finite_positive_cell(xc, yc, width, value):
+                continue
+            ix0, ix1, iy0, iy1 = _cell_pixel_bounds(xc, yc, width, xmin, ymin, pixw, pixh, nx, ny)
+            if ix0 > ix1 or iy0 > iy1:
+                continue
+            np.maximum(work[iy0 : iy1 + 1, ix0 : ix1 + 1], value, out=work[iy0 : iy1 + 1, ix0 : ix1 + 1])
+        work[~np.isfinite(work)] = np.nan
+        return work
+
+    if statistic in {"mean", "sum"}:
+        value_sum = np.zeros((ny, nx), dtype=np.float64)
+        area_sum = np.zeros((ny, nx), dtype=np.float64)
+        pixel_area = pixw * pixh
+
+        for xc, yc, width, value in zip(x, y, dx, values):
+            if not _finite_positive_cell(xc, yc, width, value):
+                continue
+            ix0, ix1, iy0, iy1 = _cell_pixel_bounds(xc, yc, width, xmin, ymin, pixw, pixh, nx, ny)
+            if ix0 > ix1 or iy0 > iy1:
+                continue
+
+            left = xc - 0.5 * width
+            right = xc + 0.5 * width
+            bottom = yc - 0.5 * width
+            top = yc + 0.5 * width
+            for iy in range(iy0, iy1 + 1):
+                py0 = ymin + iy * pixh
+                py1 = py0 + pixh
+                oy = max(0.0, min(top, py1) - max(bottom, py0))
+                if oy <= 0.0:
+                    continue
+                for ix in range(ix0, ix1 + 1):
+                    px0 = xmin + ix * pixw
+                    px1 = px0 + pixw
+                    ox = max(0.0, min(right, px1) - max(left, px0))
+                    if ox <= 0.0:
+                        continue
+                    overlap = ox * oy
+                    value_sum[iy, ix] += value * overlap
+                    area_sum[iy, ix] += overlap
+
+        valid = area_sum > 0.0
+        if statistic == "mean":
+            out[valid] = value_sum[valid] / area_sum[valid]
+        else:
+            out[valid] = value_sum[valid] / pixel_area
+        return out
+
+    raise ValueError("statistic must be one of: max, sum, mean")
+
+
+def _finite_positive_cell(x, y, dx, value) -> bool:
+    return bool(np.isfinite(x) and np.isfinite(y) and np.isfinite(dx) and dx > 0.0 and np.isfinite(value))
+
+
+def _cell_pixel_bounds(x, y, dx, xmin, ymin, pixw, pixh, nx, ny):
+    left = x - 0.5 * dx
+    right = x + 0.5 * dx
+    bottom = y - 0.5 * dx
+    top = y + 0.5 * dx
+
+    ix0 = max(0, int(np.floor((left - xmin) / pixw)))
+    ix1 = min(nx - 1, int(np.ceil((right - xmin) / pixw) - 1))
+    iy0 = max(0, int(np.floor((bottom - ymin) / pixh)))
+    iy1 = min(ny - 1, int(np.ceil((top - ymin) / pixh) - 1))
+    return ix0, ix1, iy0, iy1

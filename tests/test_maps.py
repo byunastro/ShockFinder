@@ -60,3 +60,27 @@ def test_make_mach_map_from_result_like_user_example():
 
     assert machmap.shape == (16, 16)
     assert np.nanmax(np.log10(machmap)) > 0.0
+
+
+def test_area_painting_fills_projected_cell_footprint():
+    x = np.array([0.5])
+    y = np.array([0.5])
+    dx = np.array([1.0])
+    values = np.array([3.0])
+
+    area_map = painter._paint_cells_to_map(x, y, dx, values, bins=(2, 2), extent=(0.0, 1.0, 0.0, 1.0), statistic="mean")
+    point_map = painter._bin_to_map(x, y, values, bins=(2, 2), extent=(0.0, 1.0, 0.0, 1.0), statistic="mean")
+
+    np.testing.assert_allclose(area_map, np.full((2, 2), 3.0))
+    assert np.count_nonzero(np.isfinite(point_map)) == 1
+
+
+def test_area_sum_scales_by_pixel_coverage():
+    x = np.array([0.25])
+    y = np.array([0.25])
+    dx = np.array([0.5])
+    values = np.array([8.0])
+
+    area_map = painter._paint_cells_to_map(x, y, dx, values, bins=(1, 1), extent=(0.0, 1.0, 0.0, 1.0), statistic="sum")
+
+    np.testing.assert_allclose(area_map, np.array([[2.0]]))
