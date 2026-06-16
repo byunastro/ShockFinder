@@ -24,6 +24,8 @@ class ShockResult:
     upstream_index: np.ndarray
     downstream_index: np.ndarray
     selected_indices: np.ndarray
+    pos: np.ndarray | None = None
+    dx: np.ndarray | None = None
 
 
 class ShockFinder:
@@ -85,6 +87,8 @@ class ShockFinder:
                 upstream_index=empty_index.copy(),
                 downstream_index=empty_index.copy(),
                 selected_indices=selected_indices,
+                pos=np.empty((0, 3), dtype=np.float64),
+                dx=empty_float.copy(),
             )
 
         self._progress("ShockFinder: running Fortran shock scan")
@@ -113,6 +117,8 @@ class ShockFinder:
             upstream_index=self._to_python_indices(upstream),
             downstream_index=self._to_python_indices(downstream),
             selected_indices=selected_indices,
+            pos=np.asarray(arrays["pos"], dtype=np.float64),
+            dx=np.asarray(arrays["dx"], dtype=np.float64),
         )
 
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:

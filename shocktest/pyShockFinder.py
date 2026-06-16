@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 
@@ -12,9 +11,6 @@ K_BOLTZMANN = 1.380649e-16  # erg K^-1
 PROTON_MASS = 1.67262192369e-24  # g
 MSUN = 1.98847e33  # g
 KPC = 3.0856775814913673e21  # cm
-
-Plane = Literal["xy", "xz", "yz"]
-Statistic = Literal["max", "sum", "mean"]
 
 
 @dataclass(slots=True)
@@ -123,22 +119,21 @@ def make_shock_maps(
     dissipation: DissipationResult | None = None,
     minlevel: int = 13,
     maxlevel: int = 20,
-    plane: Plane = "xy",
+    plane="xy",
     bins: int | tuple[int, int] = 1024,
     extent: tuple[float, float, float, float] | None = None,
     z_center: float | None = None,
     z_width: float | None = None,
     min_mach: float = 1.0,
-    statistic: Statistic = "max",
+    statistic="max",
     show_progress: bool = True,
     progress_interval: int = 0,
     gamma: float = 5.0 / 3.0,
     mu: float = 0.59,
 ):
-    """Return ``machmap`` and ``disspEmap`` regular images from AMR shocks.
+    """Convenience wrapper returning both ``machmap`` and ``disspEmap``."""
 
-    ``disspEmap`` is E_diss/A in erg s^-1 kpc^-2. Empty pixels are NaN.
-    """
+    from shocktest import painter
 
     if result is None:
         result = compute_shock_result(
@@ -150,28 +145,30 @@ def make_shock_maps(
         )
     if dissipation is None:
         dissipation = compute_dissipation(cell, result, gamma=gamma, mu=mu)
-
-    x_key, y_key, normal_key = _plane_keys(plane)
-    rows = result.selected_indices
-    x = np.asarray(cell[x_key], dtype=np.float64)[rows]
-    y = np.asarray(cell[y_key], dtype=np.float64)[rows]
-    normal = np.asarray(cell[normal_key], dtype=np.float64)[rows]
-    dx = np.asarray(cell["dx", "km"], dtype=np.float64)[rows]
-
     if extent is None:
-        extent = (
-            float(np.min(x - 0.5 * dx)),
-            float(np.max(x + 0.5 * dx)),
-            float(np.min(y - 0.5 * dx)),
-            float(np.max(y + 0.5 * dx)),
-        )
+        extent = painter.map_extent_from_result(result, plane=plane)
 
-    draw = result.shock & (result.mach >= min_mach) & (dissipation.flux > 0.0)
-    if z_center is not None and z_width is not None:
-        draw &= np.abs(normal - z_center) <= 0.5 * z_width
-
-    machmap = _bin_to_map(x[draw], y[draw], result.mach[draw], bins, extent, statistic)
-    disspEmap = _bin_to_map(x[draw], y[draw], dissipation.flux[draw], bins, extent, statistic)
+    machmap = painter.make_mach_map(
+        result,
+        plane=plane,
+        bins=bins,
+        extent=extent,
+        z_center=z_center,
+        z_width=z_width,
+        min_mach=min_mach,
+        statistic=statistic,
+    )
+    disspEmap = painter.make_disspE_map(
+        result,
+        dissipation,
+        plane=plane,
+        bins=bins,
+        extent=extent,
+        z_center=z_center,
+        z_width=z_width,
+        min_mach=min_mach,
+        statistic=statistic,
+    )
     return ShockMapResult(
         machmap=machmap,
         disspEmap=disspEmap,
@@ -179,59 +176,3 @@ def make_shock_maps(
         result=result,
         dissipation=dissipation,
     )
-
-
-def _plane_keys(plane: Plane):
-    axes = {
-        "xy": (("x", "km"), ("y", "km"), ("z", "km")),
-        "xz": (("x", "km"), ("z", "km"), ("y", "km")),
-        "yz": (("y", "km"), ("z", "km"), ("x", "km")),
-    }
-    if plane not in axes:
-        raise ValueError("plane must be one of: xy, xz, yz")
-    return axes[plane]
-
-
-def _bin_shape(bins: int | tuple[int, int]):
-    if isinstance(bins, int):
-        return bins, bins
-    if len(bins) != 2:
-        raise ValueError("bins must be an int or (ny, nx)")
-    return int(bins[0]), int(bins[1])
-
-
-def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):
-    ny, nx = _bin_shape(bins)
-    out = np.full((ny, nx), np.nan, dtype=np.float64)
-    if values.size == 0:
-        return out
-
-    xmin, xmax, ymin, ymax = extent
-    ix = np.floor((x - xmin) / (xmax - xmin) * nx).astype(np.int64)
-    iy = np.floor((y - ymin) / (ymax - ymin) * ny).astype(np.int64)
-    inside = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny) & np.isfinite(values)
-    if not np.any(inside):
-        return out
-
-    flat = iy[inside] * nx + ix[inside]
-    vals = values[inside]
-    if statistic == "max":
-        work = np.full(ny * nx, -np.inf, dtype=np.float64)
-        np.maximum.at(work, flat, vals)
-        work[~np.isfinite(work)] = np.nan
-        return work.reshape(ny, nx)
-    if statistic == "sum":
-        work = np.zeros(ny * nx, dtype=np.float64)
-        np.add.at(work, flat, vals)
-        work[work == 0.0] = np.nan
-        return work.reshape(ny, nx)
-    if statistic == "mean":
-        work = np.zeros(ny * nx, dtype=np.float64)
-        count = np.zeros(ny * nx, dtype=np.int64)
-        np.add.at(work, flat, vals)
-        np.add.at(count, flat, 1)
-        valid = count > 0
-        work[valid] /= count[valid]
-        work[~valid] = np.nan
-        return work.reshape(ny, nx)
-    raise ValueError("statistic must be one of: max, sum, mean")

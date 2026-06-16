@@ -163,3 +163,27 @@ painter.plot_shock_maps(
     output="shock_maps.png",
 )
 ```
+
+You can also build only a Mach map directly from `ShockResult`:
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+import shocktest
+from shocktest import painter
+
+finder = shocktest.ShockFinder()
+finder.minlevel = 15
+finder.maxlevel = 20
+finder.show_progress = True
+
+result = finder.ShockFinder(cell)
+machmap = painter.make_mach_map(result, plane="xy", statistic="mean")
+
+plt.rcParams["font.family"] = "serif"
+plt.rcParams["mathtext.fontset"] = "dejavuserif"
+
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.imshow(np.log10(machmap), origin="lower", cmap="inferno", interpolation="none", vmin=0.1, vmax=3)
+plt.show()
+```

@@ -45,3 +45,18 @@ def test_make_maps_and_rgb_image():
 
     image = painter.rgb_image(maps.disspEmap, cmap="plasma", log=True, qscale=4.0)
     assert image.shape == (16, 16, 4)
+
+
+def test_make_mach_map_from_result_like_user_example():
+    import shocktest
+
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 15
+    finder.maxlevel = 20
+    finder.show_progress = False
+
+    result = finder.ShockFinder(grid_cell())
+    machmap = painter.make_mach_map(result, plane="xy", statistic="mean", bins=(16, 16))
+
+    assert machmap.shape == (16, 16)
+    assert np.nanmax(np.log10(machmap)) > 0.0
