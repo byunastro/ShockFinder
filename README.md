@@ -125,3 +125,41 @@ plot_dissipation_and_mach(
 The left panel shows `log10(E_diss/A)` in `erg s^-1 kpc^-2`, using
 `E_diss/A = 0.5 rho_1 (M c_s,1)^3 delta(M)`. The right panel shows
 `log10(Mach)`.
+
+## Painter-Style Maps
+
+```python
+import matplotlib.pyplot as plt
+from shocktest import painter, pyShockFinder
+
+maps = pyShockFinder.make_shock_maps(
+    cell,
+    minlevel=13,
+    maxlevel=20,
+    bins=1024,
+    plane="xy",
+    show_progress=True,
+)
+
+machmap = maps.machmap
+disspEmap = maps.disspEmap
+
+dissimg = painter.rgb_image(disspEmap, cmap="plasma", log=True, vmin=37, vmax=42, qscale=4.0)
+machimg = painter.rgb_image(machmap, cmap="RdYlBu_r", log=True, vmin=0.3, vmax=1.7)
+
+fig, ax = plt.subplots()
+ax.imshow(dissimg, origin="lower", extent=maps.extent)
+```
+
+For a ready-made two-panel figure:
+
+```python
+painter.plot_shock_maps(
+    machmap,
+    disspEmap,
+    extent=maps.extent,
+    log_ediss_range=(37, 42),
+    log_mach_range=(0.3, 1.7),
+    output="shock_maps.png",
+)
+```
