@@ -310,108 +310,183 @@ class ShockFinder:
             raise ValueError("AMR cells must be cubic")
         del hi, widths
 
-        same_level: dict[tuple[int, int, int, int], int] = {}
-        boxes_by_width: dict[int, dict[tuple[int, int, int], int]] = {}
-        stage_start = time.perf_counter()
-        for idx in range(n):
-            if show_progress and progress_interval > 0 and idx % progress_interval == 0:
-                ShockFinder._print_progress("ShockFinder: indexing AMR boxes", idx, n, stage_start)
-            key = (int(level[idx]), int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
-            same_level[key] = idx
-            width = int(cell_width[idx])
-            box_key = (int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2]))
-            boxes_by_width.setdefault(width, {})[box_key] = idx
+        spans = tuple(int(np.max(lo[:, axis] + cell_width)) + 1 for axis in range(3))
+        spatial_size = spans[0] * spans[1] * spans[2]
+        level_min = int(np.min(level))
+        level_count = int(np.max(level)) - level_min + 1
+        if spatial_size * max(level_count, 1) > np.iinfo(np.uint64).max:
+            raise OverflowError("AMR integer box range is too large for sorted-key neighbor lookup")
 
+        stage_start = time.perf_counter()
+        spatial_key = ShockFinder._pack_spatial(lo[:, 0], lo[:, 1], lo[:, 2], spans)
+        same_key = spatial_key + (level.astype(np.uint64) - np.uint64(level_min)) * np.uint64(spatial_size)
+        same_order = np.argsort(same_key, kind="mergesort")
+        same_keys_sorted = same_key[same_order]
         if show_progress:
             ShockFinder._print_progress("ShockFinder: indexing AMR boxes", n, n, stage_start)
 
-        coarser_widths = sorted(boxes_by_width, reverse=True)
+        unique_widths = np.unique(cell_width)
+        width_lookups: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for width in unique_widths:
+            rows = np.nonzero(cell_width == width)[0]
+            keys = spatial_key[rows]
+            order = np.argsort(keys, kind="mergesort")
+            width_lookups[int(width)] = (keys[order], rows[order])
+
         stage_start = time.perf_counter()
-        for idx in range(n):
-            if show_progress and progress_interval > 0 and idx % progress_interval == 0:
-                ShockFinder._print_progress("ShockFinder: linking AMR neighbors", idx, n, stage_start)
-            width = int(cell_width[idx])
-            center0 = lo[idx, 0] + 0.5 * width
-            center1 = lo[idx, 1] + 0.5 * width
-            center2 = lo[idx, 2] + 0.5 * width
+        base0 = lo[:, 0]
+        base1 = lo[:, 1]
+        base2 = lo[:, 2]
+        for axis in range(3):
+            for direction, face_offset in ((-1, 0), (1, 1)):
+                face = axis * 2 + face_offset
+                target0 = base0.copy()
+                target1 = base1.copy()
+                target2 = base2.copy()
+                if axis == 0:
+                    target0 += direction * cell_width
+                elif axis == 1:
+                    target1 += direction * cell_width
+                else:
+                    target2 += direction * cell_width
+
+                valid = (
+                    (target0 >= 0)
+                    & (target0 < spans[0])
+                    & (target1 >= 0)
+                    & (target1 < spans[1])
+                    & (target2 >= 0)
+                    & (target2 < spans[2])
+                )
+                target_key = np.zeros(n, dtype=np.uint64)
+                target_key[valid] = ShockFinder._pack_spatial(target0[valid], target1[valid], target2[valid], spans)
+                target_key[valid] += (level[valid].astype(np.uint64) - np.uint64(level_min)) * np.uint64(spatial_size)
+                same = ShockFinder._lookup_sorted(target_key, same_keys_sorted, same_order)
+                same_valid = valid & (same >= 0) & (cell_width[np.maximum(same, 0)] == cell_width)
+                neighbors[same_valid, face] = same[same_valid].astype(np.int32) + 1
+
+                del target0, target1, target2, target_key, same, same_valid, valid
+                if show_progress:
+                    face_done = axis * 2 + face_offset + 1
+                    ShockFinder._print_progress(
+                        "ShockFinder: linking same-level AMR neighbors",
+                        min(n, (n * face_done) // 6),
+                        n,
+                        stage_start,
+                    )
+
+        coarser_widths = sorted((int(width) for width in unique_widths), reverse=True)
+        for width in unique_widths:
+            rows_for_width = np.nonzero(cell_width == width)[0]
+            width_i = int(width)
+            center0 = lo[rows_for_width, 0] + 0.5 * width_i
+            center1 = lo[rows_for_width, 1] + 0.5 * width_i
+            center2 = lo[rows_for_width, 2] + 0.5 * width_i
             for axis in range(3):
                 for direction, face_offset in ((-1, 0), (1, 1)):
                     face = axis * 2 + face_offset
-                    shifted0 = int(lo[idx, 0])
-                    shifted1 = int(lo[idx, 1])
-                    shifted2 = int(lo[idx, 2])
-                    if axis == 0:
-                        shifted0 += direction * width
-                    elif axis == 1:
-                        shifted1 += direction * width
-                    else:
-                        shifted2 += direction * width
-                    key = (
-                        int(level[idx]),
-                        shifted0,
-                        shifted1,
-                        shifted2,
-                    )
-                    same = same_level.get(key)
-                    if same is not None and cell_width[same] == width:
-                        neighbors[idx, face] = same + 1
+                    missing = rows_for_width[neighbors[rows_for_width, face] == 0]
+                    if missing.size == 0:
                         continue
-
-                    # If a same-level neighbor is absent, sample just outside
-                    # the face and find the coarser AMR box containing it.
-                    sample0 = center0
-                    sample1 = center1
-                    sample2 = center2
+                    sample0 = center0[neighbors[rows_for_width, face] == 0].copy()
+                    sample1 = center1[neighbors[rows_for_width, face] == 0].copy()
+                    sample2 = center2[neighbors[rows_for_width, face] == 0].copy()
                     if axis == 0:
-                        sample0 += direction * (width * 0.5 + 0.25)
+                        sample0 += direction * (width_i * 0.5 + 0.25)
                     elif axis == 1:
-                        sample1 += direction * (width * 0.5 + 0.25)
+                        sample1 += direction * (width_i * 0.5 + 0.25)
                     else:
-                        sample2 += direction * (width * 0.5 + 0.25)
-                    lower = ShockFinder._find_lower_level_neighbor(
-                        sample0,
-                        sample1,
-                        sample2,
-                        width,
-                        coarser_widths,
-                        boxes_by_width,
-                    )
-                    if lower >= 0:
-                        neighbors[idx, face] = lower + 1
+                        sample2 += direction * (width_i * 0.5 + 0.25)
+                    for coarse_width in coarser_widths:
+                        if coarse_width <= width_i:
+                            continue
+                        keys_sorted, indices_sorted = width_lookups[coarse_width]
+                        target0 = np.floor(sample0 / coarse_width).astype(np.int64) * coarse_width
+                        target1 = np.floor(sample1 / coarse_width).astype(np.int64) * coarse_width
+                        target2 = np.floor(sample2 / coarse_width).astype(np.int64) * coarse_width
+                        valid = (
+                            (target0 >= 0)
+                            & (target0 < spans[0])
+                            & (target1 >= 0)
+                            & (target1 < spans[1])
+                            & (target2 >= 0)
+                            & (target2 < spans[2])
+                        )
+                        if not np.any(valid):
+                            continue
+                        target_key = np.zeros(missing.size, dtype=np.uint64)
+                        target_key[valid] = ShockFinder._pack_spatial(target0[valid], target1[valid], target2[valid], spans)
+                        found = ShockFinder._lookup_sorted(target_key, keys_sorted, indices_sorted)
+                        found_valid = valid & (found >= 0)
+                        neighbors[missing[found_valid], face] = found[found_valid].astype(np.int32) + 1
+                        keep = ~found_valid
+                        if not np.any(keep):
+                            break
+                        missing = missing[keep]
+                        sample0 = sample0[keep]
+                        sample1 = sample1[keep]
+                        sample2 = sample2[keep]
+            if show_progress:
+                ShockFinder._print_progress(
+                    "ShockFinder: linking same-or-coarser AMR neighbors",
+                    int(np.searchsorted(unique_widths, width, side="right")),
+                    unique_widths.size,
+                    stage_start,
+                )
 
         if show_progress:
             ShockFinder._print_progress("ShockFinder: linking AMR neighbors", n, n, stage_start)
 
-        fine_widths = sorted(boxes_by_width, reverse=True)
+        fine_widths = coarser_widths
         fine_stage_start = time.perf_counter()
-        for idx in range(n):
-            if show_progress and progress_interval > 0 and idx % progress_interval == 0:
-                ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", idx, n, fine_stage_start)
-            width = int(cell_width[idx])
+        for width in unique_widths:
+            width_i = int(width)
             finer_width = next((candidate for candidate in fine_widths if candidate < width), None)
             if finer_width is None:
                 continue
-            ratio = width // finer_width
-            if ratio <= 0 or width % finer_width != 0:
+            ratio = width_i // finer_width
+            if ratio <= 0 or width_i % finer_width != 0:
                 continue
+            rows_for_width = np.nonzero(cell_width == width)[0]
+            keys_sorted, indices_sorted = width_lookups[finer_width]
 
             for axis in range(3):
                 other_axes = [other for other in range(3) if other != axis]
                 for direction, face_offset in ((-1, 0), (1, 1)):
                     face = axis * 2 + face_offset
-                    face_cells: list[int] = []
+                    slot = 0
                     for offset0 in range(ratio):
                         for offset1 in range(ratio):
-                            key_parts = [int(lo[idx, 0]), int(lo[idx, 1]), int(lo[idx, 2])]
-                            key_parts[axis] = int(lo[idx, axis] - finer_width if direction < 0 else lo[idx, axis] + width)
-                            key_parts[other_axes[0]] = int(lo[idx, other_axes[0]] + offset0 * finer_width)
-                            key_parts[other_axes[1]] = int(lo[idx, other_axes[1]] + offset1 * finer_width)
-                            fine = boxes_by_width[finer_width].get(tuple(key_parts))
-                            if fine is not None:
-                                face_cells.append(fine)
-                    if face_cells:
-                        for slot, fine in enumerate(face_cells[:4]):
-                            fine_neighbors[idx, face, slot] = fine + 1
+                            if slot >= 4:
+                                break
+                            target0 = lo[rows_for_width, 0].copy()
+                            target1 = lo[rows_for_width, 1].copy()
+                            target2 = lo[rows_for_width, 2].copy()
+                            targets = (target0, target1, target2)
+                            targets[axis][:] = lo[rows_for_width, axis] - finer_width if direction < 0 else lo[rows_for_width, axis] + width_i
+                            targets[other_axes[0]][:] = lo[rows_for_width, other_axes[0]] + offset0 * finer_width
+                            targets[other_axes[1]][:] = lo[rows_for_width, other_axes[1]] + offset1 * finer_width
+                            valid = (
+                                (target0 >= 0)
+                                & (target0 < spans[0])
+                                & (target1 >= 0)
+                                & (target1 < spans[1])
+                                & (target2 >= 0)
+                                & (target2 < spans[2])
+                            )
+                            target_key = np.zeros(rows_for_width.size, dtype=np.uint64)
+                            target_key[valid] = ShockFinder._pack_spatial(target0[valid], target1[valid], target2[valid], spans)
+                            found = ShockFinder._lookup_sorted(target_key, keys_sorted, indices_sorted)
+                            found_valid = valid & (found >= 0)
+                            fine_neighbors[rows_for_width[found_valid], face, slot] = found[found_valid].astype(np.int32) + 1
+                            slot += 1
+            if show_progress:
+                ShockFinder._print_progress(
+                    "ShockFinder: linking finer AMR face neighbors",
+                    int(np.searchsorted(unique_widths, width, side="right")),
+                    unique_widths.size,
+                    fine_stage_start,
+                )
 
         if show_progress:
             ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", n, n, fine_stage_start)
@@ -439,6 +514,29 @@ class ShockFinder:
             if idx is not None:
                 return idx
         return -1
+
+    @staticmethod
+    def _pack_spatial(x: np.ndarray, y: np.ndarray, z: np.ndarray, spans: tuple[int, int, int]) -> np.ndarray:
+        return (
+            np.asarray(x, dtype=np.uint64) * np.uint64(spans[1]) * np.uint64(spans[2])
+            + np.asarray(y, dtype=np.uint64) * np.uint64(spans[2])
+            + np.asarray(z, dtype=np.uint64)
+        )
+
+    @staticmethod
+    def _lookup_sorted(target_keys: np.ndarray, sorted_keys: np.ndarray, sorted_indices: np.ndarray) -> np.ndarray:
+        found = np.full(target_keys.shape, -1, dtype=np.int64)
+        if sorted_keys.size == 0 or target_keys.size == 0:
+            return found
+        positions = np.searchsorted(sorted_keys, target_keys)
+        valid = positions < sorted_keys.size
+        if not np.any(valid):
+            return found
+        valid_positions = positions[valid]
+        matched = sorted_keys[valid_positions] == target_keys[valid]
+        valid_rows = np.nonzero(valid)[0]
+        found[valid_rows[matched]] = sorted_indices[valid_positions[matched]]
+        return found
 
     @staticmethod
     def _quantize(values: np.ndarray) -> np.ndarray:
