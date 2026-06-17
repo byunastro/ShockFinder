@@ -61,6 +61,23 @@ def test_level_filter_maps_selected_indices():
     assert result.shock.shape == (5,)
 
 
+def test_temperature_and_density_filters_map_selected_indices():
+    cell = line_cell()
+    cell[("T", "K")] = np.array([1e4, 2e5, 2e5, 2e5, 4e5, 4e5, 4e5, 4e5], dtype=float)
+    cell[("rho", "Msol/kpc3")] = np.array([0.1, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 9.0], dtype=float)
+
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 0
+    finder.maxlevel = 20
+    finder.min_temperature = 2e5
+    finder.min_density = 1.0
+    finder.max_density = 5.0
+    result = finder.find(cell)
+
+    np.testing.assert_array_equal(result.selected_indices, np.array([2, 3, 4, 5, 6]))
+    assert result.mach.shape == (5,)
+
+
 def test_fine_cell_finds_coarse_face_neighbor():
     pos = np.array(
         [

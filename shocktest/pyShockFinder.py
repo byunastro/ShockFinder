@@ -20,6 +20,7 @@ class DissipationResult:
 
     flux: np.ndarray
     total: np.ndarray
+    area: np.ndarray
     efficiency: np.ndarray
     sound_speed: np.ndarray
 
@@ -29,6 +30,7 @@ class DissipationResult:
         empty = np.empty(0, dtype=np.float64)
         self.flux = empty
         self.total = empty.copy()
+        self.area = empty.copy()
         self.efficiency = empty.copy()
         self.sound_speed = empty.copy()
         gc.collect()
@@ -100,18 +102,25 @@ def compute_dissipation(
     *,
     gamma: float = 5.0 / 3.0,
     mu: float = 0.59,
+    area_mode: str = "normal",
 ):
-    """Compute E_diss/A in erg s^-1 kpc^-2 and cell total in erg s^-1."""
+    """Compute E_diss/A in erg s^-1 kpc^-2 and cell total in erg s^-1.
+
+    ``area_mode="normal"`` estimates the shock surface area from the local
+    upstream-to-downstream normal. ``area_mode="cell"`` keeps the older ``dx^2``
+    area approximation.
+    """
 
     n = result.mach.size
     flux = np.zeros(n, dtype=np.float64)
     total = np.zeros(n, dtype=np.float64)
+    area = np.zeros(n, dtype=np.float64)
     efficiency = np.zeros(n, dtype=np.float64)
     sound_speed = np.zeros(n, dtype=np.float64)
 
     valid = result.shock & (result.mach > 1.0) & (result.upstream_index >= 0)
     if not np.any(valid):
-        return DissipationResult(flux=flux, total=total, efficiency=efficiency, sound_speed=sound_speed)
+        return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency, sound_speed=sound_speed)
 
     retained_rows = result.selected_indices
     upstream_rows = retained_rows[result.upstream_index[valid]]
@@ -132,10 +141,44 @@ def compute_dissipation(
 
     flux[valid] = flux_valid
     dx_kpc = dx / (KPC / 1.0e5)
-    total[valid] = flux_valid * dx_kpc**2
+    area_valid = shock_surface_area(result, valid, dx_kpc, mode=area_mode)
+    area[valid] = area_valid
+    total[valid] = flux_valid * area_valid
     efficiency[valid] = delta
     sound_speed[valid] = cs_cgs / 1.0e5
-    return DissipationResult(flux=flux, total=total, efficiency=efficiency, sound_speed=sound_speed)
+    return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency, sound_speed=sound_speed)
+
+
+def shock_surface_area(result, valid, dx_kpc, *, mode: str = "normal"):
+    """Return shock surface area in kpc^2 for valid shock cells."""
+
+    base_area = dx_kpc**2
+    if mode == "cell":
+        return base_area
+    if mode != "normal":
+        raise ValueError("area_mode must be one of: normal, cell")
+
+    rows = np.nonzero(valid)[0]
+    upstream = result.upstream_index[rows]
+    downstream = result.downstream_index[rows]
+    ok = (upstream >= 0) & (downstream >= 0)
+
+    area = base_area.copy()
+    if result.pos is None or not np.any(ok):
+        return area
+
+    normal = result.pos[downstream[ok]] - result.pos[upstream[ok]]
+    norm = np.linalg.norm(normal, axis=1)
+    ok_norm = norm > 0.0
+    if not np.any(ok_norm):
+        return area
+
+    normal = normal[ok_norm] / norm[ok_norm, None]
+    dominant_cos = np.max(np.abs(normal), axis=1)
+    dominant_cos = np.clip(dominant_cos, 1.0 / np.sqrt(3.0), 1.0)
+    ok_indices = np.nonzero(ok)[0][ok_norm]
+    area[ok_indices] = base_area[ok_indices] / dominant_cos
+    return area
 
 
 def make_shock_maps(
@@ -157,6 +200,7 @@ def make_shock_maps(
     progress_interval: int = 0,
     gamma: float = 5.0 / 3.0,
     mu: float = 0.59,
+    area_mode: str = "normal",
 ):
     """Convenience wrapper returning both ``machmap`` and ``disspEmap``."""
 
@@ -171,7 +215,7 @@ def make_shock_maps(
             progress_interval=progress_interval,
         )
     if dissipation is None:
-        dissipation = compute_dissipation(cell, result, gamma=gamma, mu=mu)
+        dissipation = compute_dissipation(cell, result, gamma=gamma, mu=mu, area_mode=area_mode)
     if extent is None:
         extent = painter.map_extent_from_result(result, plane=plane)
 

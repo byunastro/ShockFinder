@@ -42,6 +42,7 @@ def test_make_maps_and_rgb_image():
     assert maps.disspEmap.shape == (16, 16)
     assert np.nanmax(maps.machmap) > 1.0
     assert np.nanmax(maps.disspEmap) > 0.0
+    assert maps.dissipation.area.shape == maps.dissipation.flux.shape
 
     image = painter.rgb_image(maps.disspEmap, cmap="plasma", log=True, qscale=4.0)
     assert image.shape == (16, 16, 4)
@@ -84,6 +85,24 @@ def test_area_sum_scales_by_pixel_coverage():
     area_map = painter._paint_cells_to_map(x, y, dx, values, bins=(1, 1), extent=(0.0, 1.0, 0.0, 1.0), statistic="sum")
 
     np.testing.assert_allclose(area_map, np.array([[2.0]]))
+
+
+def test_normal_shock_surface_area_matches_cell_area_for_axis_aligned_shock():
+    import shocktest
+
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 15
+    finder.maxlevel = 20
+    finder.show_progress = False
+
+    cell = grid_cell()
+    result = finder.ShockFinder(cell)
+    diss_cell = pyShockFinder.compute_dissipation(cell, result, area_mode="cell")
+    diss_normal = pyShockFinder.compute_dissipation(cell, result, area_mode="normal")
+
+    valid = diss_cell.area > 0.0
+    np.testing.assert_allclose(diss_normal.area[valid], diss_cell.area[valid])
+    np.testing.assert_allclose(diss_normal.total[valid], diss_cell.total[valid])
 
 
 def test_shock_map_result_clear_releases_nested_arrays():

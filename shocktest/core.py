@@ -54,6 +54,9 @@ class ShockFinder:
         self.minlevel = 0
         self.gamma = 5.0 / 3.0
         self.temperature_floor = 1.0e4
+        self.min_temperature = None
+        self.min_density = None
+        self.max_density = None
         self.min_mach = 1.0
         self.max_steps = 4
         self.position_unit = "km"
@@ -92,7 +95,7 @@ class ShockFinder:
         arrays = self._extract_amr_arrays(cell)
         selected_indices = arrays.pop("selected_indices")
         n = arrays["temp"].size
-        self._progress(f"ShockFinder: retained {n:,} cells after level filtering")
+        self._progress(f"ShockFinder: retained {n:,} cells after filtering")
 
         interval = self._resolved_progress_interval(n)
         self._progress("ShockFinder: building AMR face-neighbor table")
@@ -184,9 +187,15 @@ class ShockFinder:
             if values.size != n:
                 raise ValueError(f"{name} has length {values.size}, expected {n}")
 
-        # Keep only the AMR refinement levels requested by the caller. Geometry
-        # still comes from dx, not from this level filter.
+        # Keep only cells requested by the caller. Geometry still comes from dx,
+        # not from the level filter.
         mask = (level >= int(self.minlevel)) & (level <= int(self.maxlevel))
+        if self.min_temperature is not None:
+            mask &= temp >= float(self.min_temperature)
+        if self.min_density is not None:
+            mask &= rho >= float(self.min_density)
+        if self.max_density is not None:
+            mask &= rho <= float(self.max_density)
         selected_indices = np.nonzero(mask)[0].astype(np.int64, copy=False)
         del mask
 
