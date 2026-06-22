@@ -44,7 +44,6 @@ finder = shocktest.ShockFinder()
 finder.maxlevel = 20
 finder.minlevel = 13
 finder.show_progress = True
-finder.progress_interval = 0
 
 result = finder.ShockFinder(cell)
 

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import shocktest
+from shocktest.core import _shockfinder
 
 
 def line_cell(n=8):
@@ -114,6 +115,66 @@ def test_coarse_cell_records_finer_face_neighbors():
 
     assert neighbors[0, 1] == 0
     np.testing.assert_array_equal(np.sort(fine_neighbors[0, 1]), np.array([2, 3, 4, 5]))
+
+
+def test_shock_center_considers_finer_face_candidates():
+    pos = np.asfortranarray(
+        [
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    vel = np.asfortranarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [-0.5, 0.0, 0.0],
+            [-5.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    dx = np.asfortranarray(np.ones(5, dtype=float))
+    temp = np.asfortranarray([1.0e4, 1.0e4, 2.0e4, 4.0e4, 8.0e4], dtype=float)
+    rho = np.asfortranarray([1.0, 1.0, 1.5, 2.0, 3.0], dtype=float)
+    level = np.asfortranarray([0, 0, 0, 1, 1], dtype=np.int32)
+    neighbors = np.zeros((5, 6), dtype=np.int32, order="F")
+    fine_neighbors = np.zeros((5, 6, 4), dtype=np.int32, order="F")
+
+    # Cell 3 is a coarse candidate with a finer +x face candidate at cell 4.
+    # Cell 4 has stronger convergence, so it should become the shock center.
+    neighbors[2, 0] = 2
+    fine_neighbors[2, 1, 0] = 4
+    neighbors[3, 0] = 3
+    neighbors[3, 1] = 5
+
+    mach, shock, center, upstream, downstream = _shockfinder.shockfinder_kernel.find_shocks(
+        pos,
+        vel,
+        dx,
+        temp,
+        rho,
+        level,
+        neighbors,
+        fine_neighbors,
+        1.0e4,
+        1.0,
+        1,
+        0,
+        0,
+        5,
+    )
+
+    assert shock[2] == 0
+    assert shock[3] == 1
+    assert center[3] == 4
+    assert upstream[3] > 0
+    assert downstream[3] > 0
+    assert mach[3] > 1.0
 
 
 def test_missing_tuple_field_raises_clear_error():

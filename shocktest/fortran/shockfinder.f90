@@ -2,21 +2,26 @@ module shockfinder_kernel
   use iso_fortran_env, only: output_unit
   implicit none
   integer, parameter :: dp = kind(1.0d0)
+  real(8), parameter :: entropy_exponent = 2.0_dp / 3.0_dp
   private
   public :: find_shocks
 
 contains
 
-  pure real(8) function entropy_value(temp, rho, gamma) result(s)
-    real(8), intent(in) :: temp, rho, gamma
+  ! Return the entropy proxy T/rho^(2/3) used by the Skillman shock criteria.
+  ! The exponent assumes an ideal monatomic gas with gamma = 5/3.
+  pure real(8) function entropy_value(temp, rho) result(s)
+    real(8), intent(in) :: temp, rho
 
     if (rho > 0.0_dp .and. temp > 0.0_dp) then
-      s = temp / rho**(gamma - 1.0_dp)
+      s = temp / rho**entropy_exponent
     else
       s = 0.0_dp
     end if
   end function entropy_value
 
+  ! Invert the Rankine-Hugoniot temperature jump for gamma = 5/3.
+  ! Ratios below unity are treated as non-shocks with Mach 1.
   pure real(8) function mach_from_temperature_jump(t_ratio) result(mach)
     real(8), intent(in) :: t_ratio
     real(8) :: disc, m2
@@ -31,21 +36,25 @@ contains
     mach = sqrt(max(m2, 1.0_dp))
   end function mach_from_temperature_jump
 
+  ! Map a coordinate axis to the positive face slot in the six-neighbor table.
   pure integer function plus_face(axis) result(face)
     integer, intent(in) :: axis
     face = axis * 2
   end function plus_face
 
+  ! Map a coordinate axis to the negative face slot in the six-neighbor table.
   pure integer function minus_face(axis) result(face)
     integer, intent(in) :: axis
     face = axis * 2 - 1
   end function minus_face
 
-  pure subroutine face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, &
+  ! Sample a face state from a same/coarser neighbor or from finer face cells.
+  ! The returned values are used for local gradients and divergence.
+  pure subroutine face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, &
        i, face, axis, value_pos, value_vel, value_temp, value_entropy, ok)
     integer, intent(in) :: n, i, face, axis
     integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
-    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
     real(8), intent(out) :: value_pos, value_vel, value_temp, value_entropy
     logical, intent(out) :: ok
 
@@ -63,7 +72,7 @@ contains
       value_pos = pos(nb, axis)
       value_vel = vel(nb, axis)
       value_temp = temp(nb)
-      value_entropy = entropy_value(temp(nb), rho(nb), gamma)
+      value_entropy = entropy_value(temp(nb), rho(nb))
       ok = temp(nb) > 0.0_dp .and. rho(nb) > 0.0_dp
       return
     end if
@@ -76,7 +85,7 @@ contains
       count = count + 1
       value_vel = value_vel + vel(nb, axis)
       value_temp = value_temp + temp(nb)
-      value_entropy = value_entropy + entropy_value(temp(nb), rho(nb), gamma)
+      value_entropy = value_entropy + entropy_value(temp(nb), rho(nb))
     end do
     if (count <= 0) return
 
@@ -92,11 +101,13 @@ contains
     ok = .true.
   end subroutine face_sample
 
-  pure subroutine local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i, &
+  ! Compute local velocity divergence plus temperature and entropy gradients.
+  ! Invalid cells or missing face pairs simply leave valid set to false.
+  pure subroutine local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, i, &
        divv, grad_t, grad_s, valid)
     integer, intent(in) :: n, i
     integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
-    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
     real(8), intent(out) :: divv, grad_t(3), grad_s(3)
     logical, intent(out) :: valid
 
@@ -113,9 +124,9 @@ contains
     if (rho(i) <= 0.0_dp .or. temp(i) <= 0.0_dp .or. dx(i) <= 0.0_dp) return
 
     do axis = 1, 3
-      call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, &
+      call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, &
            i, minus_face(axis), axis, xm, vm, tm, sm, okm)
-      call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, &
+      call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, &
            i, plus_face(axis), axis, xp, vp, tp, sp, okp)
       if (.not. okm .or. .not. okp) cycle
       dist = xp - xm
@@ -128,18 +139,7 @@ contains
     end do
   end subroutine local_quantities
 
-  pure logical function cell_is_candidate(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i)
-    integer, intent(in) :: n, i
-    integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
-    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
-    real(8) :: divv, grad_t(3), grad_s(3)
-    logical :: valid
-
-    call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i, &
-         divv, grad_t, grad_s, valid)
-    cell_is_candidate = valid .and. divv < 0.0_dp .and. dot_product(grad_t, grad_s) > 0.0_dp
-  end function cell_is_candidate
-
+  ! Normalize a vector and report whether its magnitude was non-zero.
   pure subroutine normalize_vector(vector, unit_vector, ok)
     real(8), intent(in) :: vector(3)
     real(8), intent(out) :: unit_vector(3)
@@ -155,6 +155,8 @@ contains
     end if
   end subroutine normalize_vector
 
+  ! Choose the neighbor crossed by a gradient walk through one AMR face.
+  ! Same/coarser neighbors are preferred; finer face cells use the nearest center.
   pure integer function choose_face_neighbor(pos, neighbors, fine_neighbors, n, i, face, xpoint) result(nb)
     integer, intent(in) :: n, i, face
     integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
@@ -180,6 +182,8 @@ contains
     end do
   end function choose_face_neighbor
 
+  ! Advance one step along the shock-normal direction through the AMR mesh.
+  ! The output is the crossed neighbor and the new point just inside that cell.
   pure subroutine next_along_gradient(pos, dx, neighbors, fine_neighbors, n, i, xold, direction, &
        next_cell, xnew)
     integer, intent(in) :: n, i
@@ -220,20 +224,22 @@ contains
     next_cell = choose_face_neighbor(pos, neighbors, fine_neighbors, n, i, face, xnew)
   end subroutine next_along_gradient
 
-  subroutine find_shocks(pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n, gamma, &
+  ! Scan AMR cells for Skillman-style shock zones and assign center Mach numbers.
+  ! Neighbor tables are supplied by Python/Numba and the cell loop is OpenMP-ready.
+  subroutine find_shocks(pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n, &
        temp_floor, min_mach, max_steps, show_progress, progress_interval, mach, &
        shock, center_index, upstream_index, downstream_index)
     !f2py intent(in) pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n
-    !f2py intent(in) gamma, temp_floor, min_mach, max_steps, show_progress, progress_interval
+    !f2py intent(in) temp_floor, min_mach, max_steps, show_progress, progress_interval
     !f2py intent(out) mach, shock, center_index, upstream_index, downstream_index
     integer, intent(in) :: n, max_steps, show_progress, progress_interval
     integer, intent(in) :: level(n), neighbors(n, 6), fine_neighbors(n, 6, 4)
     real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
-    real(8), intent(in) :: gamma, temp_floor, min_mach
+    real(8), intent(in) :: temp_floor, min_mach
     real(8), intent(out) :: mach(n)
     integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
 
-    integer :: i, face, nb, step_count, done
+    integer :: i, face, nb, k, step_count, done
     integer :: center, trial, upstream, downstream
     integer :: progress_count, next_progress
     integer :: clock_rate, clock_now, pre_start, scan_start
@@ -260,7 +266,7 @@ contains
 
     !$omp parallel do schedule(static) private(i, done, grad_s, valid, clock_now, elapsed)
     do i = 1, n
-      call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, gamma, i, &
+      call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, i, &
            divv_arr(i), grad_t_arr(i, :), grad_s, valid)
       candidate(i) = valid .and. divv_arr(i) < 0.0_dp .and. &
            dot_product(grad_t_arr(i, :), grad_s) > 0.0_dp
@@ -301,7 +307,7 @@ contains
     next_progress = progress_interval
     call system_clock(scan_start)
 
-    !$omp parallel do schedule(dynamic, 256) private(i, face, nb, step_count, &
+    !$omp parallel do schedule(dynamic, 256) private(i, face, nb, k, step_count, &
     !$omp& center, trial, upstream, downstream, best_divv, grad_t, t_pre, t_post, &
     !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, done, clock_now, elapsed)
     do i = 1, n
@@ -333,12 +339,23 @@ contains
       grad_t = grad_t_arr(i, :)
       do face = 1, 6
         nb = neighbors(i, face)
-        if (nb <= 0) cycle
-        if (candidate(nb) .and. divv_arr(nb) < best_divv) then
-          center = nb
-          best_divv = divv_arr(nb)
-          grad_t = grad_t_arr(nb, :)
+        if (nb > 0) then
+          if (candidate(nb) .and. divv_arr(nb) < best_divv) then
+            center = nb
+            best_divv = divv_arr(nb)
+            grad_t = grad_t_arr(nb, :)
+          end if
         end if
+
+        do k = 1, 4
+          nb = fine_neighbors(i, face, k)
+          if (nb <= 0) cycle
+          if (candidate(nb) .and. divv_arr(nb) < best_divv) then
+            center = nb
+            best_divv = divv_arr(nb)
+            grad_t = grad_t_arr(nb, :)
+          end if
+        end do
       end do
 
       call normalize_vector(grad_t, dirvec, ok_direction)

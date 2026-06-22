@@ -132,7 +132,6 @@ class ShockFinder:
             arrays["level"],
             neighbors,
             fine_neighbors,
-            float(self.gamma),
             float(self.temperature_floor),
             float(self.min_mach),
             int(self.max_steps),
