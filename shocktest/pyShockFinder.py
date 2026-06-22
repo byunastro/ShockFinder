@@ -102,6 +102,7 @@ def compute_dissipation(
     *,
     gamma: float = 5.0 / 3.0,
     mu: float = 0.59,
+    temperature_floor: float = 1.0e4,
     area_mode: str = "normal",
 ):
     """Compute E_diss/A in erg s^-1 kpc^-2 and cell total in erg s^-1.
@@ -127,6 +128,7 @@ def compute_dissipation(
     center_rows = retained_rows[np.nonzero(valid)[0]]
 
     temp1 = np.asarray(cell["T", "K"], dtype=np.float64)[upstream_rows]
+    temp1 = np.maximum(temp1, float(temperature_floor))
     rho1 = np.asarray(cell["rho", "Msol/kpc3"], dtype=np.float64)[upstream_rows]
     dx = np.asarray(cell["dx", "km"], dtype=np.float64)[center_rows]
     mach = result.mach[valid]
@@ -200,6 +202,7 @@ def make_shock_maps(
     progress_interval: int = 0,
     gamma: float = 5.0 / 3.0,
     mu: float = 0.59,
+    temperature_floor: float = 1.0e4,
     area_mode: str = "normal",
 ):
     """Convenience wrapper returning both ``machmap`` and ``disspEmap``."""
@@ -215,7 +218,14 @@ def make_shock_maps(
             progress_interval=progress_interval,
         )
     if dissipation is None:
-        dissipation = compute_dissipation(cell, result, gamma=gamma, mu=mu, area_mode=area_mode)
+        dissipation = compute_dissipation(
+            cell,
+            result,
+            gamma=gamma,
+            mu=mu,
+            temperature_floor=temperature_floor,
+            area_mode=area_mode,
+        )
     if extent is None:
         extent = painter.map_extent_from_result(result, plane=plane)
 

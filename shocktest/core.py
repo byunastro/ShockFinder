@@ -455,6 +455,12 @@ class ShockFinder:
             ratio = width_i // finer_width
             if ratio <= 0 or width_i % finer_width != 0:
                 continue
+            if ratio > 2:
+                raise ValueError(
+                    "fine AMR face neighbors currently support one refinement jump "
+                    "(2x per axis, 4 cells per face). Include intermediate AMR "
+                    "levels in the retained region or narrow the level range."
+                )
             rows_for_width = np.nonzero(cell_width == width)[0]
             keys_sorted, indices_sorted = width_lookups[finer_width]
 

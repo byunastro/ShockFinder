@@ -117,6 +117,22 @@ def test_coarse_cell_records_finer_face_neighbors():
     np.testing.assert_array_equal(np.sort(fine_neighbors[0, 1]), np.array([2, 3, 4, 5]))
 
 
+def test_multi_level_fine_face_gap_raises_clear_error():
+    pos = np.array(
+        [
+            [2.0, 2.0, 2.0],
+            [4.5, 0.5, 0.5],
+        ],
+        dtype=float,
+        order="F",
+    )
+    dx = np.array([4.0, 1.0])
+    level = np.array([0, 2], dtype=np.int32)
+
+    with pytest.raises(ValueError, match="one refinement jump"):
+        shocktest.ShockFinder._build_neighbor_tables(pos, dx, level)
+
+
 def test_shock_center_considers_finer_face_candidates():
     pos = np.asfortranarray(
         [

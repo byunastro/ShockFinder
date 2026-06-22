@@ -105,6 +105,32 @@ def test_normal_shock_surface_area_matches_cell_area_for_axis_aligned_shock():
     np.testing.assert_allclose(diss_normal.total[valid], diss_cell.total[valid])
 
 
+def test_dissipation_uses_upstream_temperature_floor():
+    import shocktest
+
+    cell = {
+        ("T", "K"): np.array([1.0, 2.0e4]),
+        ("rho", "Msol/kpc3"): np.array([1.0e6, 2.0e6]),
+        ("dx", "km"): np.array([1.0, 1.0]),
+    }
+    result = shocktest.ShockResult(
+        mach=np.array([0.0, 2.0]),
+        shock=np.array([False, True]),
+        center_index=np.array([-1, 1]),
+        upstream_index=np.array([-1, 0]),
+        downstream_index=np.array([-1, 1]),
+        selected_indices=np.array([0, 1]),
+        pos=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        dx=np.array([1.0, 1.0]),
+    )
+
+    diss = pyShockFinder.compute_dissipation(cell, result, temperature_floor=1.0e4)
+
+    assert np.isfinite(diss.sound_speed[1])
+    assert diss.sound_speed[1] > 0.0
+    assert diss.flux[1] > 0.0
+
+
 def test_shock_map_result_clear_releases_nested_arrays():
     maps = pyShockFinder.make_shock_maps(
         grid_cell(),
