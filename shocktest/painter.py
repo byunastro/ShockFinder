@@ -334,6 +334,10 @@ def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):
 def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
     ny, nx = _bin_shape(bins)
     out = np.full((ny, nx), np.nan, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    dx = np.asarray(dx, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
     if values.size == 0:
         return out
 
@@ -346,11 +350,17 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
     if pixw <= 0.0 or pixh <= 0.0:
         raise ValueError("bins and extent produce non-positive pixel size")
 
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(dx) & (dx > 0.0) & np.isfinite(values)
+    if not np.any(finite):
+        return out
+    x = x[finite]
+    y = y[finite]
+    dx = dx[finite]
+    values = values[finite]
+
     if statistic == "max":
         work = np.full((ny, nx), -np.inf, dtype=np.float64)
         for xc, yc, width, value in zip(x, y, dx, values):
-            if not _finite_positive_cell(xc, yc, width, value):
-                continue
             ix0, ix1, iy0, iy1 = _cell_pixel_bounds(xc, yc, width, xmin, ymin, pixw, pixh, nx, ny)
             if ix0 > ix1 or iy0 > iy1:
                 continue
@@ -362,10 +372,10 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
         value_sum = np.zeros((ny, nx), dtype=np.float64)
         area_sum = np.zeros((ny, nx), dtype=np.float64)
         pixel_area = pixw * pixh
+        pixel_x0 = xmin + np.arange(nx, dtype=np.float64) * pixw
+        pixel_y0 = ymin + np.arange(ny, dtype=np.float64) * pixh
 
         for xc, yc, width, value in zip(x, y, dx, values):
-            if not _finite_positive_cell(xc, yc, width, value):
-                continue
             ix0, ix1, iy0, iy1 = _cell_pixel_bounds(xc, yc, width, xmin, ymin, pixw, pixh, nx, ny)
             if ix0 > ix1 or iy0 > iy1:
                 continue
@@ -374,21 +384,17 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
             right = xc + 0.5 * width
             bottom = yc - 0.5 * width
             top = yc + 0.5 * width
-            for iy in range(iy0, iy1 + 1):
-                py0 = ymin + iy * pixh
-                py1 = py0 + pixh
-                oy = max(0.0, min(top, py1) - max(bottom, py0))
-                if oy <= 0.0:
-                    continue
-                for ix in range(ix0, ix1 + 1):
-                    px0 = xmin + ix * pixw
-                    px1 = px0 + pixw
-                    ox = max(0.0, min(right, px1) - max(left, px0))
-                    if ox <= 0.0:
-                        continue
-                    overlap = ox * oy
-                    value_sum[iy, ix] += value * overlap
-                    area_sum[iy, ix] += overlap
+            px0 = pixel_x0[ix0 : ix1 + 1]
+            py0 = pixel_y0[iy0 : iy1 + 1]
+            ox = np.maximum(0.0, np.minimum(right, px0 + pixw) - np.maximum(left, px0))
+            oy = np.maximum(0.0, np.minimum(top, py0 + pixh) - np.maximum(bottom, py0))
+            if not np.any(ox > 0.0) or not np.any(oy > 0.0):
+                continue
+
+            overlap = oy[:, None] * ox[None, :]
+            target = (slice(iy0, iy1 + 1), slice(ix0, ix1 + 1))
+            value_sum[target] += value * overlap
+            area_sum[target] += overlap
 
         valid = area_sum > 0.0
         if statistic == "mean":
@@ -398,10 +404,6 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
         return out
 
     raise ValueError("statistic must be one of: max, sum, mean")
-
-
-def _finite_positive_cell(x, y, dx, value) -> bool:
-    return bool(np.isfinite(x) and np.isfinite(y) and np.isfinite(dx) and dx > 0.0 and np.isfinite(value))
 
 
 def _cell_pixel_bounds(x, y, dx, xmin, ymin, pixw, pixh, nx, ny):
