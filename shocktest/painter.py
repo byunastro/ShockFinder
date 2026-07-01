@@ -23,6 +23,7 @@ def make_mach_map(
     min_mach: float = 1.0,
     statistic: Statistic = "max",
     method: Literal["amr", "point"] = "amr",
+    weights=None,
 ):
     """Make a regular 2D Mach map from a ``ShockResult``.
 
@@ -30,7 +31,9 @@ def make_mach_map(
     ``machmap = painter.make_mach_map(result, plane="xy")``.
     The default ``method="amr"`` paints each projected AMR cell footprint into
     the image. ``method="point"`` keeps the older center-binning behavior.
-    Empty pixels are returned as NaN.
+    Empty pixels are returned as NaN. Pass per-cell ``weights`` with
+    ``statistic="mean"`` to make an area- and weight-averaged Mach map, for
+    example using shock dissipation energy as the weight.
     """
 
     x, y, normal, dx = _project_result_geometry(result, plane)
@@ -38,9 +41,18 @@ def make_mach_map(
         extent = map_extent_from_result(result, plane=plane)
 
     draw = result.shock & (result.mach >= min_mach)
+    map_weights = None
+    if weights is not None:
+        if statistic == "max":
+            raise ValueError('weights are only meaningful for statistic="mean" or statistic="sum"')
+        map_weights = np.asarray(weights, dtype=np.float64)
+        if map_weights.shape != result.mach.shape:
+            raise ValueError("weights must have the same shape as result.mach")
     if z_center is not None and z_width is not None:
         draw &= np.abs(normal - z_center) <= 0.5 * z_width
-    return _values_to_map(x[draw], y[draw], dx[draw], result.mach[draw], bins, extent, statistic, method)
+    if map_weights is not None:
+        map_weights = map_weights[draw]
+    return _values_to_map(x[draw], y[draw], dx[draw], result.mach[draw], bins, extent, statistic, method, weights=map_weights)
 
 
 def make_disspE_map(
@@ -286,17 +298,19 @@ def _bin_shape(bins: int | tuple[int, int]):
     return int(bins[0]), int(bins[1])
 
 
-def _values_to_map(x, y, dx, values, bins, extent, statistic: Statistic, method: Literal["amr", "point"]):
+def _values_to_map(x, y, dx, values, bins, extent, statistic: Statistic, method: Literal["amr", "point"], *, weights=None):
     if method == "point":
-        return _bin_to_map(x, y, values, bins, extent, statistic)
+        return _bin_to_map(x, y, values, bins, extent, statistic, weights=weights)
     if method == "amr":
-        return _paint_cells_to_map(x, y, dx, values, bins, extent, statistic)
+        return _paint_cells_to_map(x, y, dx, values, bins, extent, statistic, weights=weights)
     raise ValueError("method must be one of: amr, point")
 
 
-def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):
+def _bin_to_map(x, y, values, bins, extent, statistic: Statistic, *, weights=None):
     ny, nx = _bin_shape(bins)
     out = np.full((ny, nx), np.nan, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    weights = _optional_weights(weights, values.size)
     if values.size == 0:
         return out
 
@@ -304,6 +318,8 @@ def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):
     ix = np.floor((x - xmin) / (xmax - xmin) * nx).astype(np.int64)
     iy = np.floor((y - ymin) / (ymax - ymin) * ny).astype(np.int64)
     inside = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny) & np.isfinite(values)
+    if weights is not None:
+        inside &= np.isfinite(weights) & (weights > 0.0)
     if not np.any(inside):
         return out
 
@@ -316,28 +332,39 @@ def _bin_to_map(x, y, values, bins, extent, statistic: Statistic):
         return work.reshape(ny, nx)
     if statistic == "sum":
         work = np.zeros(ny * nx, dtype=np.float64)
+        if weights is not None:
+            vals = vals * weights[inside]
         np.add.at(work, flat, vals)
         work[work == 0.0] = np.nan
         return work.reshape(ny, nx)
     if statistic == "mean":
         work = np.zeros(ny * nx, dtype=np.float64)
-        count = np.zeros(ny * nx, dtype=np.int64)
-        np.add.at(work, flat, vals)
-        np.add.at(count, flat, 1)
-        valid = count > 0
-        work[valid] /= count[valid]
+        if weights is None:
+            count = np.zeros(ny * nx, dtype=np.int64)
+            np.add.at(work, flat, vals)
+            np.add.at(count, flat, 1)
+            valid = count > 0
+            work[valid] /= count[valid]
+        else:
+            weight_sum = np.zeros(ny * nx, dtype=np.float64)
+            vals_weight = weights[inside]
+            np.add.at(work, flat, vals * vals_weight)
+            np.add.at(weight_sum, flat, vals_weight)
+            valid = weight_sum > 0.0
+            work[valid] /= weight_sum[valid]
         work[~valid] = np.nan
         return work.reshape(ny, nx)
     raise ValueError("statistic must be one of: max, sum, mean")
 
 
-def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
+def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic, *, weights=None):
     ny, nx = _bin_shape(bins)
     out = np.full((ny, nx), np.nan, dtype=np.float64)
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     dx = np.asarray(dx, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
+    weights = _optional_weights(weights, values.size)
     if values.size == 0:
         return out
 
@@ -351,12 +378,16 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
         raise ValueError("bins and extent produce non-positive pixel size")
 
     finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(dx) & (dx > 0.0) & np.isfinite(values)
+    if weights is not None:
+        finite &= np.isfinite(weights) & (weights > 0.0)
     if not np.any(finite):
         return out
     x = x[finite]
     y = y[finite]
     dx = dx[finite]
     values = values[finite]
+    if weights is not None:
+        weights = weights[finite]
 
     if statistic == "max":
         work = np.full((ny, nx), -np.inf, dtype=np.float64)
@@ -375,7 +406,12 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
         pixel_x0 = xmin + np.arange(nx, dtype=np.float64) * pixw
         pixel_y0 = ymin + np.arange(ny, dtype=np.float64) * pixh
 
-        for xc, yc, width, value in zip(x, y, dx, values):
+        if weights is None:
+            iterator = zip(x, y, dx, values, np.ones(values.size, dtype=np.float64))
+        else:
+            iterator = zip(x, y, dx, values, weights)
+
+        for xc, yc, width, value, weight in iterator:
             ix0, ix1, iy0, iy1 = _cell_pixel_bounds(xc, yc, width, xmin, ymin, pixw, pixh, nx, ny)
             if ix0 > ix1 or iy0 > iy1:
                 continue
@@ -393,8 +429,9 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
 
             overlap = oy[:, None] * ox[None, :]
             target = (slice(iy0, iy1 + 1), slice(ix0, ix1 + 1))
-            value_sum[target] += value * overlap
-            area_sum[target] += overlap
+            weighted_overlap = weight * overlap
+            value_sum[target] += value * weighted_overlap
+            area_sum[target] += weighted_overlap
 
         valid = area_sum > 0.0
         if statistic == "mean":
@@ -404,6 +441,15 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic):
         return out
 
     raise ValueError("statistic must be one of: max, sum, mean")
+
+
+def _optional_weights(weights, size: int):
+    if weights is None:
+        return None
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.shape != (size,):
+        raise ValueError("weights must be a 1D array with the same length as values")
+    return weights
 
 
 def _cell_pixel_bounds(x, y, dx, xmin, ymin, pixw, pixh, nx, ny):

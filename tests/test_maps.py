@@ -63,6 +63,37 @@ def test_make_mach_map_from_result_like_user_example():
     assert np.nanmax(np.log10(machmap)) > 0.0
 
 
+def test_make_mach_map_accepts_dissipation_weights():
+    import pytest
+    import shocktest
+
+    result = shocktest.ShockResult(
+        mach=np.array([2.0, 10.0]),
+        shock=np.array([True, True]),
+        center_index=np.array([0, 1]),
+        upstream_index=np.array([0, 1]),
+        downstream_index=np.array([0, 1]),
+        selected_indices=np.array([0, 1]),
+        pos=np.array([[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]]),
+        dx=np.array([1.0, 1.0]),
+    )
+    weights = np.array([9.0, 1.0])
+
+    machmap = painter.make_mach_map(
+        result,
+        plane="xy",
+        bins=(1, 1),
+        extent=(0.0, 1.0, 0.0, 1.0),
+        statistic="mean",
+        method="amr",
+        weights=weights,
+    )
+
+    np.testing.assert_allclose(machmap, np.array([[2.8]]))
+    with pytest.raises(ValueError, match="weights"):
+        painter.make_mach_map(result, statistic="max", weights=weights)
+
+
 def test_area_painting_fills_projected_cell_footprint():
     x = np.array([0.5])
     y = np.array([0.5])
