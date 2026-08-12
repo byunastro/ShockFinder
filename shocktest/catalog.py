@@ -24,6 +24,10 @@ class ShockGroup:
     bounds: np.ndarray
     level_min: int
     level_max: int
+    upstream_temperature: float
+    upstream_density: float
+    external_fraction: float
+    classification: str
 
 
 @dataclass(slots=True)
@@ -76,6 +80,7 @@ class _UnionFind:
 def build_shock_catalog(
     result: ShockResult,
     *,
+    cell=None,
     levels=None,
     dissipation=None,
     mach_tolerance: float = 0.3,
@@ -84,6 +89,8 @@ def build_shock_catalog(
     duplicate_normal_cosine: float = 0.8,
     min_mach: float = 1.0,
     boundary: str = "open",
+    external_temperature: float = 1.0e4,
+    classification_fraction: float = 0.8,
     _neighbor_tables=None,
 ) -> ShockCatalog:
     """Group AMR face-connected shock centers and summarize each surface.
@@ -107,6 +114,10 @@ def build_shock_catalog(
         raise ValueError("duplicate_normal_cosine must be between 0 and 1")
     if min_mach < 1.0:
         raise ValueError("min_mach must be at least 1.0")
+    if not np.isfinite(external_temperature) or external_temperature <= 0.0:
+        raise ValueError("external_temperature must be finite and positive")
+    if not 0.5 <= classification_fraction <= 1.0:
+        raise ValueError("classification_fraction must be between 0.5 and 1.0")
 
     n = result.mach.size
     if result.pos.shape != (n, 3) or result.dx.shape != (n,):
@@ -197,6 +208,8 @@ def build_shock_catalog(
         if area.shape != (n,) or total.shape != (n,):
             raise ValueError("dissipation arrays must have one value per retained cell")
 
+    upstream_temperature, upstream_density = _upstream_fields(cell, result)
+
     groups: list[ShockGroup] = []
     for group_id in range(unique_roots.size):
         rows = np.nonzero(labels == group_id)[0]
@@ -212,6 +225,38 @@ def build_shock_catalog(
         half_width = 0.5 * result.dx[rows, None]
         lower = np.min(result.pos[rows] - half_width, axis=0)
         upper = np.max(result.pos[rows] + half_width, axis=0)
+        valid_upstream = np.isfinite(upstream_temperature[rows])
+        if np.any(valid_upstream):
+            upstream_weights = weights[valid_upstream]
+            upstream_weight_sum = float(np.sum(upstream_weights))
+            group_temperature = float(
+                np.sum(upstream_temperature[rows][valid_upstream] * upstream_weights)
+                / upstream_weight_sum
+            )
+            group_density = float(
+                np.sum(upstream_density[rows][valid_upstream] * upstream_weights)
+                / upstream_weight_sum
+            )
+            external_fraction = float(
+                np.sum(
+                    upstream_weights[
+                        upstream_temperature[rows][valid_upstream]
+                        <= external_temperature
+                    ]
+                )
+                / upstream_weight_sum
+            )
+            if external_fraction >= classification_fraction:
+                classification = "external"
+            elif external_fraction <= 1.0 - classification_fraction:
+                classification = "internal"
+            else:
+                classification = "mixed"
+        else:
+            group_temperature = np.nan
+            group_density = np.nan
+            external_fraction = np.nan
+            classification = "unclassified"
         groups.append(
             ShockGroup(
                 group_id=group_id,
@@ -227,6 +272,10 @@ def build_shock_catalog(
                 bounds=np.stack((lower, upper)),
                 level_min=int(np.min(levels_array[rows])),
                 level_max=int(np.max(levels_array[rows])),
+                upstream_temperature=group_temperature,
+                upstream_density=group_density,
+                external_fraction=external_fraction,
+                classification=classification,
             )
         )
     return ShockCatalog(
@@ -234,6 +283,31 @@ def build_shock_catalog(
         center_representative=representatives,
         groups=groups,
     )
+
+
+def _upstream_fields(cell, result: ShockResult) -> tuple[np.ndarray, np.ndarray]:
+    n = result.mach.size
+    temperature = np.full(n, np.nan, dtype=np.float64)
+    density = np.full(n, np.nan, dtype=np.float64)
+    if cell is None:
+        return temperature, density
+
+    temp_all = ShockFinder._field(
+        cell,
+        (("T", "K"), ("temperature", "K"), "T", "temp", "temperature"),
+    )
+    rho_all = ShockFinder._field(
+        cell,
+        (("rho", "Msol/kpc3"), "rho", "density"),
+    )
+    valid = (result.upstream_index >= 0) & (result.upstream_index < n)
+    if not np.any(valid):
+        return temperature, density
+    upstream_retained = result.upstream_index[valid]
+    upstream_original = result.selected_indices[upstream_retained]
+    temperature[valid] = np.asarray(temp_all, dtype=np.float64)[upstream_original]
+    density[valid] = np.asarray(rho_all, dtype=np.float64)[upstream_original]
+    return temperature, density
 
 
 def analyze_catalog_sensitivity(

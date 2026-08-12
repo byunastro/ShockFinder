@@ -245,3 +245,98 @@ def test_sensitivity_sweep_reports_parameter_effects(monkeypatch):
         if row.min_mach == 1.3 and row.mach_tolerance == 0.2
     )
     assert loose.n_groups < strict.n_groups
+
+
+@pytest.mark.parametrize(
+    ("upstream_temperatures", "expected"),
+    [
+        ([1.0e4, 1.0e4], "external"),
+        ([1.0e6, 2.0e6], "internal"),
+        ([1.0e4, 1.0e6], "mixed"),
+    ],
+)
+def test_catalog_classifies_groups_from_upstream_temperature(
+    upstream_temperatures, expected
+):
+    result = result_from_centers(
+        [
+            [-0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, 1.5, 0.5],
+            [-0.5, 1.5, 0.5],
+        ],
+        [0.0, 3.0, 3.0, 0.0],
+    )
+    result.upstream_index[1] = 0
+    result.upstream_index[2] = 3
+    cell = {
+        ("T", "K"): np.array(
+            [upstream_temperatures[0], 2.0e6, 2.0e6, upstream_temperatures[1]]
+        ),
+        ("rho", "Msol/kpc3"): np.array([2.0, 4.0, 4.0, 6.0]),
+    }
+
+    group = shocktest.build_shock_catalog(result, cell=cell).groups[0]
+
+    assert group.classification == expected
+    assert group.upstream_temperature == pytest.approx(
+        np.mean(upstream_temperatures)
+    )
+    assert group.upstream_density == pytest.approx(4.0)
+    assert group.external_fraction == pytest.approx(
+        np.mean(np.asarray(upstream_temperatures) <= 1.0e4)
+    )
+
+
+def test_catalog_upstream_statistics_are_surface_area_weighted():
+    result = result_from_centers(
+        [
+            [-0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, 1.5, 0.5],
+            [-0.5, 1.5, 0.5],
+        ],
+        [0.0, 3.0, 3.0, 0.0],
+    )
+    result.upstream_index[1] = 0
+    result.upstream_index[2] = 3
+    cell = {
+        ("T", "K"): np.array([1.0e4, 1.0, 1.0, 1.0e6]),
+        ("rho", "Msol/kpc3"): np.array([2.0, 1.0, 1.0, 6.0]),
+    }
+    dissipation = pyShockFinder.DissipationResult(
+        flux=np.zeros(4),
+        total=np.zeros(4),
+        area=np.array([0.0, 3.0, 1.0, 0.0]),
+        efficiency=np.zeros(4),
+        sound_speed=np.zeros(4),
+    )
+
+    group = shocktest.build_shock_catalog(
+        result, cell=cell, dissipation=dissipation
+    ).groups[0]
+
+    assert group.upstream_temperature == pytest.approx((3.0e4 + 1.0e6) / 4.0)
+    assert group.upstream_density == pytest.approx(3.0)
+    assert group.external_fraction == pytest.approx(0.75)
+    assert group.classification == "mixed"
+
+
+def test_catalog_without_cell_remains_unclassified():
+    result = result_from_centers([[0.5, 0.5, 0.5]], [3.0])
+
+    group = shocktest.build_shock_catalog(result).groups[0]
+
+    assert group.classification == "unclassified"
+    assert np.isnan(group.upstream_temperature)
+    assert np.isnan(group.upstream_density)
+    assert np.isnan(group.external_fraction)
+
+
+def test_catalog_validates_classification_thresholds():
+    result = result_from_centers([[0.5, 0.5, 0.5]], [3.0])
+
+    with pytest.raises(ValueError, match="external_temperature"):
+        shocktest.build_shock_catalog(result, external_temperature=0.0)
+    with pytest.raises(ValueError, match="classification_fraction"):
+        shocktest.build_shock_catalog(result, classification_fraction=0.4)

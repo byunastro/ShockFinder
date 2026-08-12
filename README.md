@@ -164,6 +164,7 @@ result = finder.find(cell)
 dissipation = pyShockFinder.compute_dissipation(cell, result)
 catalog = shocktest.build_shock_catalog(
     result,
+    cell=cell,
     dissipation=dissipation,
     mach_tolerance=0.3,
     normal_cosine=0.7,
@@ -172,7 +173,13 @@ catalog = shocktest.build_shock_catalog(
 
 group_labels = catalog.group_id  # -1 for non-shock cells
 for group in catalog.groups:
-    print(group.mach_peak, group.mach_mean, group.area, group.dissipation_total)
+    print(
+        group.mach_peak,
+        group.mach_mean,
+        group.area,
+        group.dissipation_total,
+        group.classification,
+    )
 ```
 
 Group means and centroids are surface-area weighted. When a dissipation result
@@ -180,6 +187,13 @@ is supplied, `group.area` is in kpc2 and total dissipation is in erg/s. Without
 one, area is measured in the square of `result.pos`'s position unit. Grouping
 does not change the existing center-only meaning of `result.shock` or
 `result.mach`.
+
+When `cell` is supplied, each group also reports its surface-area-weighted
+`upstream_temperature`, `upstream_density`, and `external_fraction`. A group is
+`external` when at least 80% of its area has upstream temperature at or below
+`external_temperature=1e4 K`, `internal` when at most 20% does, and `mixed`
+otherwise. These thresholds are configurable with `external_temperature` and
+`classification_fraction`. Without `cell`, groups remain `unclassified`.
 
 With `deduplicate=True`, adjacent centers stacked along the shock normal are
 collapsed to the strongest-Mach representative for catalog construction.

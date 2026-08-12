@@ -91,6 +91,8 @@ class ShockFinder:
         normal_cosine: float = 0.7,
         duplicate_normal_cosine: float = 0.8,
         min_mach: float | None = None,
+        external_temperature: float = 1.0e4,
+        classification_fraction: float = 0.8,
         dissipation_options: dict[str, Any] | None = None,
     ):
         """Run shock detection and optional post-processing in one pass.
@@ -125,6 +127,7 @@ class ShockFinder:
             stage_start = time.perf_counter()
             catalog = make_catalog(
                 result,
+                cell=cell,
                 dissipation=dissipation,
                 mach_tolerance=mach_tolerance,
                 normal_cosine=normal_cosine,
@@ -132,6 +135,8 @@ class ShockFinder:
                 duplicate_normal_cosine=duplicate_normal_cosine,
                 min_mach=self.min_mach if min_mach is None else min_mach,
                 boundary=self.boundary,
+                external_temperature=external_temperature,
+                classification_fraction=classification_fraction,
                 _neighbor_tables=neighbor_tables,
             )
             timings["catalog"] = time.perf_counter() - stage_start

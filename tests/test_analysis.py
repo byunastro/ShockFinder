@@ -131,3 +131,16 @@ def test_analysis_rejects_inconsistent_dissipation_gamma():
 
     with np.testing.assert_raises_regex(ValueError, "must match finder.gamma"):
         finder.analyze(grid_cell(), dissipation_options={"gamma": 5.0 / 3.0})
+
+
+def test_analysis_builds_physical_catalog_from_input_cell():
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 0
+
+    analysis = finder.analyze(grid_cell(), external_temperature=2.0e7)
+
+    assert analysis.catalog.groups
+    assert all(
+        group.classification == "external" for group in analysis.catalog.groups
+    )
+    assert all(np.isfinite(group.upstream_temperature) for group in analysis.catalog.groups)
