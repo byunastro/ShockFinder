@@ -68,6 +68,32 @@ result = finder(cell)
 result = finder.ShockFinder(cell)
 ```
 
+For detection, dissipation, and surface grouping together, use the single-pass
+pipeline. It reuses the AMR neighbor tables instead of rebuilding them for the
+catalog:
+
+```python
+analysis = finder.analyze(
+    cell,
+    compute_dissipation=True,
+    build_catalog=True,
+    deduplicate=True,
+)
+
+result = analysis.result
+dissipation = analysis.dissipation
+catalog = analysis.catalog
+print(analysis.timings)
+print(analysis.counts)
+
+analysis.clear()
+```
+
+`timings` reports input extraction, neighbor construction, Fortran scan,
+dissipation, catalog, detection-total, and end-to-end wall times. The existing
+`find()` API still releases neighbor tables immediately after detection and has
+unchanged output semantics.
+
 ## Input Cell Fields
 
 `cell` is an AMR cell table, not a dense 3D array. The wrapper reads these

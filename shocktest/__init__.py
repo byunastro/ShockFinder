@@ -1,4 +1,5 @@
 from .core import ShockFinder, ShockResult
+from .analysis import ShockAnalysis
 from .catalog import (
     CatalogSensitivity,
     ShockCatalog,
@@ -9,6 +10,7 @@ from .catalog import (
 
 __all__ = [
     "ShockCatalog",
+    "ShockAnalysis",
     "CatalogSensitivity",
     "ShockFinder",
     "ShockGroup",

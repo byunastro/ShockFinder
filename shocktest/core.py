@@ -80,6 +80,62 @@ class ShockFinder:
         """Compatibility alias matching the requested example style."""
         return self.find(cell)
 
+    def analyze(
+        self,
+        cell: Any,
+        *,
+        compute_dissipation: bool = True,
+        build_catalog: bool = True,
+        deduplicate: bool = True,
+        mach_tolerance: float = 0.3,
+        normal_cosine: float = 0.7,
+        duplicate_normal_cosine: float = 0.8,
+        min_mach: float | None = None,
+        dissipation_options: dict[str, Any] | None = None,
+    ):
+        """Run shock detection and optional post-processing in one pass.
+
+        The AMR neighbor tables are retained only until catalog construction is
+        complete, avoiding the second geometry build required by the separate
+        ``find`` then ``build_shock_catalog`` workflow.
+        """
+
+        from .analysis import ShockAnalysis
+        from .catalog import build_shock_catalog as make_catalog
+        from .pyShockFinder import compute_dissipation as make_dissipation
+
+        analysis_start = time.perf_counter()
+        result, neighbor_tables, timings = self._find_internal(cell)
+        dissipation = None
+        catalog = None
+        if compute_dissipation:
+            stage_start = time.perf_counter()
+            dissipation = make_dissipation(
+                cell, result, **({} if dissipation_options is None else dissipation_options)
+            )
+            timings["dissipation"] = time.perf_counter() - stage_start
+        if build_catalog:
+            stage_start = time.perf_counter()
+            catalog = make_catalog(
+                result,
+                dissipation=dissipation,
+                mach_tolerance=mach_tolerance,
+                normal_cosine=normal_cosine,
+                deduplicate=deduplicate,
+                duplicate_normal_cosine=duplicate_normal_cosine,
+                min_mach=self.min_mach if min_mach is None else min_mach,
+                boundary=self.boundary,
+                _neighbor_tables=neighbor_tables,
+            )
+            timings["catalog"] = time.perf_counter() - stage_start
+        timings["total"] = time.perf_counter() - analysis_start
+        return ShockAnalysis(
+            result=result,
+            dissipation=dissipation,
+            catalog=catalog,
+            timings=timings,
+        )
+
     def clear(self) -> None:
         """Compatibility cleanup hook.
 
@@ -91,6 +147,12 @@ class ShockFinder:
         gc.collect()
 
     def find(self, cell: Any) -> ShockResult:
+        result, _, _ = self._find_internal(cell)
+        return result
+
+    def _find_internal(self, cell: Any):
+        total_start = time.perf_counter()
+        timings: dict[str, float] = {}
         if self.boundary != "open":
             raise ValueError(
                 "boundary must be 'open'; ShockFinder inputs are extracted "
@@ -104,13 +166,16 @@ class ShockFinder:
             ) from _IMPORT_ERROR
 
         self._progress("ShockFinder: reading AMR cell fields")
+        stage_start = time.perf_counter()
         arrays = self._extract_amr_arrays(cell)
+        timings["input"] = time.perf_counter() - stage_start
         selected_indices = arrays.pop("selected_indices")
         n = arrays["temp"].size
         self._progress(f"ShockFinder: retained {n:,} cells after filtering")
 
         interval = self._resolved_progress_interval(n)
         self._progress("ShockFinder: building AMR face-neighbor table")
+        stage_start = time.perf_counter()
         neighbors, fine_neighbors = self._build_neighbor_tables(
             arrays["pos"],
             arrays["dx"],
@@ -118,12 +183,13 @@ class ShockFinder:
             show_progress=self.show_progress,
             progress_interval=interval,
         )
+        timings["neighbors"] = time.perf_counter() - stage_start
 
         if n == 0:
             empty_float = np.empty(0, dtype=np.float64)
             empty_bool = np.empty(0, dtype=bool)
             empty_index = np.empty(0, dtype=np.int64)
-            return ShockResult(
+            result = ShockResult(
                 mach=empty_float,
                 shock=empty_bool,
                 center_index=empty_index,
@@ -136,8 +202,12 @@ class ShockFinder:
                 level=np.empty(0, dtype=np.int32),
                 zone_width=empty_float.copy(),
             )
+            timings["scan"] = 0.0
+            timings["detection_total"] = time.perf_counter() - total_start
+            return result, (neighbors, fine_neighbors), timings
 
         self._progress("ShockFinder: running Fortran shock scan")
+        stage_start = time.perf_counter()
         mach, shock, center, upstream, downstream = _shockfinder.shockfinder_kernel.find_shocks(
             arrays["pos"],
             arrays["vel"],
@@ -154,6 +224,7 @@ class ShockFinder:
             int(interval),
             n,
         )
+        timings["scan"] = time.perf_counter() - stage_start
         self._progress("ShockFinder: done")
 
         result_pos = arrays["pos"]
@@ -171,9 +242,9 @@ class ShockFinder:
             nonzero = lengths > 0.0
             valid_rows = np.nonzero(valid_normal)[0]
             normal[valid_rows[nonzero]] = vectors[nonzero] / lengths[nonzero, None]
-        del arrays, neighbors, fine_neighbors
+        del arrays
 
-        return ShockResult(
+        result = ShockResult(
             mach=np.asarray(mach, dtype=np.float64),
             shock=np.asarray(shock, dtype=np.int32).astype(bool),
             center_index=self._to_python_indices(center),
@@ -186,6 +257,8 @@ class ShockFinder:
             level=result_level,
             zone_width=zone_width,
         )
+        timings["detection_total"] = time.perf_counter() - total_start
+        return result, (neighbors, fine_neighbors), timings
 
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:
         x = self._field(cell, (("x", self.position_unit), "x"))
