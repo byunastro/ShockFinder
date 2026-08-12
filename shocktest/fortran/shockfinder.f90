@@ -2,37 +2,38 @@ module shockfinder_kernel
   use iso_fortran_env, only: output_unit
   implicit none
   integer, parameter :: dp = kind(1.0d0)
-  real(8), parameter :: entropy_exponent = 2.0_dp / 3.0_dp
   private
   public :: find_shocks
 
 contains
 
-  ! Return the entropy proxy T/rho^(2/3) used by the Skillman shock criteria.
-  ! The exponent assumes an ideal monatomic gas with gamma = 5/3.
-  pure real(8) function entropy_value(temp, rho) result(s)
-    real(8), intent(in) :: temp, rho
+  ! Return the ideal-gas entropy proxy T/rho^(gamma-1).
+  pure real(8) function entropy_value(temp, rho, gamma) result(s)
+    real(8), intent(in) :: temp, rho, gamma
 
     if (rho > 0.0_dp .and. temp > 0.0_dp) then
-      s = temp / rho**entropy_exponent
+      s = temp / rho**(gamma - 1.0_dp)
     else
       s = 0.0_dp
     end if
   end function entropy_value
 
-  ! Invert the Rankine-Hugoniot temperature jump for gamma = 5/3.
+  ! Invert the ideal-gas Rankine-Hugoniot temperature jump for general gamma.
   ! Ratios below unity are treated as non-shocks with Mach 1.
-  pure real(8) function mach_from_temperature_jump(t_ratio) result(mach)
-    real(8), intent(in) :: t_ratio
-    real(8) :: disc, m2
+  pure real(8) function mach_from_temperature_jump(t_ratio, gamma) result(mach)
+    real(8), intent(in) :: t_ratio, gamma
+    real(8) :: a, b, c, disc, m2
 
     if (t_ratio <= 1.0_dp) then
       mach = 1.0_dp
       return
     end if
 
-    disc = (14.0_dp - 16.0_dp * t_ratio)**2 + 60.0_dp
-    m2 = ((16.0_dp * t_ratio - 14.0_dp) + sqrt(disc)) / 10.0_dp
+    a = 2.0_dp * gamma * (gamma - 1.0_dp)
+    b = 4.0_dp * gamma - (gamma - 1.0_dp)**2 - t_ratio * (gamma + 1.0_dp)**2
+    c = -2.0_dp * (gamma - 1.0_dp)
+    disc = max(b*b - 4.0_dp*a*c, 0.0_dp)
+    m2 = (-b + sqrt(disc)) / (2.0_dp*a)
     mach = sqrt(max(m2, 1.0_dp))
   end function mach_from_temperature_jump
 
@@ -51,10 +52,10 @@ contains
   ! Sample a face state from a same/coarser neighbor or from finer face cells.
   ! The returned values are used for local gradients and divergence.
   pure subroutine face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, &
-       i, face, axis, value_pos, value_vel, value_temp, value_entropy, ok)
+       i, face, axis, gamma, value_pos, value_vel, value_temp, value_entropy, ok)
     integer, intent(in) :: n, i, face, axis
     integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
-    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
     real(8), intent(out) :: value_pos, value_vel, value_temp, value_entropy
     logical, intent(out) :: ok
 
@@ -72,7 +73,7 @@ contains
       value_pos = pos(nb, axis)
       value_vel = vel(nb, axis)
       value_temp = temp(nb)
-      value_entropy = entropy_value(temp(nb), rho(nb))
+      value_entropy = entropy_value(temp(nb), rho(nb), gamma)
       ok = temp(nb) > 0.0_dp .and. rho(nb) > 0.0_dp
       return
     end if
@@ -85,7 +86,7 @@ contains
       count = count + 1
       value_vel = value_vel + vel(nb, axis)
       value_temp = value_temp + temp(nb)
-      value_entropy = value_entropy + entropy_value(temp(nb), rho(nb))
+      value_entropy = value_entropy + entropy_value(temp(nb), rho(nb), gamma)
     end do
     if (count <= 0) return
 
@@ -104,10 +105,10 @@ contains
   ! Compute local velocity divergence plus temperature and entropy gradients.
   ! Invalid cells or missing face pairs simply leave valid set to false.
   pure subroutine local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, i, &
-       divv, grad_t, grad_s, valid)
+       gamma, divv, grad_t, grad_s, valid)
     integer, intent(in) :: n, i
     integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
-    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
     real(8), intent(out) :: divv, grad_t(3), grad_s(3)
     logical, intent(out) :: valid
 
@@ -125,9 +126,9 @@ contains
 
     do axis = 1, 3
       call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, &
-           i, minus_face(axis), axis, xm, vm, tm, sm, okm)
+           i, minus_face(axis), axis, gamma, xm, vm, tm, sm, okm)
       call face_sample(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, &
-           i, plus_face(axis), axis, xp, vp, tp, sp, okp)
+           i, plus_face(axis), axis, gamma, xp, vp, tp, sp, okp)
       if (.not. okm .or. .not. okp) cycle
       dist = xp - xm
       if (abs(dist) <= 0.0_dp) cycle
@@ -227,15 +228,15 @@ contains
   ! Scan AMR cells for Skillman-style shock zones and assign center Mach numbers.
   ! Neighbor tables are supplied by Python/Numba and the cell loop is OpenMP-ready.
   subroutine find_shocks(pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n, &
-       temp_floor, min_mach, max_steps, show_progress, progress_interval, mach, &
+       gamma, temp_floor, min_mach, max_steps, show_progress, progress_interval, mach, &
        shock, center_index, upstream_index, downstream_index)
     !f2py intent(in) pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n
-    !f2py intent(in) temp_floor, min_mach, max_steps, show_progress, progress_interval
+    !f2py intent(in) gamma, temp_floor, min_mach, max_steps, show_progress, progress_interval
     !f2py intent(out) mach, shock, center_index, upstream_index, downstream_index
     integer, intent(in) :: n, max_steps, show_progress, progress_interval
     integer, intent(in) :: level(n), neighbors(n, 6), fine_neighbors(n, 6, 4)
     real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
-    real(8), intent(in) :: temp_floor, min_mach
+    real(8), intent(in) :: gamma, temp_floor, min_mach
     real(8), intent(out) :: mach(n)
     integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
 
@@ -267,7 +268,7 @@ contains
     !$omp parallel do schedule(static) private(i, done, grad_s, valid, clock_now, elapsed)
     do i = 1, n
       call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_neighbors, n, i, &
-           divv_arr(i), grad_t_arr(i, :), grad_s, valid)
+           gamma, divv_arr(i), grad_t_arr(i, :), grad_s, valid)
       candidate(i) = valid .and. divv_arr(i) < 0.0_dp .and. &
            dot_product(grad_t_arr(i, :), grad_s) > 0.0_dp
       if (show_progress /= 0 .and. progress_interval > 0) then
@@ -400,8 +401,8 @@ contains
       if (rho_post <= rho_pre) cycle
 
       ratio = t_post / t_pre
-      m = mach_from_temperature_jump(ratio)
-      if (m < min_mach) cycle
+      m = mach_from_temperature_jump(ratio, gamma)
+      if (m < min_mach * (1.0_dp - 1.0e-12_dp)) cycle
 
       !$omp critical(shock_update)
       if (m > mach(center)) then

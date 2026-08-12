@@ -80,6 +80,20 @@ def test_temperature_jump_formula_matches_kernel_inverse():
     np.testing.assert_allclose(mach_from_temperature_jump(ratio), mach)
 
 
+@pytest.mark.parametrize("gamma", [1.4, 1.5, 5.0 / 3.0])
+@pytest.mark.parametrize("mach", [1.5, 3.0, 8.0])
+def test_general_gamma_mach_recovery(gamma, mach):
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 0
+    finder.gamma = gamma
+    finder.min_mach = 1.3
+
+    result = finder.find(planar_shock_cell(mach, n=18, shock_index=9, gamma=gamma))
+
+    assert result.shock.any()
+    assert result.mach[result.shock].max() == pytest.approx(mach, rel=0.05)
+
+
 def test_external_internal_classification_and_dissipation_weighting():
     finder = shocktest.ShockFinder()
     finder.minlevel = 0

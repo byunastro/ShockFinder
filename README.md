@@ -45,6 +45,7 @@ finder.maxlevel = 20
 finder.minlevel = 13
 finder.show_progress = True
 finder.boundary = "open"
+finder.gamma = 5.0 / 3.0
 
 result = finder.ShockFinder(cell)
 
@@ -93,6 +94,12 @@ analysis.clear()
 dissipation, catalog, detection-total, and end-to-end wall times. The existing
 `find()` API still releases neighbor tables immediately after detection and has
 unchanged output semantics.
+
+`finder.gamma` is used consistently by the entropy-gradient shock criterion,
+the general ideal-gas Rankine-Hugoniot temperature-jump inversion, and the
+single-pass dissipation calculation. The default `5/3` preserves the original
+monatomic-gas behavior. Physical settings and all required input fields are
+validated before the compiled scan; NaN and infinite values are rejected.
 
 ## Input Cell Fields
 

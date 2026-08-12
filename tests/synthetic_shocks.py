@@ -19,18 +19,22 @@ class ShockSpec:
     level: int = 20
 
 
-def temperature_jump_from_mach(mach: float) -> float:
-    """Rankine-Hugoniot T2/T1 for gamma=5/3."""
+def temperature_jump_from_mach(mach: float, gamma: float = GAMMA) -> float:
+    """Rankine-Hugoniot T2/T1 for an ideal gas."""
 
     m2 = float(mach) ** 2
-    return ((5.0 * m2 - 1.0) * (m2 + 3.0)) / (16.0 * m2)
+    return (
+        (2.0 * gamma * m2 - (gamma - 1.0))
+        * ((gamma - 1.0) * m2 + 2.0)
+        / ((gamma + 1.0) ** 2 * m2)
+    )
 
 
-def density_jump_from_mach(mach: float) -> float:
-    """Rankine-Hugoniot rho2/rho1 for gamma=5/3."""
+def density_jump_from_mach(mach: float, gamma: float = GAMMA) -> float:
+    """Rankine-Hugoniot rho2/rho1 for an ideal gas."""
 
     m2 = float(mach) ** 2
-    return (4.0 * m2) / (m2 + 3.0)
+    return ((gamma + 1.0) * m2) / ((gamma - 1.0) * m2 + 2.0)
 
 
 def mach_from_temperature_jump(t_ratio: np.ndarray | float) -> np.ndarray:
@@ -50,6 +54,7 @@ def planar_shock_cell(
     upstream_temperature: float = 1.0e4,
     upstream_density: float = 1.0e6,
     level: int = 20,
+    gamma: float = GAMMA,
 ):
     """Return a 1D planar shock embedded in AMR-cell table fields."""
 
@@ -63,8 +68,8 @@ def planar_shock_cell(
     rho = np.full(n, upstream_density, dtype=np.float64)
 
     post = slice(shock_index, None)
-    temp[post] = upstream_temperature * temperature_jump_from_mach(mach)
-    rho[post] = upstream_density * density_jump_from_mach(mach)
+    temp[post] = upstream_temperature * temperature_jump_from_mach(mach, gamma)
+    rho[post] = upstream_density * density_jump_from_mach(mach, gamma)
 
     vx = np.full(n, 100.0, dtype=np.float64)
     vx[post] = -100.0

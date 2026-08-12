@@ -110,8 +110,15 @@ class ShockFinder:
         catalog = None
         if compute_dissipation:
             stage_start = time.perf_counter()
+            options = {} if dissipation_options is None else dict(dissipation_options)
+            if "gamma" in options and not np.isclose(float(options["gamma"]), float(self.gamma)):
+                raise ValueError(
+                    "dissipation gamma must match finder.gamma for a physically "
+                    "consistent single-pass analysis"
+                )
+            options["gamma"] = float(self.gamma)
             dissipation = make_dissipation(
-                cell, result, **({} if dissipation_options is None else dissipation_options)
+                cell, result, **options
             )
             timings["dissipation"] = time.perf_counter() - stage_start
         if build_catalog:
@@ -153,6 +160,7 @@ class ShockFinder:
     def _find_internal(self, cell: Any):
         total_start = time.perf_counter()
         timings: dict[str, float] = {}
+        self._validate_settings()
         if self.boundary != "open":
             raise ValueError(
                 "boundary must be 'open'; ShockFinder inputs are extracted "
@@ -217,6 +225,7 @@ class ShockFinder:
             arrays["level"],
             neighbors,
             fine_neighbors,
+            float(self.gamma),
             float(self.temperature_floor),
             float(self.min_mach),
             int(self.max_steps),
@@ -260,6 +269,22 @@ class ShockFinder:
         timings["detection_total"] = time.perf_counter() - total_start
         return result, (neighbors, fine_neighbors), timings
 
+    def _validate_settings(self) -> None:
+        if not np.isfinite(self.gamma) or self.gamma <= 1.0:
+            raise ValueError("gamma must be finite and greater than 1")
+        if not np.isfinite(self.temperature_floor) or self.temperature_floor <= 0.0:
+            raise ValueError("temperature_floor must be finite and positive")
+        if not np.isfinite(self.min_mach) or self.min_mach < 1.0:
+            raise ValueError("min_mach must be finite and at least 1")
+        if (
+            isinstance(self.max_steps, (bool, np.bool_))
+            or int(self.max_steps) != self.max_steps
+            or self.max_steps < 0
+        ):
+            raise ValueError("max_steps must be a non-negative integer")
+        if int(self.minlevel) > int(self.maxlevel):
+            raise ValueError("minlevel must not exceed maxlevel")
+
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:
         x = self._field(cell, (("x", self.position_unit), "x"))
         y = self._field(cell, (("y", self.position_unit), "y"))
@@ -270,7 +295,12 @@ class ShockFinder:
         vz = self._field(cell, (("vz", self.velocity_unit), "vz"))
         temp = self._field(cell, (("T", self.temperature_unit), ("temperature", self.temperature_unit), "T", "temp", "temperature"))
         rho = self._field(cell, (("rho", self.density_unit), "rho", "density"))
-        level = self._field(cell, ("level", "levels", "refinement_level")).astype(np.int32, copy=False)
+        level_values = self._field(cell, ("level", "levels", "refinement_level"))
+        if not np.all(np.isfinite(level_values)):
+            raise ValueError("level must contain only finite values")
+        if not np.all(level_values == np.floor(level_values)):
+            raise ValueError("level must contain integer values")
+        level = level_values.astype(np.int32, copy=False)
 
         n = x.size
         fields = {
@@ -289,6 +319,10 @@ class ShockFinder:
                 raise ValueError(f"{name} must be a 1D AMR cell field")
             if values.size != n:
                 raise ValueError(f"{name} has length {values.size}, expected {n}")
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{name} must contain only finite values")
+        if not np.all(np.isfinite(x)):
+            raise ValueError("x must contain only finite values")
 
         # Keep only cells requested by the caller. Geometry still comes from dx,
         # not from the level filter.

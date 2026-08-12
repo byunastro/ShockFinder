@@ -107,3 +107,27 @@ def test_analysis_handles_empty_extracted_region():
     assert analysis.dissipation.total.size == 0
     assert analysis.catalog.groups == []
     assert analysis.counts["retained"] == 0
+
+
+def test_analysis_uses_finder_gamma_for_dissipation():
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 0
+    finder.gamma = 1.4
+    cell = grid_cell()
+
+    analysis = finder.analyze(cell)
+    expected = pyShockFinder.compute_dissipation(
+        cell, analysis.result, gamma=finder.gamma
+    )
+
+    np.testing.assert_allclose(analysis.dissipation.efficiency, expected.efficiency)
+    np.testing.assert_allclose(analysis.dissipation.sound_speed, expected.sound_speed)
+
+
+def test_analysis_rejects_inconsistent_dissipation_gamma():
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 0
+    finder.gamma = 1.4
+
+    with np.testing.assert_raises_regex(ValueError, "must match finder.gamma"):
+        finder.analyze(grid_cell(), dissipation_options={"gamma": 5.0 / 3.0})

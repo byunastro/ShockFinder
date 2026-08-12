@@ -177,6 +177,7 @@ def test_shock_center_considers_finer_face_candidates():
         level,
         neighbors,
         fine_neighbors,
+        5.0 / 3.0,
         1.0e4,
         1.0,
         1,
@@ -209,6 +210,45 @@ def test_only_open_boundary_is_supported_for_extracted_regions():
     finder.boundary = "periodic"
     with pytest.raises(ValueError, match="boundary must be 'open'"):
         finder.find(line_cell())
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("gamma", 1.0, "gamma"),
+        ("gamma", np.nan, "gamma"),
+        ("temperature_floor", 0.0, "temperature_floor"),
+        ("min_mach", 0.9, "min_mach"),
+        ("max_steps", -1, "max_steps"),
+        ("max_steps", 1.5, "max_steps"),
+    ],
+)
+def test_invalid_physical_settings_are_rejected(attribute, value, message):
+    finder = shocktest.ShockFinder()
+    setattr(finder, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        finder.find(line_cell())
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        ("x", "km"),
+        ("dx", "km"),
+        ("vx", "km/s"),
+        ("T", "K"),
+        ("rho", "Msol/kpc3"),
+        "level",
+    ],
+)
+def test_nonfinite_input_fields_are_rejected(field):
+    cell = line_cell()
+    cell[field] = np.asarray(cell[field], dtype=float)
+    cell[field][2] = np.nan
+
+    with pytest.raises(ValueError, match="finite"):
+        shocktest.ShockFinder().find(cell)
 
 
 def test_shock_result_clear_releases_arrays():
