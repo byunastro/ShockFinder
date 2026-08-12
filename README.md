@@ -102,11 +102,43 @@ filter.
 - `upstream_index`: retained-row index used for the preshock state, `-1` elsewhere.
 - `downstream_index`: retained-row index used for the postshock state, `-1` elsewhere.
 - `selected_indices`: original input-row indices retained after level filtering.
+- `normal`: unit shock normal from the retained upstream cell toward the
+  downstream cell; zero for non-shock cells.
+- `level`: AMR level of every retained cell.
 
 Neighbor links are built from AMR cell centers and widths. Same-level face
 neighbors are preferred. Fine cells can fall back to coarser face neighbors, and
 coarse cells adjacent to refined regions pass the four finer face cells to the
 Fortran kernel so gradients can use their face-averaged state.
+
+## Shock Surface Catalog
+
+Face-connected shock centers can be grouped into physical shock surfaces. The
+grouping follows same-level and coarse/fine AMR face links and requires both a
+similar Mach number and a compatible shock-normal orientation:
+
+```python
+from shocktest import pyShockFinder
+
+result = finder.find(cell)
+dissipation = pyShockFinder.compute_dissipation(cell, result)
+catalog = shocktest.build_shock_catalog(
+    result,
+    dissipation=dissipation,
+    mach_tolerance=0.3,
+    normal_cosine=0.7,
+)
+
+group_labels = catalog.group_id  # -1 for non-shock cells
+for group in catalog.groups:
+    print(group.mach_peak, group.mach_mean, group.area, group.dissipation_total)
+```
+
+Group means and centroids are surface-area weighted. When a dissipation result
+is supplied, `group.area` is in kpc2 and total dissipation is in erg/s. Without
+one, area is measured in the square of `result.pos`'s position unit. Grouping
+does not change the existing center-only meaning of `result.shock` or
+`result.mach`.
 
 ## Python Examples
 

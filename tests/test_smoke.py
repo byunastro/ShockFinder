@@ -214,3 +214,5 @@ def test_shock_result_clear_releases_arrays():
     assert result.selected_indices.size == 0
     assert result.pos is None
     assert result.dx is None
+    assert result.normal is None
+    assert result.level is None
