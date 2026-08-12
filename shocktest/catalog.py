@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -28,6 +29,18 @@ class ShockGroup:
     upstream_density: float
     external_fraction: float
     classification: str
+    boundary_faces: np.ndarray
+    touches_boundary: bool
+    valid_upstream_fraction: float
+    classification_confidence: float
+    mach_std: float
+    normal_dispersion: float
+    zone_width_mean: float
+    zone_width_min: float
+    zone_width_max: float
+    level_count: int
+    is_complete: bool
+    quality_flags: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -37,6 +50,7 @@ class ShockCatalog:
     group_id: np.ndarray
     center_representative: np.ndarray
     groups: list[ShockGroup]
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -91,6 +105,10 @@ def build_shock_catalog(
     boundary: str = "open",
     external_temperature: float = 1.0e4,
     classification_fraction: float = 0.8,
+    boundary_margin_cells: float = 0.0,
+    minimum_group_centers: int = 2,
+    maximum_normal_dispersion: float = 0.3,
+    provenance: dict[str, object] | None = None,
     _neighbor_tables=None,
 ) -> ShockCatalog:
     """Group AMR face-connected shock centers and summarize each surface.
@@ -118,6 +136,12 @@ def build_shock_catalog(
         raise ValueError("external_temperature must be finite and positive")
     if not 0.5 <= classification_fraction <= 1.0:
         raise ValueError("classification_fraction must be between 0.5 and 1.0")
+    if boundary_margin_cells < 0.0:
+        raise ValueError("boundary_margin_cells must be non-negative")
+    if minimum_group_centers < 1:
+        raise ValueError("minimum_group_centers must be at least 1")
+    if not 0.0 <= maximum_normal_dispersion <= 1.0:
+        raise ValueError("maximum_normal_dispersion must be between 0 and 1")
 
     n = result.mach.size
     if result.pos.shape != (n, 3) or result.dx.shape != (n,):
@@ -140,7 +164,22 @@ def build_shock_catalog(
     labels = np.full(n, -1, dtype=np.int64)
     representatives = np.full(n, -1, dtype=np.int64)
     if shock_rows.size == 0:
-        return ShockCatalog(group_id=labels, center_representative=representatives, groups=[])
+        return ShockCatalog(
+            group_id=labels,
+            center_representative=representatives,
+            groups=[],
+            metadata=_catalog_metadata(
+                result,
+                mach_tolerance,
+                normal_cosine,
+                deduplicate,
+                duplicate_normal_cosine,
+                min_mach,
+                external_temperature,
+                classification_fraction,
+                provenance,
+            ),
+        )
 
     if _neighbor_tables is None:
         neighbors, fine_neighbors = ShockFinder._build_neighbor_tables(
@@ -209,6 +248,8 @@ def build_shock_catalog(
             raise ValueError("dissipation arrays must have one value per retained cell")
 
     upstream_temperature, upstream_density = _upstream_fields(cell, result)
+    region_lower = np.min(result.pos - 0.5 * result.dx[:, None], axis=0)
+    region_upper = np.max(result.pos + 0.5 * result.dx[:, None], axis=0)
 
     groups: list[ShockGroup] = []
     for group_id in range(unique_roots.size):
@@ -246,6 +287,9 @@ def build_shock_catalog(
                 )
                 / upstream_weight_sum
             )
+            valid_upstream_fraction = float(
+                np.sum(upstream_weights) / weight_sum
+            )
             if external_fraction >= classification_fraction:
                 classification = "external"
             elif external_fraction <= 1.0 - classification_fraction:
@@ -257,13 +301,71 @@ def build_shock_catalog(
             group_density = np.nan
             external_fraction = np.nan
             classification = "unclassified"
+            valid_upstream_fraction = 0.0
+
+        mach_mean = float(np.sum(result.mach[rows] * weights) / weight_sum)
+        mach_std = float(
+            np.sqrt(np.sum((result.mach[rows] - mach_mean) ** 2 * weights) / weight_sum)
+        )
+        group_normals = normals[rows].copy()
+        valid_normals = np.linalg.norm(group_normals, axis=1) > 0.0
+        if np.any(valid_normals):
+            reference = group_normals[np.nonzero(valid_normals)[0][0]]
+            flips = np.sum(group_normals * reference, axis=1) < 0.0
+            group_normals[flips] *= -1.0
+            normal_resultant = np.average(group_normals[valid_normals], axis=0, weights=weights[valid_normals])
+            normal_dispersion = float(1.0 - np.clip(np.linalg.norm(normal_resultant), 0.0, 1.0))
+        else:
+            normal_dispersion = 1.0
+        zone_values = (
+            np.asarray(result.zone_width[rows], dtype=np.float64)
+            if result.zone_width is not None
+            else np.zeros(rows.size, dtype=np.float64)
+        )
+        positive_zone = zone_values > 0.0
+        if np.any(positive_zone):
+            zone_width_mean = float(np.average(zone_values[positive_zone], weights=weights[positive_zone]))
+            zone_width_min = float(np.min(zone_values[positive_zone]))
+            zone_width_max = float(np.max(zone_values[positive_zone]))
+        else:
+            zone_width_mean = zone_width_min = zone_width_max = 0.0
+        margin = boundary_margin_cells * result.dx[rows, None]
+        cell_lower = result.pos[rows] - 0.5 * result.dx[rows, None]
+        cell_upper = result.pos[rows] + 0.5 * result.dx[rows, None]
+        boundary_faces = np.array(
+            [
+                np.any(cell_lower[:, 0] - margin[:, 0] <= region_lower[0]),
+                np.any(cell_upper[:, 0] + margin[:, 0] >= region_upper[0]),
+                np.any(cell_lower[:, 1] - margin[:, 0] <= region_lower[1]),
+                np.any(cell_upper[:, 1] + margin[:, 0] >= region_upper[1]),
+                np.any(cell_lower[:, 2] - margin[:, 0] <= region_lower[2]),
+                np.any(cell_upper[:, 2] + margin[:, 0] >= region_upper[2]),
+            ],
+            dtype=bool,
+        )
+        touches_boundary = bool(np.any(boundary_faces))
+        classification_confidence = (
+            float(max(external_fraction, 1.0 - external_fraction))
+            if np.isfinite(external_fraction)
+            else np.nan
+        )
+        flags: list[str] = []
+        if touches_boundary:
+            flags.append("touches_boundary")
+        if valid_upstream_fraction < 1.0:
+            flags.append("missing_upstream")
+        if rows.size < minimum_group_centers:
+            flags.append("small_group")
+        if normal_dispersion > maximum_normal_dispersion:
+            flags.append("normal_dispersion")
+        is_complete = not touches_boundary and valid_upstream_fraction == 1.0
         groups.append(
             ShockGroup(
                 group_id=group_id,
                 center_indices=rows,
                 n_centers=rows.size,
                 mach_peak=float(np.max(result.mach[rows])),
-                mach_mean=float(np.sum(result.mach[rows] * weights) / weight_sum),
+                mach_mean=mach_mean,
                 area=weight_sum,
                 area_unit="kpc2" if dissipation is not None else "position_unit2",
                 dissipation_total=float(np.sum(total[rows])),
@@ -276,13 +378,81 @@ def build_shock_catalog(
                 upstream_density=group_density,
                 external_fraction=external_fraction,
                 classification=classification,
+                boundary_faces=boundary_faces,
+                touches_boundary=touches_boundary,
+                valid_upstream_fraction=valid_upstream_fraction,
+                classification_confidence=classification_confidence,
+                mach_std=mach_std,
+                normal_dispersion=normal_dispersion,
+                zone_width_mean=zone_width_mean,
+                zone_width_min=zone_width_min,
+                zone_width_max=zone_width_max,
+                level_count=int(np.unique(levels_array[rows]).size),
+                is_complete=is_complete,
+                quality_flags=tuple(flags),
             )
         )
+    groups = sorted(
+        groups,
+        key=lambda group: (
+            -group.mach_peak,
+            *np.asarray(group.centroid, dtype=np.float64).tolist(),
+            -group.area,
+        ),
+    )
+    old_to_new = np.full(len(groups), -1, dtype=np.int64)
+    for new_id, group in enumerate(groups):
+        old_to_new[group.group_id] = new_id
+        group.group_id = new_id
+    grouped = labels >= 0
+    labels[grouped] = old_to_new[labels[grouped]]
     return ShockCatalog(
         group_id=labels,
         center_representative=representatives,
         groups=groups,
+        metadata=_catalog_metadata(
+            result,
+            mach_tolerance,
+            normal_cosine,
+            deduplicate,
+            duplicate_normal_cosine,
+            min_mach,
+            external_temperature,
+            classification_fraction,
+            provenance,
+        ),
     )
+
+
+def _catalog_metadata(
+    result,
+    mach_tolerance,
+    normal_cosine,
+    deduplicate,
+    duplicate_normal_cosine,
+    min_mach,
+    external_temperature,
+    classification_fraction,
+    provenance,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "retained_cells": int(result.mach.size),
+        "mach_tolerance": float(mach_tolerance),
+        "normal_cosine": float(normal_cosine),
+        "deduplicate": bool(deduplicate),
+        "duplicate_normal_cosine": float(duplicate_normal_cosine),
+        "min_mach": float(min_mach),
+        "external_temperature": float(external_temperature),
+        "classification_fraction": float(classification_fraction),
+        "boundary": "open",
+    }
+    if result.level is not None and result.level.size:
+        metadata["level_min"] = int(np.min(result.level))
+        metadata["level_max"] = int(np.max(result.level))
+    if provenance:
+        metadata.update(provenance)
+    return metadata
 
 
 def _upstream_fields(cell, result: ShockResult) -> tuple[np.ndarray, np.ndarray]:

@@ -44,6 +44,9 @@ def test_catalog_npz_round_trip_preserves_complete_catalog(tmp_path):
     assert len(loaded.groups) == len(analysis.catalog.groups)
     for actual, expected in zip(loaded.groups, analysis.catalog.groups):
         assert_group_equal(actual, expected)
+        np.testing.assert_array_equal(actual.boundary_faces, expected.boundary_faces)
+        assert actual.quality_flags == expected.quality_flags
+    assert loaded.metadata == analysis.catalog.metadata
 
 
 def test_empty_catalog_round_trip(tmp_path):
@@ -118,3 +121,24 @@ def test_catalog_loader_rejects_inconsistent_center_counts(tmp_path):
 
     with pytest.raises(ValueError, match="center counts"):
         shocktest.load_shock_catalog(invalid_path)
+
+
+def test_schema_v1_catalog_is_upgraded_conservatively(tmp_path):
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 0
+    catalog = finder.analyze(grid_cell()).catalog
+    path = tmp_path / "legacy.npz"
+    import shocktest.catalog_io as catalog_io
+
+    arrays = catalog_io._catalog_arrays(catalog)
+    v2_only = catalog_io._required_fields(2) - catalog_io._required_fields(1)
+    for field in v2_only:
+        arrays.pop(field)
+    arrays["schema_version"] = np.asarray(1, dtype=np.int32)
+    np.savez(path, **arrays)
+
+    loaded = shocktest.load_shock_catalog(path)
+
+    assert loaded.metadata == {"loaded_from_schema": 1}
+    assert all(not group.is_complete for group in loaded.groups)
+    assert all(group.quality_flags == ("legacy_schema",) for group in loaded.groups)

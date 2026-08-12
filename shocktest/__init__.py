@@ -6,6 +6,7 @@ from .catalog_io import (
     save_shock_catalog,
     save_shock_catalog_csv,
 )
+from .catalog_qa import plot_catalog_quality, summarize_catalog_quality
 from .catalog import (
     CatalogSensitivity,
     ShockCatalog,
@@ -25,6 +26,8 @@ __all__ = [
     "analyze_catalog_sensitivity",
     "build_shock_catalog",
     "load_shock_catalog",
+    "plot_catalog_quality",
     "save_shock_catalog",
     "save_shock_catalog_csv",
+    "summarize_catalog_quality",
 ]

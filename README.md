@@ -231,7 +231,9 @@ catalog = shocktest.load_shock_catalog("shock_catalog.npz")
 
 The archive preserves per-cell group labels, center-representative mappings,
 variable-length center lists, geometry, physical statistics, classifications,
-and units. For table inspection or plotting tools, export one summary row per
+quality metrics, provenance metadata, and units. Schema-v1 catalogs remain
+readable and are conservatively marked as legacy/incomplete. For table
+inspection or plotting tools, export one summary row per
 group:
 
 ```python
@@ -240,6 +242,25 @@ shocktest.save_shock_catalog_csv("shock_groups.csv", catalog)
 
 CSV is a summary format and does not contain the per-cell mappings required for
 a full round trip; use NPZ when the catalog will be loaded back into ShockFinder.
+
+Groups receive deterministic IDs ordered by peak Mach, centroid, and area. Each
+group reports six boundary-face flags, `touches_boundary`, computational
+`is_complete`, valid-upstream fraction, Mach scatter, normal dispersion,
+zone-width statistics, level count, classification confidence, and quality
+flags. `is_complete` means the detected group does not touch the extracted
+region boundary and all representative centers have valid upstream states; it
+does not claim physical completeness outside the supplied region.
+
+Pass run-specific identifiers through `provenance` and inspect catalog health:
+
+```python
+analysis = finder.analyze(
+    cell,
+    provenance={"snapshot": 620, "region": "cluster-core"},
+)
+summary = shocktest.summarize_catalog_quality(analysis.catalog)
+fig, axes = shocktest.plot_catalog_quality(analysis.catalog)
+```
 
 ## Python Examples
 

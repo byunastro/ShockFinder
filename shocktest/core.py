@@ -93,6 +93,10 @@ class ShockFinder:
         min_mach: float | None = None,
         external_temperature: float = 1.0e4,
         classification_fraction: float = 0.8,
+        boundary_margin_cells: float = 0.0,
+        minimum_group_centers: int = 2,
+        maximum_normal_dispersion: float = 0.3,
+        provenance: dict[str, object] | None = None,
         dissipation_options: dict[str, Any] | None = None,
     ):
         """Run shock detection and optional post-processing in one pass.
@@ -137,6 +141,10 @@ class ShockFinder:
                 boundary=self.boundary,
                 external_temperature=external_temperature,
                 classification_fraction=classification_fraction,
+                boundary_margin_cells=boundary_margin_cells,
+                minimum_group_centers=minimum_group_centers,
+                maximum_normal_dispersion=maximum_normal_dispersion,
+                provenance=provenance,
                 _neighbor_tables=neighbor_tables,
             )
             timings["catalog"] = time.perf_counter() - stage_start

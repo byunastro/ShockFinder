@@ -340,3 +340,68 @@ def test_catalog_validates_classification_thresholds():
         shocktest.build_shock_catalog(result, external_temperature=0.0)
     with pytest.raises(ValueError, match="classification_fraction"):
         shocktest.build_shock_catalog(result, classification_fraction=0.4)
+
+
+def test_group_ids_are_deterministic_across_cell_order():
+    result = result_from_centers(
+        [[0.5, 0.5, 0.5], [0.5, 1.5, 0.5], [5.5, 0.5, 0.5]],
+        [2.9, 3.0, 5.0],
+    )
+    order = np.array([1, 2, 0])
+    shuffled = result_from_centers(
+        result.pos[order], result.mach[order], normal=result.normal[order]
+    )
+
+    first = shocktest.build_shock_catalog(result)
+    second = shocktest.build_shock_catalog(shuffled)
+
+    first_by_peak = {group.mach_peak: group.group_id for group in first.groups}
+    second_by_peak = {group.mach_peak: group.group_id for group in second.groups}
+    assert first_by_peak == second_by_peak == {5.0: 0, 3.0: 1}
+
+
+def test_catalog_reports_boundary_completeness_and_quality_flags():
+    result = result_from_centers(
+        [
+            [0.5, 0.5, 0.5],
+            [1.5, 0.5, 0.5],
+            [1.5, 1.5, 0.5],
+            [1.5, 2.5, 0.5],
+            [2.5, 1.5, 0.5],
+            [1.5, 1.5, -0.5],
+            [1.5, 1.5, 1.5],
+        ],
+        [0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    result.upstream_index[2] = 1
+    result.zone_width = np.array([0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+    cell = {
+        ("T", "K"): np.array([1.0, 1.0e4, 2.0e4, 1.0, 1.0, 1.0, 1.0]),
+        ("rho", "Msol/kpc3"): np.ones(7),
+    }
+
+    group = shocktest.build_shock_catalog(result, cell=cell).groups[0]
+
+    assert not group.touches_boundary
+    assert not np.any(group.boundary_faces)
+    assert group.is_complete
+    assert group.valid_upstream_fraction == pytest.approx(1.0)
+    assert group.zone_width_mean == pytest.approx(2.0)
+    assert group.level_count == 1
+    assert group.quality_flags == ("small_group",)
+
+
+def test_catalog_metadata_records_settings_and_user_provenance():
+    result = result_from_centers([[0.5, 0.5, 0.5]], [3.0])
+
+    catalog = shocktest.build_shock_catalog(
+        result,
+        min_mach=1.5,
+        provenance={"snapshot": 620, "region": "cluster-core"},
+    )
+
+    assert catalog.metadata["min_mach"] == pytest.approx(1.5)
+    assert catalog.metadata["snapshot"] == 620
+    assert catalog.metadata["region"] == "cluster-core"
+    assert catalog.metadata["boundary"] == "open"
+    assert "created_utc" in catalog.metadata
