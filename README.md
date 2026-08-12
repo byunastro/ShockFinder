@@ -219,6 +219,28 @@ Each row reports the input and representative center counts, group count,
 surface area, total dissipation, peak Mach, and area-weighted mean Mach for one
 parameter combination.
 
+## Saving Catalogs
+
+The complete catalog can be stored in a versioned, non-pickle NPZ archive and
+loaded without the original cell data:
+
+```python
+shocktest.save_shock_catalog("shock_catalog.npz", catalog)
+catalog = shocktest.load_shock_catalog("shock_catalog.npz")
+```
+
+The archive preserves per-cell group labels, center-representative mappings,
+variable-length center lists, geometry, physical statistics, classifications,
+and units. For table inspection or plotting tools, export one summary row per
+group:
+
+```python
+shocktest.save_shock_catalog_csv("shock_groups.csv", catalog)
+```
+
+CSV is a summary format and does not contain the per-cell mappings required for
+a full round trip; use NPZ when the catalog will be loaded back into ShockFinder.
+
 ## Python Examples
 
 `make_mach_map` and `make_disspE_map` default to `method="amr"`, which paints
