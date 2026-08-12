@@ -216,3 +216,4 @@ def test_shock_result_clear_releases_arrays():
     assert result.dx is None
     assert result.normal is None
     assert result.level is None
+    assert result.zone_width is None

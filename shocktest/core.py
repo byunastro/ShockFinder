@@ -30,6 +30,7 @@ class ShockResult:
     dx: np.ndarray | None = None
     normal: np.ndarray | None = None
     level: np.ndarray | None = None
+    zone_width: np.ndarray | None = None
 
     def clear(self) -> None:
         """Release arrays held by this result object."""
@@ -47,6 +48,7 @@ class ShockResult:
         self.dx = None
         self.normal = None
         self.level = None
+        self.zone_width = None
         gc.collect()
 
 
@@ -126,6 +128,7 @@ class ShockFinder:
                 dx=empty_float.copy(),
                 normal=np.empty((0, 3), dtype=np.float64),
                 level=np.empty(0, dtype=np.int32),
+                zone_width=empty_float.copy(),
             )
 
         self._progress("ShockFinder: running Fortran shock scan")
@@ -151,12 +154,14 @@ class ShockFinder:
         result_dx = arrays["dx"]
         result_level = arrays["level"]
         normal = np.zeros_like(result_pos)
+        zone_width = np.zeros(n, dtype=np.float64)
         valid_normal = (upstream > 0) & (downstream > 0)
         if np.any(valid_normal):
             upstream_rows = np.asarray(upstream[valid_normal], dtype=np.int64) - 1
             downstream_rows = np.asarray(downstream[valid_normal], dtype=np.int64) - 1
             vectors = result_pos[downstream_rows] - result_pos[upstream_rows]
             lengths = np.linalg.norm(vectors, axis=1)
+            zone_width[np.nonzero(valid_normal)[0]] = lengths
             nonzero = lengths > 0.0
             valid_rows = np.nonzero(valid_normal)[0]
             normal[valid_rows[nonzero]] = vectors[nonzero] / lengths[nonzero, None]
@@ -173,6 +178,7 @@ class ShockFinder:
             dx=result_dx,
             normal=normal,
             level=result_level,
+            zone_width=zone_width,
         )
 
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:

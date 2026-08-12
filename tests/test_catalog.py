@@ -124,3 +124,42 @@ def test_grouping_connects_coarse_and_fine_face_centers():
     catalog = shocktest.build_shock_catalog(result)
 
     assert len(catalog.groups) == 1
+
+
+def test_deduplication_collapses_centers_stacked_along_shock_normal():
+    result = result_from_centers(
+        [[0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [1.5, 1.5, 0.5]],
+        [2.5, 3.0, 3.1],
+    )
+
+    catalog = shocktest.build_shock_catalog(result, deduplicate=True)
+
+    assert catalog.center_representative[0] == 1
+    assert catalog.center_representative[1] == 1
+    assert catalog.center_representative[2] == 2
+    assert catalog.group_id[0] == -1
+    assert len(catalog.groups) == 1
+    np.testing.assert_array_equal(catalog.groups[0].center_indices, [1, 2])
+
+
+def test_deduplication_preserves_tangential_surface_centers():
+    result = result_from_centers(
+        [[0.5, 0.5, 0.5], [0.5, 1.5, 0.5], [0.5, 2.5, 0.5]],
+        [3.0, 3.0, 3.0],
+    )
+
+    catalog = shocktest.build_shock_catalog(result, deduplicate=True)
+
+    np.testing.assert_array_equal(catalog.center_representative, [0, 1, 2])
+    assert catalog.groups[0].n_centers == 3
+
+
+def test_real_finder_reports_positive_zone_span_only_at_shocks():
+    from test_maps import grid_cell
+
+    finder = shocktest.ShockFinder()
+    finder.minlevel = 0
+    result = finder.find(grid_cell())
+
+    assert np.all(result.zone_width[result.shock] > 0.0)
+    assert np.all(result.zone_width[~result.shock] == 0.0)

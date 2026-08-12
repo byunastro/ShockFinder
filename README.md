@@ -105,6 +105,8 @@ filter.
 - `normal`: unit shock normal from the retained upstream cell toward the
   downstream cell; zero for non-shock cells.
 - `level`: AMR level of every retained cell.
+- `zone_width`: upstream-to-downstream center distance in the configured
+  position unit; zero for non-shock cells.
 
 Neighbor links are built from AMR cell centers and widths. Same-level face
 neighbors are preferred. Fine cells can fall back to coarser face neighbors, and
@@ -127,6 +129,7 @@ catalog = shocktest.build_shock_catalog(
     dissipation=dissipation,
     mach_tolerance=0.3,
     normal_cosine=0.7,
+    deduplicate=True,
 )
 
 group_labels = catalog.group_id  # -1 for non-shock cells
@@ -139,6 +142,12 @@ is supplied, `group.area` is in kpc2 and total dissipation is in erg/s. Without
 one, area is measured in the square of `result.pos`'s position unit. Grouping
 does not change the existing center-only meaning of `result.shock` or
 `result.mach`.
+
+With `deduplicate=True`, adjacent centers stacked along the shock normal are
+collapsed to the strongest-Mach representative for catalog construction.
+Tangentially adjacent centers remain separate samples of the same surface. The
+mapping is returned as `catalog.center_representative`; suppressed centers have
+`group_id == -1`, while the original `result.shock` array remains unchanged.
 
 ## Python Examples
 
