@@ -35,6 +35,23 @@ class ShockCatalog:
     groups: list[ShockGroup]
 
 
+@dataclass(slots=True, frozen=True)
+class CatalogSensitivity:
+    """One summary row from a shock-catalog parameter sweep."""
+
+    mach_tolerance: float
+    normal_cosine: float
+    duplicate_normal_cosine: float
+    min_mach: float
+    n_input_centers: int
+    n_representative_centers: int
+    n_groups: int
+    surface_area: float
+    dissipation_total: float
+    mach_peak: float
+    mach_mean: float
+
+
 class _UnionFind:
     def __init__(self, size: int) -> None:
         self.parent = np.arange(size, dtype=np.int64)
@@ -65,6 +82,9 @@ def build_shock_catalog(
     normal_cosine: float = 0.7,
     deduplicate: bool = False,
     duplicate_normal_cosine: float = 0.8,
+    min_mach: float = 1.0,
+    boundary: str = "open",
+    _neighbor_tables=None,
 ) -> ShockCatalog:
     """Group AMR face-connected shock centers and summarize each surface.
 
@@ -75,12 +95,18 @@ def build_shock_catalog(
 
     if result.pos is None or result.dx is None:
         raise ValueError("result.pos and result.dx are required for shock grouping")
+    if boundary != "open":
+        raise ValueError(
+            "boundary must be 'open'; extracted snapshot regions must not wrap"
+        )
     if mach_tolerance < 0.0:
         raise ValueError("mach_tolerance must be non-negative")
     if not 0.0 <= normal_cosine <= 1.0:
         raise ValueError("normal_cosine must be between 0 and 1")
     if not 0.0 <= duplicate_normal_cosine <= 1.0:
         raise ValueError("duplicate_normal_cosine must be between 0 and 1")
+    if min_mach < 1.0:
+        raise ValueError("min_mach must be at least 1.0")
 
     n = result.mach.size
     if result.pos.shape != (n, 3) or result.dx.shape != (n,):
@@ -89,6 +115,8 @@ def build_shock_catalog(
     if levels is None:
         if result.level is not None:
             levels_array = np.asarray(result.level, dtype=np.int32)
+        elif n == 0:
+            levels_array = np.empty(0, dtype=np.int32)
         else:
             inferred = np.rint(np.log2(np.max(result.dx) / result.dx))
             levels_array = inferred.astype(np.int32)
@@ -97,17 +125,20 @@ def build_shock_catalog(
     if levels_array.shape != (n,):
         raise ValueError("levels must have one value per retained cell")
 
-    shock_rows = np.nonzero(result.shock & (result.mach > 1.0))[0]
+    shock_rows = np.nonzero(result.shock & (result.mach >= min_mach))[0]
     labels = np.full(n, -1, dtype=np.int64)
     representatives = np.full(n, -1, dtype=np.int64)
     if shock_rows.size == 0:
         return ShockCatalog(group_id=labels, center_representative=representatives, groups=[])
 
-    neighbors, fine_neighbors = ShockFinder._build_neighbor_tables(
-        np.asfortranarray(result.pos, dtype=np.float64),
-        np.asfortranarray(result.dx, dtype=np.float64),
-        np.asfortranarray(levels_array, dtype=np.int32),
-    )
+    if _neighbor_tables is None:
+        neighbors, fine_neighbors = ShockFinder._build_neighbor_tables(
+            np.asfortranarray(result.pos, dtype=np.float64),
+            np.asfortranarray(result.dx, dtype=np.float64),
+            np.asfortranarray(levels_array, dtype=np.int32),
+        )
+    else:
+        neighbors, fine_neighbors = _neighbor_tables
     shock_position = np.full(n, -1, dtype=np.int64)
     shock_position[shock_rows] = np.arange(shock_rows.size)
     union_find = _UnionFind(shock_rows.size)
@@ -203,6 +234,85 @@ def build_shock_catalog(
         center_representative=representatives,
         groups=groups,
     )
+
+
+def analyze_catalog_sensitivity(
+    result: ShockResult,
+    *,
+    dissipation=None,
+    mach_tolerances=(0.2, 0.3, 0.5),
+    normal_cosines=(0.5, 0.7, 0.9),
+    duplicate_normal_cosines=(0.8,),
+    min_machs=(1.3,),
+    deduplicate: bool = True,
+    boundary: str = "open",
+) -> list[CatalogSensitivity]:
+    """Evaluate catalog stability across grouping and selection thresholds."""
+
+    rows: list[CatalogSensitivity] = []
+    n = result.mach.size
+    if result.pos is None or result.dx is None:
+        raise ValueError("result.pos and result.dx are required for sensitivity analysis")
+    if result.level is not None:
+        levels = np.asarray(result.level, dtype=np.int32)
+    elif n == 0:
+        levels = np.empty(0, dtype=np.int32)
+    else:
+        levels = np.rint(np.log2(np.max(result.dx) / result.dx)).astype(np.int32)
+    neighbor_tables = ShockFinder._build_neighbor_tables(
+        np.asfortranarray(result.pos, dtype=np.float64),
+        np.asfortranarray(result.dx, dtype=np.float64),
+        np.asfortranarray(levels, dtype=np.int32),
+    )
+    for min_mach in min_machs:
+        for mach_tolerance in mach_tolerances:
+            for normal_cosine in normal_cosines:
+                for duplicate_normal_cosine in duplicate_normal_cosines:
+                    catalog = build_shock_catalog(
+                        result,
+                        dissipation=dissipation,
+                        mach_tolerance=float(mach_tolerance),
+                        normal_cosine=float(normal_cosine),
+                        deduplicate=deduplicate,
+                        duplicate_normal_cosine=float(duplicate_normal_cosine),
+                        min_mach=float(min_mach),
+                        boundary=boundary,
+                        levels=levels,
+                        _neighbor_tables=neighbor_tables,
+                    )
+                    selected = result.shock & (result.mach >= float(min_mach))
+                    representatives = catalog.center_representative
+                    representative_count = int(
+                        np.count_nonzero(selected & (representatives == np.arange(result.mach.size)))
+                    )
+                    areas = np.array([group.area for group in catalog.groups], dtype=np.float64)
+                    group_mach = np.array([group.mach_mean for group in catalog.groups], dtype=np.float64)
+                    area_sum = float(np.sum(areas))
+                    mean_mach = (
+                        float(np.sum(group_mach * areas) / area_sum)
+                        if area_sum > 0.0
+                        else 0.0
+                    )
+                    rows.append(
+                        CatalogSensitivity(
+                            mach_tolerance=float(mach_tolerance),
+                            normal_cosine=float(normal_cosine),
+                            duplicate_normal_cosine=float(duplicate_normal_cosine),
+                            min_mach=float(min_mach),
+                            n_input_centers=int(np.count_nonzero(selected)),
+                            n_representative_centers=representative_count,
+                            n_groups=len(catalog.groups),
+                            surface_area=area_sum,
+                            dissipation_total=float(
+                                sum(group.dissipation_total for group in catalog.groups)
+                            ),
+                            mach_peak=float(
+                                max((group.mach_peak for group in catalog.groups), default=0.0)
+                            ),
+                            mach_mean=mean_mach,
+                        )
+                    )
+    return rows
 
 
 def _center_representatives(

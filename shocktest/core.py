@@ -71,6 +71,7 @@ class ShockFinder:
         self.density_unit = "Msol/kpc3"
         self.show_progress = False
         self.progress_interval = 0
+        self.boundary = "open"
 
     def __call__(self, cell: Any) -> ShockResult:
         return self.find(cell)
@@ -90,6 +91,11 @@ class ShockFinder:
         gc.collect()
 
     def find(self, cell: Any) -> ShockResult:
+        if self.boundary != "open":
+            raise ValueError(
+                "boundary must be 'open'; ShockFinder inputs are extracted "
+                "snapshot regions and their outer faces are not connected"
+            )
         if _shockfinder is None:
             raise ImportError(
                 "shocktest Fortran extension is not built. Run "

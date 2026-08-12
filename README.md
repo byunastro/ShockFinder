@@ -44,6 +44,7 @@ finder = shocktest.ShockFinder()
 finder.maxlevel = 20
 finder.minlevel = 13
 finder.show_progress = True
+finder.boundary = "open"
 
 result = finder.ShockFinder(cell)
 
@@ -91,6 +92,10 @@ finder.minlevel <= cell["level"] <= finder.maxlevel
 
 `dx` is used for AMR geometry and neighbor construction, not as the level
 filter.
+
+Inputs are treated as extracted snapshot regions with `boundary="open"`.
+Missing cells outside the selected region are not inferred and opposite region
+edges are never connected. Other boundary modes are rejected explicitly.
 
 ## Output
 
@@ -148,6 +153,24 @@ collapsed to the strongest-Mach representative for catalog construction.
 Tangentially adjacent centers remain separate samples of the same surface. The
 mapping is returned as `catalog.center_representative`; suppressed centers have
 `group_id == -1`, while the original `result.shock` array remains unchanged.
+
+Catalog threshold stability can be evaluated without rerunning the Fortran
+shock finder:
+
+```python
+rows = shocktest.analyze_catalog_sensitivity(
+    result,
+    dissipation=dissipation,
+    mach_tolerances=(0.2, 0.3, 0.5),
+    normal_cosines=(0.5, 0.7, 0.9),
+    duplicate_normal_cosines=(0.7, 0.8, 0.9),
+    min_machs=(1.3, 1.5),
+)
+```
+
+Each row reports the input and representative center counts, group count,
+surface area, total dissipation, peak Mach, and area-weighted mean Mach for one
+parameter combination.
 
 ## Python Examples
 

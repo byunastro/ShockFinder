@@ -202,6 +202,15 @@ def test_missing_tuple_field_raises_clear_error():
         finder.find(cell)
 
 
+def test_only_open_boundary_is_supported_for_extracted_regions():
+    finder = shocktest.ShockFinder()
+    assert finder.boundary == "open"
+
+    finder.boundary = "periodic"
+    with pytest.raises(ValueError, match="boundary must be 'open'"):
+        finder.find(line_cell())
+
+
 def test_shock_result_clear_releases_arrays():
     finder = shocktest.ShockFinder()
     result = finder.ShockFinder(line_cell())

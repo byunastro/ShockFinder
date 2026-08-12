@@ -111,6 +111,10 @@ def test_catalog_rejects_invalid_thresholds():
         shocktest.build_shock_catalog(result, mach_tolerance=-0.1)
     with pytest.raises(ValueError, match="normal_cosine"):
         shocktest.build_shock_catalog(result, normal_cosine=1.1)
+    with pytest.raises(ValueError, match="min_mach"):
+        shocktest.build_shock_catalog(result, min_mach=0.9)
+    with pytest.raises(ValueError, match="boundary"):
+        shocktest.build_shock_catalog(result, boundary="periodic")
 
 
 def test_grouping_connects_coarse_and_fine_face_centers():
@@ -163,3 +167,81 @@ def test_real_finder_reports_positive_zone_span_only_at_shocks():
 
     assert np.all(result.zone_width[result.shock] > 0.0)
     assert np.all(result.zone_width[~result.shock] == 0.0)
+
+
+def test_open_boundary_does_not_connect_opposite_region_edges():
+    result = result_from_centers(
+        [[0.5, 0.5, 0.5], [9.5, 0.5, 0.5]],
+        [3.0, 3.0],
+    )
+
+    catalog = shocktest.build_shock_catalog(result, boundary="open")
+
+    assert len(catalog.groups) == 2
+
+
+def test_catalog_statistics_are_invariant_to_cell_order():
+    result = result_from_centers(
+        [
+            [0.5, 0.5, 0.5],
+            [0.5, 1.5, 0.5],
+            [5.5, 0.5, 0.5],
+            [5.5, 1.5, 0.5],
+        ],
+        [2.9, 3.0, 5.0, 5.1],
+    )
+    order = np.array([2, 0, 3, 1])
+    shuffled = result_from_centers(
+        result.pos[order],
+        result.mach[order],
+        normal=result.normal[order],
+        dx=result.dx[order],
+    )
+
+    first = shocktest.build_shock_catalog(result)
+    second = shocktest.build_shock_catalog(shuffled)
+
+    first_stats = sorted((g.n_centers, g.mach_peak, g.area) for g in first.groups)
+    second_stats = sorted((g.n_centers, g.mach_peak, g.area) for g in second.groups)
+    assert first_stats == second_stats
+
+
+def test_sensitivity_sweep_reports_parameter_effects(monkeypatch):
+    result = result_from_centers(
+        [[0.5, 0.5, 0.5], [0.5, 1.5, 0.5], [4.5, 0.5, 0.5]],
+        [1.4, 2.0, 4.0],
+    )
+    original = shocktest.ShockFinder._build_neighbor_tables
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        shocktest.ShockFinder, "_build_neighbor_tables", staticmethod(counted)
+    )
+
+    rows = shocktest.analyze_catalog_sensitivity(
+        result,
+        mach_tolerances=(0.2, 0.5),
+        normal_cosines=(0.7,),
+        duplicate_normal_cosines=(0.8,),
+        min_machs=(1.3, 1.5),
+        deduplicate=False,
+    )
+
+    assert len(rows) == 4
+    assert calls == 1
+    assert {row.n_input_centers for row in rows if row.min_mach == 1.3} == {3}
+    assert {row.n_input_centers for row in rows if row.min_mach == 1.5} == {2}
+    loose = next(
+        row for row in rows
+        if row.min_mach == 1.3 and row.mach_tolerance == 0.5
+    )
+    strict = next(
+        row for row in rows
+        if row.min_mach == 1.3 and row.mach_tolerance == 0.2
+    )
+    assert loose.n_groups < strict.n_groups
