@@ -101,6 +101,21 @@ single-pass dissipation calculation. The default `5/3` preserves the original
 monatomic-gas behavior. Physical settings and all required input fields are
 validated before the compiled scan; NaN and infinite values are rejected.
 
+Shock-zone walks default to `finder.max_steps = 50` and stop earlier at the
+first thermodynamic, convergence, or candidate-zone boundary. Values above 50
+remain supported but emit a `RuntimeWarning`. Center finding walks along both
+signs of the local temperature-gradient normal and exposes three controls:
+
+```python
+finder.max_center_steps = 50
+finder.center_normal_cosine = 0.7
+finder.center_plateau_tolerance = 1.0e-12
+```
+
+The normal is recomputed after each move. Abruptly misaligned moves are
+rejected, equal-convergence plateaus select a deterministic representative,
+and resolved center paths are cached for reuse by later candidates.
+
 ## Input Cell Fields
 
 `cell` is an AMR cell table, not a dense 3D array. The wrapper reads these
@@ -145,6 +160,9 @@ edges are never connected. Other boundary modes are rejected explicitly.
 - `level`: AMR level of every retained cell.
 - `zone_width`: upstream-to-downstream center distance in the configured
   position unit; zero for non-shock cells.
+- `diagnostics`: counts center/walk step-limit hits, missing neighbors,
+  candidate/thermodynamic/convergence exits, invalid jumps, and rejected Mach
+  values. These counters are intended for real-snapshot quality comparisons.
 
 Neighbor links are built from AMR cell centers and widths. Same-level face
 neighbors are preferred. Fine cells can fall back to coarser face neighbors, and

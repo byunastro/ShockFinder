@@ -141,6 +141,9 @@ def test_shock_center_considers_finer_face_candidates():
             [1.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
             [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 2.0, 0.0],
         ],
         dtype=float,
     )
@@ -151,24 +154,38 @@ def test_shock_center_considers_finer_face_candidates():
             [5.0, 0.0, 0.0],
             [-0.5, 0.0, 0.0],
             [-5.0, 0.0, 0.0],
+            [-20.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, -100.0, 0.0],
         ],
         dtype=float,
     )
-    dx = np.asfortranarray(np.ones(5, dtype=float))
-    temp = np.asfortranarray([1.0e4, 1.0e4, 2.0e4, 4.0e4, 8.0e4], dtype=float)
-    rho = np.asfortranarray([1.0, 1.0, 1.5, 2.0, 3.0], dtype=float)
-    level = np.asfortranarray([0, 0, 0, 1, 1], dtype=np.int32)
-    neighbors = np.zeros((5, 6), dtype=np.int32, order="F")
-    fine_neighbors = np.zeros((5, 6, 4), dtype=np.int32, order="F")
+    dx = np.asfortranarray(np.ones(8, dtype=float))
+    temp = np.asfortranarray(
+        [1.0e4, 1.0e4, 2.0e4, 4.0e4, 8.0e4, 16.0e4, 4.0e4, 8.0e4], dtype=float
+    )
+    rho = np.asfortranarray([1.0, 1.0, 1.5, 2.0, 3.0, 4.0, 2.0, 3.0], dtype=float)
+    level = np.asfortranarray([0, 0, 0, 1, 1, 1, 0, 0], dtype=np.int32)
+    neighbors = np.zeros((8, 6), dtype=np.int32, order="F")
+    fine_neighbors = np.zeros((8, 6, 4), dtype=np.int32, order="F")
 
     # Cell 3 is a coarse candidate with a finer +x face candidate at cell 4.
-    # Cell 4 has stronger convergence, so it should become the shock center.
+    # Cells 4 and 5 are progressively more convergent. Center selection must
+    # continue through the finer neighbor and settle on cell 5, not stop at 4.
     neighbors[2, 0] = 2
     fine_neighbors[2, 1, 0] = 4
     neighbors[3, 0] = 3
     neighbors[3, 1] = 5
+    neighbors[4, 0] = 4
+    neighbors[4, 1] = 6
+    # Cell 7 is a much more convergent candidate in the tangential +y
+    # direction. It must not pull the center away from the x-directed normal.
+    neighbors[2, 3] = 7
+    neighbors[6, 2] = 3
+    neighbors[6, 3] = 8
 
-    mach, shock, center, upstream, downstream = _shockfinder.shockfinder_kernel.find_shocks(
+    mach, shock, center, upstream, downstream, diagnostics = (
+        _shockfinder.shockfinder_kernel.find_shocks(
         pos,
         vel,
         dx,
@@ -180,18 +197,107 @@ def test_shock_center_considers_finer_face_candidates():
         5.0 / 3.0,
         1.0e4,
         1.0,
-        1,
+        3,
+        50,
+        0.7,
+        1.0e-12,
         0,
         0,
-        5,
+        8,
+        )
     )
 
     assert shock[2] == 0
-    assert shock[3] == 1
-    assert center[3] == 4
-    assert upstream[3] > 0
-    assert downstream[3] > 0
-    assert mach[3] > 1.0
+    assert shock[3] == 0
+    assert shock[4] == 1
+    assert center[4] == 5
+    assert upstream[4] == 2
+    assert downstream[4] == 6
+    assert mach[4] > 1.0
+    assert diagnostics.shape == (10,)
+
+    plateau_vel = vel.copy(order="F")
+    plateau_vel[5, 0] = -10.5  # Cells 4 and 5 now have identical divV=-5.
+    _, plateau_shock, plateau_center, _, _, _ = (
+        _shockfinder.shockfinder_kernel.find_shocks(
+            pos,
+            plateau_vel,
+            dx,
+            temp,
+            rho,
+            level,
+            neighbors,
+            fine_neighbors,
+            5.0 / 3.0,
+            1.0e4,
+            1.0,
+            3,
+            50,
+            0.7,
+            1.0e-12,
+            0,
+            0,
+            8,
+        )
+    )
+    np.testing.assert_array_equal(np.nonzero(plateau_shock)[0], [3])
+    assert plateau_center[3] == 4
+
+    _, _, _, _, _, center_capped_diagnostics = (
+        _shockfinder.shockfinder_kernel.find_shocks(
+            pos,
+            vel,
+            dx,
+            temp,
+            rho,
+            level,
+            neighbors,
+            fine_neighbors,
+            5.0 / 3.0,
+            1.0e4,
+            1.0,
+            3,
+            1,
+            0.7,
+            1.0e-12,
+            0,
+            0,
+            8,
+        )
+    )
+    assert center_capped_diagnostics[0] > 0
+
+    # With only two steps, the upstream walk is still inside the candidate
+    # zone. Reaching the cap must reject the detection instead of using that
+    # candidate cell as a pre-shock endpoint.
+    _, capped_shock, _, _, _, capped_diagnostics = (
+        _shockfinder.shockfinder_kernel.find_shocks(
+        pos,
+        vel,
+        dx,
+        temp,
+        rho,
+        level,
+        neighbors,
+        fine_neighbors,
+        5.0 / 3.0,
+        1.0e4,
+        1.0,
+        2,
+        50,
+        0.7,
+        1.0e-12,
+        0,
+        0,
+        8,
+        )
+    )
+    assert not np.any(capped_shock)
+    assert capped_diagnostics[2] > 0
+
+
+def test_default_shock_walk_limit_is_fifty_steps():
+    assert shocktest.ShockFinder().max_steps == 50
 
 
 def test_missing_tuple_field_raises_clear_error():
@@ -221,6 +327,11 @@ def test_only_open_boundary_is_supported_for_extracted_regions():
         ("min_mach", 0.9, "min_mach"),
         ("max_steps", -1, "max_steps"),
         ("max_steps", 1.5, "max_steps"),
+        ("max_center_steps", 0, "max_center_steps"),
+        ("max_center_steps", 1.5, "max_center_steps"),
+        ("center_normal_cosine", -0.1, "center_normal_cosine"),
+        ("center_normal_cosine", 1.1, "center_normal_cosine"),
+        ("center_plateau_tolerance", -1.0, "center_plateau_tolerance"),
     ],
 )
 def test_invalid_physical_settings_are_rejected(attribute, value, message):
@@ -229,6 +340,29 @@ def test_invalid_physical_settings_are_rejected(attribute, value, message):
 
     with pytest.raises(ValueError, match=message):
         finder.find(line_cell())
+
+
+def test_large_walk_limit_warns_but_is_used():
+    finder = shocktest.ShockFinder()
+    finder.max_steps = 51
+
+    with pytest.warns(RuntimeWarning, match="exceeds.*50"):
+        result = finder.find(line_cell())
+
+    assert result.shock.any()
+    assert result.diagnostics is not None
+    assert set(result.diagnostics) == {
+        "center_step_limit",
+        "upstream_missing_neighbor",
+        "upstream_step_limit",
+        "downstream_missing_neighbor",
+        "downstream_step_limit",
+        "candidate_exit",
+        "thermodynamic_exit",
+        "nonconverging_exit",
+        "invalid_jump",
+        "mach_rejected",
+    }
 
 
 @pytest.mark.parametrize(

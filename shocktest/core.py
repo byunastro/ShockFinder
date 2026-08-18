@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -31,6 +32,7 @@ class ShockResult:
     normal: np.ndarray | None = None
     level: np.ndarray | None = None
     zone_width: np.ndarray | None = None
+    diagnostics: dict[str, int] | None = None
 
     def clear(self) -> None:
         """Release arrays held by this result object."""
@@ -49,6 +51,7 @@ class ShockResult:
         self.normal = None
         self.level = None
         self.zone_width = None
+        self.diagnostics = None
         gc.collect()
 
 
@@ -64,7 +67,10 @@ class ShockFinder:
         self.min_density = None
         self.max_density = None
         self.min_mach = 1.0
-        self.max_steps = 4
+        self.max_steps = 50
+        self.max_center_steps = 50
+        self.center_normal_cosine = 0.7
+        self.center_plateau_tolerance = 1.0e-12
         self.position_unit = "km"
         self.velocity_unit = "km/s"
         self.temperature_unit = "K"
@@ -222,6 +228,7 @@ class ShockFinder:
                 normal=np.empty((0, 3), dtype=np.float64),
                 level=np.empty(0, dtype=np.int32),
                 zone_width=empty_float.copy(),
+                diagnostics={},
             )
             timings["scan"] = 0.0
             timings["detection_total"] = time.perf_counter() - total_start
@@ -229,22 +236,27 @@ class ShockFinder:
 
         self._progress("ShockFinder: running Fortran shock scan")
         stage_start = time.perf_counter()
-        mach, shock, center, upstream, downstream = _shockfinder.shockfinder_kernel.find_shocks(
-            arrays["pos"],
-            arrays["vel"],
-            arrays["dx"],
-            arrays["temp"],
-            arrays["rho"],
-            arrays["level"],
-            neighbors,
-            fine_neighbors,
-            float(self.gamma),
-            float(self.temperature_floor),
-            float(self.min_mach),
-            int(self.max_steps),
-            int(bool(self.show_progress)),
-            int(interval),
-            n,
+        mach, shock, center, upstream, downstream, diagnostic_counts = (
+            _shockfinder.shockfinder_kernel.find_shocks(
+                arrays["pos"],
+                arrays["vel"],
+                arrays["dx"],
+                arrays["temp"],
+                arrays["rho"],
+                arrays["level"],
+                neighbors,
+                fine_neighbors,
+                float(self.gamma),
+                float(self.temperature_floor),
+                float(self.min_mach),
+                int(self.max_steps),
+                int(self.max_center_steps),
+                float(self.center_normal_cosine),
+                float(self.center_plateau_tolerance),
+                int(bool(self.show_progress)),
+                int(interval),
+                n,
+            )
         )
         timings["scan"] = time.perf_counter() - stage_start
         self._progress("ShockFinder: done")
@@ -278,6 +290,23 @@ class ShockFinder:
             normal=normal,
             level=result_level,
             zone_width=zone_width,
+            diagnostics=dict(
+                zip(
+                    (
+                        "center_step_limit",
+                        "upstream_missing_neighbor",
+                        "upstream_step_limit",
+                        "downstream_missing_neighbor",
+                        "downstream_step_limit",
+                        "candidate_exit",
+                        "thermodynamic_exit",
+                        "nonconverging_exit",
+                        "invalid_jump",
+                        "mach_rejected",
+                    ),
+                    np.asarray(diagnostic_counts, dtype=np.int64).tolist(),
+                )
+            ),
         )
         timings["detection_total"] = time.perf_counter() - total_start
         return result, (neighbors, fine_neighbors), timings
@@ -295,6 +324,26 @@ class ShockFinder:
             or self.max_steps < 0
         ):
             raise ValueError("max_steps must be a non-negative integer")
+        if self.max_steps > 50:
+            warnings.warn(
+                "max_steps exceeds the RAKER-style safety reference of 50; "
+                "the requested value will still be used",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if (
+            isinstance(self.max_center_steps, (bool, np.bool_))
+            or int(self.max_center_steps) != self.max_center_steps
+            or self.max_center_steps < 1
+        ):
+            raise ValueError("max_center_steps must be a positive integer")
+        if not 0.0 <= self.center_normal_cosine <= 1.0:
+            raise ValueError("center_normal_cosine must be between 0 and 1")
+        if (
+            not np.isfinite(self.center_plateau_tolerance)
+            or self.center_plateau_tolerance < 0.0
+        ):
+            raise ValueError("center_plateau_tolerance must be finite and non-negative")
         if int(self.minlevel) > int(self.maxlevel):
             raise ValueError("minlevel must not exceed maxlevel")
 

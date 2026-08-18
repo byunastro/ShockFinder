@@ -225,38 +225,145 @@ contains
     next_cell = choose_face_neighbor(pos, neighbors, fine_neighbors, n, i, face, xnew)
   end subroutine next_along_gradient
 
+  ! Resolve every candidate to a deterministic local convergence minimum along
+  ! the shock normal. Previously resolved paths are reused (path compression),
+  ! avoiding repeated walks through the same thick shock zone.
+  subroutine resolve_shock_centers(pos, dx, neighbors, fine_neighbors, n, candidate, &
+       divv_arr, grad_t_arr, max_center_steps, normal_cosine, plateau_tolerance, &
+       resolved_center, limit_count)
+    integer, intent(in) :: n, max_center_steps
+    integer, intent(in) :: neighbors(n, 6), fine_neighbors(n, 6, 4)
+    logical, intent(in) :: candidate(n)
+    real(8), intent(in) :: pos(n, 3), dx(n), divv_arr(n), grad_t_arr(n, 3)
+    real(8), intent(in) :: normal_cosine, plateau_tolerance
+    integer, intent(out) :: resolved_center(n)
+    integer(8), intent(out) :: limit_count
+
+    integer :: i, center, next_center, trial, step_count, path_length, j
+    integer, allocatable :: path(:)
+    real(8) :: best_divv, scale, tolerance, dirvec(3), trial_dir(3)
+    real(8) :: xwalk(3), xnext(3)
+    logical :: ok_direction, ok_trial_direction, center_changed, finished
+
+    resolved_center = 0
+    limit_count = 0_8
+    allocate(path(n))
+
+    do i = 1, n
+      if (.not. candidate(i) .or. resolved_center(i) > 0) cycle
+
+      center = i
+      path_length = 0
+      finished = .false.
+      ! Evaluate the starting cell plus at most max_center_steps moves. This
+      ! lets a center reached on the final permitted move be accepted.
+      do step_count = 0, max_center_steps
+        if (resolved_center(center) > 0) then
+          center = resolved_center(center)
+          finished = .true.
+          exit
+        end if
+
+        path_length = path_length + 1
+        path(path_length) = center
+        call normalize_vector(grad_t_arr(center, :), dirvec, ok_direction)
+        if (.not. ok_direction) exit
+
+        best_divv = divv_arr(center)
+        next_center = center
+        center_changed = .false.
+        xwalk = pos(center, :)
+
+        call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, center, xwalk, dirvec, &
+             trial, xnext)
+        if (trial > 0 .and. candidate(trial)) then
+          call normalize_vector(grad_t_arr(trial, :), trial_dir, ok_trial_direction)
+          scale = max(1.0_dp, abs(best_divv), abs(divv_arr(trial)))
+          tolerance = plateau_tolerance * scale
+          if (ok_trial_direction .and. abs(dot_product(dirvec, trial_dir)) >= normal_cosine) then
+            if (divv_arr(trial) < best_divv - tolerance .or. &
+                 (abs(divv_arr(trial) - best_divv) <= tolerance .and. trial < next_center)) then
+              next_center = trial
+              best_divv = divv_arr(trial)
+              center_changed = .true.
+            end if
+          end if
+        end if
+
+        call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, center, xwalk, -dirvec, &
+             trial, xnext)
+        if (trial > 0 .and. candidate(trial)) then
+          call normalize_vector(grad_t_arr(trial, :), trial_dir, ok_trial_direction)
+          scale = max(1.0_dp, abs(best_divv), abs(divv_arr(trial)))
+          tolerance = plateau_tolerance * scale
+          if (ok_trial_direction .and. abs(dot_product(dirvec, trial_dir)) >= normal_cosine) then
+            if (divv_arr(trial) < best_divv - tolerance .or. &
+                 (abs(divv_arr(trial) - best_divv) <= tolerance .and. trial < next_center)) then
+              next_center = trial
+              best_divv = divv_arr(trial)
+              center_changed = .true.
+            end if
+          end if
+        end if
+
+        if (.not. center_changed) then
+          finished = .true.
+          exit
+        end if
+        center = next_center
+      end do
+
+      if (finished) then
+        resolved_center(center) = center
+        do j = 1, path_length
+          resolved_center(path(j)) = center
+        end do
+      else
+        limit_count = limit_count + 1_8
+      end if
+    end do
+
+    deallocate(path)
+  end subroutine resolve_shock_centers
+
   ! Scan AMR cells for Skillman-style shock zones and assign center Mach numbers.
   ! Neighbor tables are supplied by Python/Numba and the cell loop is OpenMP-ready.
   subroutine find_shocks(pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n, &
-       gamma, temp_floor, min_mach, max_steps, show_progress, progress_interval, mach, &
-       shock, center_index, upstream_index, downstream_index)
+       gamma, temp_floor, min_mach, max_steps, max_center_steps, center_normal_cosine, &
+       center_plateau_tolerance, show_progress, progress_interval, mach, shock, center_index, &
+       upstream_index, downstream_index, diagnostics)
     !f2py intent(in) pos, vel, dx, temp, rho, level, neighbors, fine_neighbors, n
-    !f2py intent(in) gamma, temp_floor, min_mach, max_steps, show_progress, progress_interval
-    !f2py intent(out) mach, shock, center_index, upstream_index, downstream_index
-    integer, intent(in) :: n, max_steps, show_progress, progress_interval
+    !f2py intent(in) gamma, temp_floor, min_mach, max_steps, max_center_steps
+    !f2py intent(in) center_normal_cosine, center_plateau_tolerance, show_progress, progress_interval
+    !f2py intent(out) mach, shock, center_index, upstream_index, downstream_index, diagnostics
+    integer, intent(in) :: n, max_steps, max_center_steps, show_progress, progress_interval
     integer, intent(in) :: level(n), neighbors(n, 6), fine_neighbors(n, 6, 4)
     real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
     real(8), intent(in) :: gamma, temp_floor, min_mach
+    real(8), intent(in) :: center_normal_cosine, center_plateau_tolerance
     real(8), intent(out) :: mach(n)
     integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
+    integer(8), intent(out) :: diagnostics(10)
 
-    integer :: i, face, nb, k, step_count, done
+    integer :: i, step_count, done
     integer :: center, trial, upstream, downstream
     integer :: progress_count, next_progress
     integer :: clock_rate, clock_now, pre_start, scan_start
-    real(8) :: best_divv, grad_t(3), grad_s(3), dirvec(3), xwalk(3), xnext(3)
+    real(8) :: grad_t(3), grad_s(3), dirvec(3), xwalk(3), xnext(3)
     real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m, elapsed
     real(8), allocatable :: divv_arr(:), grad_t_arr(:, :)
     logical, allocatable :: candidate(:)
-    logical :: valid, ok_direction
+    integer, allocatable :: resolved_center(:)
+    logical :: valid, ok_direction, endpoint_found
 
     mach = 0.0_dp
     shock = 0
     center_index = 0
     upstream_index = 0
     downstream_index = 0
+    diagnostics = 0_8
 
-    allocate(divv_arr(n), grad_t_arr(n, 3), candidate(n))
+    allocate(divv_arr(n), grad_t_arr(n, 3), candidate(n), resolved_center(n))
 
     ! Precompute all local shock diagnostics once. This loop is independent for
     ! each AMR cell and is therefore a good OpenMP target.
@@ -302,15 +409,20 @@ contains
       flush(output_unit)
     end if
 
-    ! Candidate cells are independent except when several cells choose the same
-    ! maximum-convergence center. The small critical section protects that write.
+    call resolve_shock_centers(pos, dx, neighbors, fine_neighbors, n, candidate, divv_arr, &
+         grad_t_arr, max_center_steps, center_normal_cosine, center_plateau_tolerance, &
+         resolved_center, diagnostics(1))
+
+    ! Candidate paths are independent after center resolution. Several paths
+    ! can share a center, so the small critical section protects that write.
     progress_count = 0
     next_progress = progress_interval
     call system_clock(scan_start)
 
-    !$omp parallel do schedule(dynamic, 256) private(i, face, nb, k, step_count, &
-    !$omp& center, trial, upstream, downstream, best_divv, grad_t, t_pre, t_post, &
-    !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, done, clock_now, elapsed)
+    !$omp parallel do schedule(dynamic, 256) private(i, step_count, &
+    !$omp& center, trial, upstream, downstream, grad_t, t_pre, t_post, &
+    !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, &
+    !$omp& endpoint_found, done, clock_now, elapsed)
     do i = 1, n
       if (show_progress /= 0 .and. progress_interval > 0) then
         !$omp atomic capture
@@ -335,74 +447,117 @@ contains
       end if
       if (.not. candidate(i)) cycle
 
-      center = i
-      best_divv = divv_arr(i)
-      grad_t = grad_t_arr(i, :)
-      do face = 1, 6
-        nb = neighbors(i, face)
-        if (nb > 0) then
-          if (candidate(nb) .and. divv_arr(nb) < best_divv) then
-            center = nb
-            best_divv = divv_arr(nb)
-            grad_t = grad_t_arr(nb, :)
-          end if
-        end if
+      center = resolved_center(i)
+      if (center <= 0) cycle
 
-        do k = 1, 4
-          nb = fine_neighbors(i, face, k)
-          if (nb <= 0) cycle
-          if (candidate(nb) .and. divv_arr(nb) < best_divv) then
-            center = nb
-            best_divv = divv_arr(nb)
-            grad_t = grad_t_arr(nb, :)
-          end if
-        end do
-      end do
-
+      grad_t = grad_t_arr(center, :)
       call normalize_vector(grad_t, dirvec, ok_direction)
       if (.not. ok_direction) cycle
 
       upstream = center
       xwalk = pos(center, :)
+      endpoint_found = .false.
+      trial = -1
       do step_count = 1, max_steps
         call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, upstream, xwalk, -dirvec, &
              trial, xnext)
-        if (trial <= 0) exit
-        if (.not. candidate(trial)) exit
+        if (trial <= 0) then
+          !$omp atomic update
+          diagnostics(2) = diagnostics(2) + 1_8
+          exit
+        end if
+        if (divv_arr(trial) >= 0.0_dp) then
+          !$omp atomic update
+          diagnostics(8) = diagnostics(8) + 1_8
+          upstream = trial
+          endpoint_found = .true.
+          exit
+        else if ((temp(trial) - temp(upstream)) * (rho(trial) - rho(upstream)) <= 0.0_dp) then
+          !$omp atomic update
+          diagnostics(7) = diagnostics(7) + 1_8
+          upstream = trial
+          endpoint_found = .true.
+          exit
+        else if (.not. candidate(trial)) then
+          !$omp atomic update
+          diagnostics(6) = diagnostics(6) + 1_8
+          upstream = trial
+          endpoint_found = .true.
+          exit
+        end if
         upstream = trial
         xwalk = xnext
       end do
-      call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, upstream, xwalk, -dirvec, &
-           trial, xnext)
-      upstream = trial
-      if (upstream <= 0) cycle
+      ! A valid endpoint is the first cell outside the shock zone. If the walk
+      ! reaches its safety cap while still inside the zone, reject this center.
+      if (.not. endpoint_found) then
+        if (trial /= 0) then
+          !$omp atomic update
+          diagnostics(3) = diagnostics(3) + 1_8
+        end if
+        cycle
+      end if
 
       downstream = center
       xwalk = pos(center, :)
+      endpoint_found = .false.
+      trial = -1
       do step_count = 1, max_steps
         call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, downstream, xwalk, dirvec, &
              trial, xnext)
-        if (trial <= 0) exit
-        if (.not. candidate(trial)) exit
+        if (trial <= 0) then
+          !$omp atomic update
+          diagnostics(4) = diagnostics(4) + 1_8
+          exit
+        end if
+        if (divv_arr(trial) >= 0.0_dp) then
+          !$omp atomic update
+          diagnostics(8) = diagnostics(8) + 1_8
+          downstream = trial
+          endpoint_found = .true.
+          exit
+        else if ((temp(trial) - temp(downstream)) * (rho(trial) - rho(downstream)) <= 0.0_dp) then
+          !$omp atomic update
+          diagnostics(7) = diagnostics(7) + 1_8
+          downstream = trial
+          endpoint_found = .true.
+          exit
+        else if (.not. candidate(trial)) then
+          !$omp atomic update
+          diagnostics(6) = diagnostics(6) + 1_8
+          downstream = trial
+          endpoint_found = .true.
+          exit
+        end if
         downstream = trial
         xwalk = xnext
       end do
-      call next_along_gradient(pos, dx, neighbors, fine_neighbors, n, downstream, xwalk, dirvec, &
-           trial, xnext)
-      downstream = trial
-      if (downstream <= 0) cycle
+      if (.not. endpoint_found) then
+        if (trial /= 0) then
+          !$omp atomic update
+          diagnostics(5) = diagnostics(5) + 1_8
+        end if
+        cycle
+      end if
 
       t_pre = max(temp(upstream), temp_floor)
       t_post = temp(downstream)
       rho_pre = rho(upstream)
       rho_post = rho(downstream)
 
-      if (t_post <= t_pre) cycle
-      if (rho_post <= rho_pre) cycle
+      if (t_post <= t_pre .or. rho_post <= rho_pre) then
+        !$omp atomic update
+        diagnostics(9) = diagnostics(9) + 1_8
+        cycle
+      end if
 
       ratio = t_post / t_pre
       m = mach_from_temperature_jump(ratio, gamma)
-      if (m < min_mach * (1.0_dp - 1.0e-12_dp)) cycle
+      if (m < min_mach * (1.0_dp - 1.0e-12_dp)) then
+        !$omp atomic update
+        diagnostics(10) = diagnostics(10) + 1_8
+        cycle
+      end if
 
       !$omp critical(shock_update)
       if (m > mach(center)) then
@@ -423,7 +578,7 @@ contains
       flush(output_unit)
     end if
 
-    deallocate(divv_arr, grad_t_arr, candidate)
+    deallocate(divv_arr, grad_t_arr, candidate, resolved_center)
   end subroutine find_shocks
 
 end module shockfinder_kernel
