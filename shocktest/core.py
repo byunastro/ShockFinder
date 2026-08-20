@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import time
 import warnings
 from dataclasses import dataclass
 from typing import Any, Mapping
+from pathlib import Path
 
 import numpy as np
 
@@ -78,6 +80,8 @@ class ShockFinder:
         self.show_progress = False
         self.progress_interval = 0
         self.boundary = "open"
+        self.neighbor_backend = "fortran"
+        self.neighbor_cache_dir: str | None = None
 
     def __call__(self, cell: Any) -> ShockResult:
         return self.find(cell)
@@ -203,7 +207,7 @@ class ShockFinder:
         interval = self._resolved_progress_interval(n)
         self._progress("ShockFinder: building AMR face-neighbor table")
         stage_start = time.perf_counter()
-        neighbors, fine_neighbors = self._build_neighbor_tables(
+        neighbors, fine_face_index, fine_neighbors = self._neighbor_tables_for_arrays(
             arrays["pos"],
             arrays["dx"],
             arrays["level"],
@@ -232,7 +236,7 @@ class ShockFinder:
             )
             timings["scan"] = 0.0
             timings["detection_total"] = time.perf_counter() - total_start
-            return result, (neighbors, fine_neighbors), timings
+            return result, (neighbors, fine_face_index, fine_neighbors), timings
 
         self._progress("ShockFinder: running Fortran shock scan")
         stage_start = time.perf_counter()
@@ -244,7 +248,9 @@ class ShockFinder:
                 arrays["temp"],
                 arrays["rho"],
                 arrays["level"],
+                arrays["detection_mask"],
                 neighbors,
+                fine_face_index,
                 fine_neighbors,
                 float(self.gamma),
                 float(self.temperature_floor),
@@ -256,6 +262,7 @@ class ShockFinder:
                 int(bool(self.show_progress)),
                 int(interval),
                 n,
+                fine_neighbors.shape[0],
             )
         )
         timings["scan"] = time.perf_counter() - stage_start
@@ -309,7 +316,61 @@ class ShockFinder:
             ),
         )
         timings["detection_total"] = time.perf_counter() - total_start
-        return result, (neighbors, fine_neighbors), timings
+        return result, (neighbors, fine_face_index, fine_neighbors), timings
+
+    def _neighbor_tables_for_arrays(
+        self,
+        pos,
+        dx,
+        level,
+        *,
+        show_progress=False,
+        progress_interval=0,
+    ):
+        if self.neighbor_cache_dir is None:
+            return self._build_neighbor_tables(
+                pos,
+                dx,
+                level,
+                show_progress=show_progress,
+                progress_interval=progress_interval,
+                backend=self.neighbor_backend,
+            )
+
+        cache_dir = Path(self.neighbor_cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        digest = self._geometry_digest(pos, dx, level)
+        prefix = cache_dir / f"neighbors-{digest}"
+        paths = (
+            Path(f"{prefix}-same.npy"),
+            Path(f"{prefix}-fine-index.npy"),
+            Path(f"{prefix}-fine-values.npy"),
+        )
+        if all(path.exists() for path in paths):
+            return tuple(
+                np.load(path, mmap_mode="r", allow_pickle=False) for path in paths
+            )
+
+        tables = self._build_neighbor_tables(
+            pos,
+            dx,
+            level,
+            show_progress=show_progress,
+            progress_interval=progress_interval,
+            backend=self.neighbor_backend,
+        )
+        for path, values in zip(paths, tables):
+            np.save(path, np.asfortranarray(values), allow_pickle=False)
+        return tables
+
+    @staticmethod
+    def _geometry_digest(pos, dx, level):
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(b"shockfinder-neighbors-sparse-v1")
+        for values in (pos[:, 0], pos[:, 1], pos[:, 2], dx, level):
+            array = np.ascontiguousarray(values)
+            digest.update(memoryview(array).cast("B"))
+        return digest.hexdigest()
 
     def _validate_settings(self) -> None:
         if not np.isfinite(self.gamma) or self.gamma <= 1.0:
@@ -346,6 +407,8 @@ class ShockFinder:
             raise ValueError("center_plateau_tolerance must be finite and non-negative")
         if int(self.minlevel) > int(self.maxlevel):
             raise ValueError("minlevel must not exceed maxlevel")
+        if self.neighbor_backend not in {"fortran", "numpy"}:
+            raise ValueError("neighbor_backend must be 'fortran' or 'numpy'")
 
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:
         x = self._field(cell, (("x", self.position_unit), "x"))
@@ -381,22 +444,23 @@ class ShockFinder:
                 raise ValueError(f"{name} must be a 1D AMR cell field")
             if values.size != n:
                 raise ValueError(f"{name} has length {values.size}, expected {n}")
-            if not np.all(np.isfinite(values)):
-                raise ValueError(f"{name} must contain only finite values")
-        if not np.all(np.isfinite(x)):
-            raise ValueError("x must contain only finite values")
 
-        # Keep only cells requested by the caller. Geometry still comes from dx,
-        # not from the level filter.
+        # Keep the complete level-selected geometry. Temperature and density
+        # cuts only control which cells may start a shock detection; filtered
+        # cells remain available as neighbors and walk endpoints.
         mask = (level >= int(self.minlevel)) & (level <= int(self.maxlevel))
-        if self.min_temperature is not None:
-            mask &= temp >= float(self.min_temperature)
-        if self.min_density is not None:
-            mask &= rho >= float(self.min_density)
-        if self.max_density is not None:
-            mask &= rho <= float(self.max_density)
         selected_indices = np.nonzero(mask)[0].astype(np.int64, copy=False)
         del mask
+
+        selected_temp = temp[selected_indices]
+        selected_rho = rho[selected_indices]
+        detection_mask = np.ones(selected_indices.size, dtype=np.int32)
+        if self.min_temperature is not None:
+            detection_mask[selected_temp < float(self.min_temperature)] = 0
+        if self.min_density is not None:
+            detection_mask[selected_rho < float(self.min_density)] = 0
+        if self.max_density is not None:
+            detection_mask[selected_rho > float(self.max_density)] = 0
 
         # f2py passes Fortran-contiguous arrays to the compiled kernel without
         # needing extra copies. Fill the columns directly to avoid the
@@ -410,13 +474,27 @@ class ShockFinder:
         vel[:, 0] = vx[selected_indices]
         vel[:, 1] = vy[selected_indices]
         vel[:, 2] = vz[selected_indices]
+        selected_dx = np.asfortranarray(dx[selected_indices], dtype=np.float64)
+        selected_level = np.asfortranarray(level[selected_indices], dtype=np.int32)
+        selected_temp = np.asfortranarray(selected_temp, dtype=np.float64)
+        selected_rho = np.asfortranarray(selected_rho, dtype=np.float64)
+        for name, values in (
+            ("position", pos),
+            ("velocity", vel),
+            ("dx", selected_dx),
+            ("T", selected_temp),
+            ("rho", selected_rho),
+        ):
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{name} must contain only finite values")
         return {
             "pos": pos,
             "vel": vel,
-            "dx": np.asfortranarray(dx[selected_indices], dtype=np.float64),
-            "temp": np.asfortranarray(temp[selected_indices], dtype=np.float64),
-            "rho": np.asfortranarray(rho[selected_indices], dtype=np.float64),
-            "level": np.asfortranarray(level[selected_indices], dtype=np.int32),
+            "dx": selected_dx,
+            "temp": selected_temp,
+            "rho": selected_rho,
+            "level": selected_level,
+            "detection_mask": np.asfortranarray(detection_mask, dtype=np.int32),
             "selected_indices": selected_indices,
         }
 
@@ -463,7 +541,7 @@ class ShockFinder:
         show_progress: bool = False,
         progress_interval: int = 0,
     ) -> np.ndarray:
-        neighbors, _ = ShockFinder._build_neighbor_tables(
+        neighbors, _, _ = ShockFinder._build_neighbor_tables(
             pos,
             dx,
             level,
@@ -480,12 +558,73 @@ class ShockFinder:
         *,
         show_progress: bool = False,
         progress_interval: int = 0,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        backend: str = "fortran",
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if backend == "numpy":
+            return ShockFinder._build_neighbor_tables_numpy(
+                pos,
+                dx,
+                level,
+                show_progress=show_progress,
+                progress_interval=progress_interval,
+            )
+        if backend != "fortran":
+            raise ValueError("neighbor backend must be 'fortran' or 'numpy'")
+        if _shockfinder is None:
+            raise ImportError("shocktest Fortran extension is not built") from _IMPORT_ERROR
+        n = int(np.asarray(dx).size)
+        if n == 0:
+            return (
+                np.zeros((0, 6), dtype=np.int32, order="F"),
+                np.zeros((0, 6), dtype=np.int32, order="F"),
+                np.zeros((0, 4), dtype=np.int32, order="F"),
+            )
+        dx_values = np.asarray(dx, dtype=np.float64)
+        if np.any(~np.isfinite(dx_values)) or np.any(dx_values <= 0.0):
+            raise ValueError("dx must be finite and positive for every retained cell")
+        unique_widths = np.unique(dx_values)
+        if unique_widths.size > 1 and np.any(
+            unique_widths[1:] / unique_widths[:-1] > 2.0 * (1.0 + 1.0e-12)
+        ):
+            raise ValueError(
+                "fine AMR face neighbors currently support one refinement jump "
+                "(2x per axis, 4 cells per face). Include intermediate AMR levels."
+            )
+        pos_f = np.asfortranarray(pos, dtype=np.float64)
+        dx_f = np.asfortranarray(dx_values, dtype=np.float64)
+        level_f = np.asfortranarray(level, dtype=np.int32)
+        neighbors, fine_face_index, nfine = (
+            _shockfinder.shockfinder_kernel.build_neighbor_index(
+                pos_f, dx_f, level_f, n
+            )
+        )
+        fine_neighbors = _shockfinder.shockfinder_kernel.fill_fine_neighbors(
+            pos_f, dx_f, level_f, fine_face_index, int(nfine), n
+        )
+        return (
+            np.asfortranarray(neighbors, dtype=np.int32),
+            np.asfortranarray(fine_face_index, dtype=np.int32),
+            np.asfortranarray(fine_neighbors, dtype=np.int32),
+        )
+
+    @staticmethod
+    def _build_neighbor_tables_numpy(
+        pos: np.ndarray,
+        dx: np.ndarray,
+        level: np.ndarray,
+        *,
+        show_progress: bool = False,
+        progress_interval: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         n = dx.size
         neighbors = np.zeros((n, 6), dtype=np.int32, order="F")
         fine_neighbors = np.zeros((n, 6, 4), dtype=np.int32, order="F")
         if n == 0:
-            return neighbors, fine_neighbors
+            return (
+                neighbors,
+                np.zeros((0, 6), dtype=np.int32, order="F"),
+                np.zeros((0, 4), dtype=np.int32, order="F"),
+            )
 
         if np.any(dx <= 0.0):
             raise ValueError("dx must be positive for every retained cell")
@@ -705,7 +844,19 @@ class ShockFinder:
         if show_progress:
             ShockFinder._print_progress("ShockFinder: linking finer AMR face neighbors", n, n, fine_stage_start)
 
-        return neighbors, fine_neighbors
+        fine_face_mask = np.any(fine_neighbors > 0, axis=2)
+        fine_rows, fine_faces = np.nonzero(fine_face_mask)
+        fine_face_index = np.zeros((n, 6), dtype=np.int32, order="F")
+        if fine_rows.size:
+            fine_face_index[fine_rows, fine_faces] = np.arange(
+                1, fine_rows.size + 1, dtype=np.int32
+            )
+            sparse_fine_neighbors = np.asfortranarray(
+                fine_neighbors[fine_rows, fine_faces, :], dtype=np.int32
+            )
+        else:
+            sparse_fine_neighbors = np.zeros((0, 4), dtype=np.int32, order="F")
+        return neighbors, fine_face_index, sparse_fine_neighbors
 
     @staticmethod
     def _find_lower_level_neighbor(

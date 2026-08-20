@@ -138,6 +138,10 @@ Cells are filtered with:
 finder.minlevel <= cell["level"] <= finder.maxlevel
 ```
 
+Level filtering defines the retained AMR geometry. Temperature and density
+limits only control which retained cells may start a shock detection; those
+cells remain in the mesh as neighbors and upstream/downstream endpoints.
+
 `dx` is used for AMR geometry and neighbor construction, not as the level
 filter.
 
@@ -168,6 +172,24 @@ Neighbor links are built from AMR cell centers and widths. Same-level face
 neighbors are preferred. Fine cells can fall back to coarser face neighbors, and
 coarse cells adjacent to refined regions pass the four finer face cells to the
 Fortran kernel so gradients can use their face-averaged state.
+
+The default `neighbor_backend="fortran"` uses a compiled open-addressing hash
+index and stores finer-face links sparsely. The previous sorted NumPy builder is
+available as a correctness reference:
+
+```python
+finder.neighbor_backend = "numpy"
+```
+
+For repeated runs on identical level-selected geometry, persist the sparse
+neighbor tables as memory-mapped NPY files:
+
+```python
+finder.neighbor_cache_dir = "/path/to/shockfinder-neighbor-cache"
+```
+
+The cache key hashes cell positions, widths, levels, and the sparse table schema;
+temperature, density, Mach, and walk settings do not invalidate it.
 
 ## Shock Surface Catalog
 

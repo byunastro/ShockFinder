@@ -182,13 +182,13 @@ def build_shock_catalog(
         )
 
     if _neighbor_tables is None:
-        neighbors, fine_neighbors = ShockFinder._build_neighbor_tables(
+        neighbors, fine_face_index, fine_neighbors = ShockFinder._build_neighbor_tables(
             np.asfortranarray(result.pos, dtype=np.float64),
             np.asfortranarray(result.dx, dtype=np.float64),
             np.asfortranarray(levels_array, dtype=np.int32),
         )
     else:
-        neighbors, fine_neighbors = _neighbor_tables
+        neighbors, fine_face_index, fine_neighbors = _neighbor_tables
     shock_position = np.full(n, -1, dtype=np.int64)
     shock_position[shock_rows] = np.arange(shock_rows.size)
     union_find = _UnionFind(shock_rows.size)
@@ -203,6 +203,7 @@ def build_shock_catalog(
             result,
             shock_rows,
             neighbors,
+            fine_face_index,
             fine_neighbors,
             normals,
             duplicate_normal_cosine,
@@ -213,7 +214,7 @@ def build_shock_catalog(
         union_find = _UnionFind(shock_rows.size)
 
     for local_i, row in enumerate(shock_rows):
-        adjacent = np.concatenate((neighbors[row], fine_neighbors[row].ravel()))
+        adjacent = _adjacent_encoded(row, neighbors, fine_face_index, fine_neighbors)
         for encoded in adjacent:
             if encoded <= 0:
                 continue
@@ -563,6 +564,7 @@ def _center_representatives(
     result: ShockResult,
     shock_rows: np.ndarray,
     neighbors: np.ndarray,
+    fine_face_index: np.ndarray,
     fine_neighbors: np.ndarray,
     normals: np.ndarray,
     normal_cosine: float,
@@ -581,7 +583,7 @@ def _center_representatives(
         ni_norm = float(np.linalg.norm(ni))
         if ni_norm == 0.0:
             continue
-        adjacent = np.concatenate((neighbors[row], fine_neighbors[row].ravel()))
+        adjacent = _adjacent_encoded(row, neighbors, fine_face_index, fine_neighbors)
         for encoded in adjacent:
             if encoded <= 0:
                 continue
@@ -611,6 +613,14 @@ def _center_representatives(
         representative = min(rows, key=lambda row: (-float(result.mach[row]), row))
         representatives[rows] = representative
     return representatives
+
+
+def _adjacent_encoded(row, neighbors, fine_face_index, fine_neighbors):
+    groups = fine_face_index[row]
+    valid_groups = groups[groups > 0] - 1
+    if valid_groups.size == 0:
+        return neighbors[row]
+    return np.concatenate((neighbors[row], fine_neighbors[valid_groups].ravel()))
 
 
 def _surface_area(result: ShockResult, rows: np.ndarray) -> np.ndarray:

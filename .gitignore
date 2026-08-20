@@ -14,5 +14,6 @@ build/
 dist/
 *.egg-info/
 tests/output/
+/amr_data/
 
 .DS_Store

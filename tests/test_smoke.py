@@ -62,7 +62,7 @@ def test_level_filter_maps_selected_indices():
     assert result.shock.shape == (5,)
 
 
-def test_temperature_and_density_filters_map_selected_indices():
+def test_temperature_and_density_filters_preserve_neighbor_geometry():
     cell = line_cell()
     cell[("T", "K")] = np.array([1e4, 2e5, 2e5, 2e5, 4e5, 4e5, 4e5, 4e5], dtype=float)
     cell[("rho", "Msol/kpc3")] = np.array([0.1, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 9.0], dtype=float)
@@ -75,8 +75,8 @@ def test_temperature_and_density_filters_map_selected_indices():
     finder.max_density = 5.0
     result = finder.find(cell)
 
-    np.testing.assert_array_equal(result.selected_indices, np.array([2, 3, 4, 5, 6]))
-    assert result.mach.shape == (5,)
+    np.testing.assert_array_equal(result.selected_indices, np.arange(8))
+    assert result.mach.shape == (8,)
 
 
 def test_fine_cell_finds_coarse_face_neighbor():
@@ -111,10 +111,50 @@ def test_coarse_cell_records_finer_face_neighbors():
     dx = np.array([2.0, 1.0, 1.0, 1.0, 1.0])
     level = np.array([0, 1, 1, 1, 1], dtype=np.int32)
 
-    neighbors, fine_neighbors = shocktest.ShockFinder._build_neighbor_tables(pos, dx, level)
+    neighbors, fine_face_index, fine_neighbors = shocktest.ShockFinder._build_neighbor_tables(
+        pos, dx, level
+    )
 
     assert neighbors[0, 1] == 0
-    np.testing.assert_array_equal(np.sort(fine_neighbors[0, 1]), np.array([2, 3, 4, 5]))
+    group = fine_face_index[0, 1] - 1
+    np.testing.assert_array_equal(np.sort(fine_neighbors[group]), np.array([2, 3, 4, 5]))
+
+    numpy_tables = shocktest.ShockFinder._build_neighbor_tables(
+        pos, dx, level, backend="numpy"
+    )
+    np.testing.assert_array_equal(neighbors, numpy_tables[0])
+    numpy_group = numpy_tables[1][0, 1] - 1
+    np.testing.assert_array_equal(
+        np.sort(fine_neighbors[group]), np.sort(numpy_tables[2][numpy_group])
+    )
+
+
+def test_neighbor_cache_reuses_sparse_tables(tmp_path, monkeypatch):
+    cell = line_cell()
+    finder = shocktest.ShockFinder()
+    arrays = finder._extract_amr_arrays(cell)
+    finder.neighbor_cache_dir = str(tmp_path)
+
+    calls = 0
+    original = finder._build_neighbor_tables
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(finder, "_build_neighbor_tables", counted)
+    first = finder._neighbor_tables_for_arrays(
+        arrays["pos"], arrays["dx"], arrays["level"]
+    )
+    second = finder._neighbor_tables_for_arrays(
+        arrays["pos"], arrays["dx"], arrays["level"]
+    )
+
+    assert calls == 1
+    assert len(list(tmp_path.glob("*.npy"))) == 3
+    for first_values, second_values in zip(first, second):
+        np.testing.assert_array_equal(first_values, second_values)
 
 
 def test_multi_level_fine_face_gap_raises_clear_error():
@@ -166,14 +206,17 @@ def test_shock_center_considers_finer_face_candidates():
     )
     rho = np.asfortranarray([1.0, 1.0, 1.5, 2.0, 3.0, 4.0, 2.0, 3.0], dtype=float)
     level = np.asfortranarray([0, 0, 0, 1, 1, 1, 0, 0], dtype=np.int32)
+    detection_mask = np.ones(8, dtype=np.int32, order="F")
     neighbors = np.zeros((8, 6), dtype=np.int32, order="F")
-    fine_neighbors = np.zeros((8, 6, 4), dtype=np.int32, order="F")
+    fine_face_index = np.zeros((8, 6), dtype=np.int32, order="F")
+    fine_neighbors = np.zeros((1, 4), dtype=np.int32, order="F")
 
     # Cell 3 is a coarse candidate with a finer +x face candidate at cell 4.
     # Cells 4 and 5 are progressively more convergent. Center selection must
     # continue through the finer neighbor and settle on cell 5, not stop at 4.
     neighbors[2, 0] = 2
-    fine_neighbors[2, 1, 0] = 4
+    fine_face_index[2, 1] = 1
+    fine_neighbors[0, 0] = 4
     neighbors[3, 0] = 3
     neighbors[3, 1] = 5
     neighbors[4, 0] = 4
@@ -192,7 +235,9 @@ def test_shock_center_considers_finer_face_candidates():
         temp,
         rho,
         level,
+        detection_mask,
         neighbors,
+        fine_face_index,
         fine_neighbors,
         5.0 / 3.0,
         1.0e4,
@@ -204,6 +249,7 @@ def test_shock_center_considers_finer_face_candidates():
         0,
         0,
         8,
+        1,
         )
     )
 
@@ -226,7 +272,9 @@ def test_shock_center_considers_finer_face_candidates():
             temp,
             rho,
             level,
+            detection_mask,
             neighbors,
+            fine_face_index,
             fine_neighbors,
             5.0 / 3.0,
             1.0e4,
@@ -238,6 +286,7 @@ def test_shock_center_considers_finer_face_candidates():
             0,
             0,
             8,
+            1,
         )
     )
     np.testing.assert_array_equal(np.nonzero(plateau_shock)[0], [3])
@@ -251,7 +300,9 @@ def test_shock_center_considers_finer_face_candidates():
             temp,
             rho,
             level,
+            detection_mask,
             neighbors,
+            fine_face_index,
             fine_neighbors,
             5.0 / 3.0,
             1.0e4,
@@ -263,6 +314,7 @@ def test_shock_center_considers_finer_face_candidates():
             0,
             0,
             8,
+            1,
         )
     )
     assert center_capped_diagnostics[0] > 0
@@ -278,7 +330,9 @@ def test_shock_center_considers_finer_face_candidates():
         temp,
         rho,
         level,
+        detection_mask,
         neighbors,
+        fine_face_index,
         fine_neighbors,
         5.0 / 3.0,
         1.0e4,
@@ -290,6 +344,7 @@ def test_shock_center_considers_finer_face_candidates():
         0,
         0,
         8,
+        1,
         )
     )
     assert not np.any(capped_shock)
@@ -332,6 +387,7 @@ def test_only_open_boundary_is_supported_for_extracted_regions():
         ("center_normal_cosine", -0.1, "center_normal_cosine"),
         ("center_normal_cosine", 1.1, "center_normal_cosine"),
         ("center_plateau_tolerance", -1.0, "center_plateau_tolerance"),
+        ("neighbor_backend", "invalid", "neighbor_backend"),
     ],
 )
 def test_invalid_physical_settings_are_rejected(attribute, value, message):
