@@ -47,6 +47,12 @@ finder.show_progress = True
 finder.boundary = "open"
 finder.gamma = 5.0 / 3.0
 
+# Optional Mach cross-validation (these are the defaults).
+finder.validate_mach = True
+finder.filter_inconsistent = False
+finder.consistency_factor = 1.5
+finder.density_check_max_mach = 3.0
+
 result = finder.ShockFinder(cell)
 
 mach = result.mach
@@ -168,10 +174,52 @@ edges are never connected. Other boundary modes are rejected explicitly.
   candidate/thermodynamic/convergence exits, invalid jumps, and rejected Mach
   values. These counters are intended for real-snapshot quality comparisons.
 
+### Mach cross-validation
+
+`result.mach` remains the analytically inverted temperature-jump Mach number;
+`result.mach_temperature` is an alias to the same array.  Validation adds
+`mach_pressure`, `mach_density`, the three endpoint ratios, check-validity and
+consistency masks, and the compact uint16 `mach_validation_status` bit field.
+The public `shocktest.MachValidationFlag` enum decodes that field.
+
+Thermal pressure is taken from `finder.thermal_pressure_field` when that is set
+to the exact cell-table key. Fields explicitly named `thermal_pressure`,
+`pressure_thermal`, `p_thermal`, or `pth` are also discovered automatically.
+Otherwise the ideal-gas proportionality `P ~ rho*T` is used, which assumes the
+same mean molecular weight on both sides. Total MHD, cosmic-ray, or turbulent
+pressure is never selected automatically.
+
+Pressure consistency requires `M_T/f <= M_P <= f*M_T`, where
+`finder.consistency_factor` defaults to 1.5. Pressure must be calculable and
+pass for the overall mask to pass. Density must also pass when
+`min(M_T, M_rho) < finder.density_check_max_mach` (default 3). At higher Mach,
+or when the compression is saturated near `(gamma+1)/(gamma-1)`, the density
+test is marked not applicable and does not fail the shock. Saturated density
+ratios return NaN rather than being clipped to an arbitrarily large Mach.
+
+The default is diagnostic-only: validation does not change `result.shock` or
+`result.mach`. With `finder.filter_inconsistent=True`, only `result.shock` is
+filtered; the primary Mach and diagnostic values are retained for auditing.
+`examples/mach_validation.py` plots the estimator comparisons, pressure-ratio
+distribution, binned pass rate, reason counts, and per-AMR-level pass rates.
+
+These Rankine--Hugoniot checks assume an ideal, adiabatic hydrodynamic shock.
+Radiative and multiphase flows, variable molecular weight, MHD, cosmic-ray
+pressure, and other non-thermal components can produce genuine disagreement.
+
 Neighbor links are built from AMR cell centers and widths. Same-level face
 neighbors are preferred. Fine cells can fall back to coarser face neighbors, and
 coarse cells adjacent to refined regions pass the four finer face cells to the
 Fortran kernel so gradients can use their face-averaged state.
+
+Shock-center and endpoint walks cross actual cell faces using each local
+`dx`; they do not treat a coarse and fine cell as equal index-distance steps.
+At a coarse-to-fine face, the finer cell nearest the physical ray crossing is
+used for the walk. A center is rejected if the walk limit is reached while it
+is still in the candidate shock zone. The current topology supports one 2x
+refinement jump across a face and requires intermediate levels to be present;
+it does not reconstruct missing cells outside an extracted open-boundary
+region.
 
 The default `neighbor_backend="fortran"` uses a compiled open-addressing hash
 index and stores finer-face links sparsely. The previous sorted NumPy builder is

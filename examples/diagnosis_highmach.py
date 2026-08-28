@@ -94,6 +94,282 @@ class RHDiagnosis:
         }
 
 
+@dataclass(slots=True)
+class EndpointProfile:
+    """One shock-axis profile used to audit endpoint placement."""
+
+    diagnosis_row: int
+    result_row: int
+    mach_reported: float
+    s_over_dx: np.ndarray
+    radius_over_dx: np.ndarray
+    temperature: np.ndarray
+    density: np.ndarray
+    normal_velocity: np.ndarray
+    entropy_proxy: np.ndarray
+    level: np.ndarray
+    upstream_s_over_dx: float
+    downstream_s_over_dx: float
+    plateau_upstream_temperature: float
+    plateau_downstream_temperature: float
+    plateau_upstream_density: float
+    plateau_downstream_density: float
+    mach_from_plateaus: float
+    compression_from_plateaus: float
+    upstream_plateau_change: float
+    downstream_plateau_change: float
+    flag_upstream_not_plateau: bool
+    flag_downstream_not_plateau: bool
+    flag_temperature_mach_changes: bool
+    flag_insufficient_samples: bool
+
+
+@dataclass(slots=True)
+class EndpointInvestigation:
+    """Endpoint profiles and aggregate cause counts for selected shocks."""
+
+    profiles: list[EndpointProfile]
+
+    def summary(self) -> dict[str, int | float]:
+        n = len(self.profiles)
+        if not n:
+            return {"investigated": 0}
+        return {
+            "investigated": n,
+            "insufficient_samples": sum(p.flag_insufficient_samples for p in self.profiles),
+            "upstream_not_plateau": sum(p.flag_upstream_not_plateau for p in self.profiles),
+            "downstream_not_plateau": sum(p.flag_downstream_not_plateau for p in self.profiles),
+            "temperature_mach_changes": sum(
+                p.flag_temperature_mach_changes for p in self.profiles
+            ),
+            "median_plateau_to_reported_mach": float(np.nanmedian([
+                p.mach_from_plateaus / p.mach_reported for p in self.profiles
+                if np.isfinite(p.mach_from_plateaus) and p.mach_reported > 0.0
+            ])),
+        }
+
+
+def _mach_from_temperature_ratio(ratio, gamma: float = 5.0 / 3.0) -> float:
+    """Invert the ideal-gas temperature jump for an arbitrary gamma."""
+
+    if not np.isfinite(ratio) or ratio <= 1.0:
+        return np.nan
+    a = 2.0 * gamma * (gamma - 1.0)
+    b = 4.0 * gamma - (gamma - 1.0) ** 2 - ratio * (gamma + 1.0) ** 2
+    c = -2.0 * (gamma - 1.0)
+    discriminant = b * b - 4.0 * a * c
+    if discriminant < 0.0:
+        return np.nan
+    m2 = (-b + np.sqrt(discriminant)) / (2.0 * a)
+    return float(np.sqrt(m2)) if m2 > 0.0 else np.nan
+
+
+def investigate_highmach_endpoints(
+    cell,
+    result,
+    diagnosis: RHDiagnosis,
+    *,
+    max_cases: int = 50,
+    cylinder_radius_dx: float = 1.5,
+    outside_width_dx: float = 3.0,
+    plateau_relative_tolerance: float = 0.2,
+    mach_relative_tolerance: float = 0.2,
+    minimum_plateau_samples: int = 2,
+    gamma: float = 5.0 / 3.0,
+) -> EndpointInvestigation:
+    """Sample both sides of each endpoint and test whether they are plateaus.
+
+    Cases are selected by decreasing reported Mach, with suspect cases first.
+    Nearby retained AMR cells are projected onto the upstream-to-downstream
+    axis. The windows immediately *outside* the selected endpoints provide an
+    alternative pre/post-shock state. If those values continue changing, the
+    endpoint was probably selected before the fluid reached a plateau.
+
+    This geometrical reconstruction does not reproduce the exact Fortran walk;
+    it intentionally tests the surrounding data independently.
+    """
+
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError as exc:
+        raise ImportError("investigate_highmach_endpoints requires scipy") from exc
+
+    pos = getattr(result, "pos", None)
+    if pos is None:
+        raise ValueError("result.pos is required for endpoint investigation")
+    pos = np.asarray(pos, dtype=np.float64)
+    n = pos.shape[0]
+    if pos.shape != (n, 3):
+        raise ValueError("result.pos must have shape (n, 3)")
+
+    selected = optional_array(result, "selected_indices", n, dtype=np.int64, fill=-1)
+    upstream_all = optional_array(result, "upstream_index", n, dtype=np.int64, fill=-1)
+    downstream_all = optional_array(result, "downstream_index", n, dtype=np.int64, fill=-1)
+    dx_all = optional_array(result, "dx", n)
+    level_all = optional_array(result, "level", n)
+    normal_all = getattr(result, "normal", None)
+    if normal_all is not None:
+        normal_all = np.asarray(normal_all, dtype=np.float64)
+
+    temperature_all = _cell_field(cell, "T", "K")[selected]
+    density_all = _cell_field(cell, "rho", "Msol/kpc3")[selected]
+    velocity_all = np.column_stack((
+        _cell_field(cell, "vx", "km/s")[selected],
+        _cell_field(cell, "vy", "km/s")[selected],
+        _cell_field(cell, "vz", "km/s")[selected],
+    ))
+
+    priority = np.lexsort((
+        -diagnosis.mach_temperature,
+        ~diagnosis.flag_suspect,
+    ))
+    priority = priority[:max_cases]
+    tree = cKDTree(pos)
+    profiles: list[EndpointProfile] = []
+
+    def relative_change(endpoint_value: float, plateau_value: float) -> float:
+        scale = max(abs(endpoint_value), np.finfo(float).tiny)
+        return abs(plateau_value - endpoint_value) / scale
+
+    for diagnosis_row in priority:
+        row = int(diagnosis.result_rows[diagnosis_row])
+        upstream = int(upstream_all[row])
+        downstream = int(downstream_all[row])
+        dx = float(dx_all[row])
+        if not (0 <= upstream < n and 0 <= downstream < n and dx > 0.0):
+            continue
+
+        direction = (
+            normal_all[row].copy() if normal_all is not None
+            else pos[downstream] - pos[upstream]
+        )
+        direction_norm = np.linalg.norm(direction)
+        if not np.isfinite(direction_norm) or direction_norm == 0.0:
+            continue
+        direction /= direction_norm
+
+        center_pos = pos[row]
+        s_up = float(np.dot(pos[upstream] - center_pos, direction))
+        s_down = float(np.dot(pos[downstream] - center_pos, direction))
+        if s_up > s_down:
+            direction *= -1.0
+            s_up, s_down = -s_up, -s_down
+
+        outside_width = outside_width_dx * dx
+        radius = cylinder_radius_dx * dx
+        s_min = s_up - outside_width
+        s_max = s_down + outside_width
+        query_radius = np.sqrt(max(abs(s_min), abs(s_max)) ** 2 + radius ** 2)
+        candidates = np.asarray(tree.query_ball_point(center_pos, query_radius), dtype=np.int64)
+        displacement = pos[candidates] - center_pos
+        s = displacement @ direction
+        radial = np.linalg.norm(displacement - s[:, None] * direction, axis=1)
+        keep = (s >= s_min) & (s <= s_max) & (radial <= radius)
+        candidates = candidates[keep]
+        s = s[keep]
+        radial = radial[keep]
+        order = np.argsort(s)
+        candidates, s, radial = candidates[order], s[order], radial[order]
+
+        # Half-open windows avoid using the endpoint itself as evidence that it
+        # is already on a plateau.
+        up_window = (s >= s_up - outside_width) & (s < s_up)
+        down_window = (s > s_down) & (s <= s_down + outside_width)
+        enough = (
+            np.count_nonzero(up_window) >= minimum_plateau_samples
+            and np.count_nonzero(down_window) >= minimum_plateau_samples
+        )
+
+        if enough:
+            t1_plateau = float(np.median(temperature_all[candidates[up_window]]))
+            t2_plateau = float(np.median(temperature_all[candidates[down_window]]))
+            rho1_plateau = float(np.median(density_all[candidates[up_window]]))
+            rho2_plateau = float(np.median(density_all[candidates[down_window]]))
+            plateau_mach = _mach_from_temperature_ratio(t2_plateau / t1_plateau, gamma)
+            plateau_compression = rho2_plateau / rho1_plateau
+            up_change = max(
+                relative_change(temperature_all[upstream], t1_plateau),
+                relative_change(density_all[upstream], rho1_plateau),
+            )
+            down_change = max(
+                relative_change(temperature_all[downstream], t2_plateau),
+                relative_change(density_all[downstream], rho2_plateau),
+            )
+        else:
+            t1_plateau = t2_plateau = rho1_plateau = rho2_plateau = np.nan
+            plateau_mach = plateau_compression = up_change = down_change = np.nan
+
+        reported_mach = float(diagnosis.mach_temperature[diagnosis_row])
+        mach_changes = (
+            enough and np.isfinite(plateau_mach)
+            and abs(plateau_mach / reported_mach - 1.0) > mach_relative_tolerance
+        )
+        vn = velocity_all[candidates] @ direction
+        entropy = np.full(candidates.size, np.nan)
+        physical = (temperature_all[candidates] > 0.0) & (density_all[candidates] > 0.0)
+        entropy[physical] = (
+            temperature_all[candidates][physical]
+            / density_all[candidates][physical] ** (gamma - 1.0)
+        )
+        profiles.append(EndpointProfile(
+            diagnosis_row=int(diagnosis_row), result_row=row,
+            mach_reported=reported_mach, s_over_dx=s / dx,
+            radius_over_dx=radial / dx, temperature=temperature_all[candidates],
+            density=density_all[candidates], normal_velocity=vn,
+            entropy_proxy=entropy, level=level_all[candidates],
+            upstream_s_over_dx=s_up / dx, downstream_s_over_dx=s_down / dx,
+            plateau_upstream_temperature=t1_plateau,
+            plateau_downstream_temperature=t2_plateau,
+            plateau_upstream_density=rho1_plateau,
+            plateau_downstream_density=rho2_plateau,
+            mach_from_plateaus=plateau_mach,
+            compression_from_plateaus=plateau_compression,
+            upstream_plateau_change=up_change, downstream_plateau_change=down_change,
+            flag_upstream_not_plateau=bool(enough and up_change > plateau_relative_tolerance),
+            flag_downstream_not_plateau=bool(enough and down_change > plateau_relative_tolerance),
+            flag_temperature_mach_changes=bool(mach_changes),
+            flag_insufficient_samples=not enough,
+        ))
+
+    return EndpointInvestigation(profiles)
+
+
+def plot_endpoint_investigation(
+    investigation: EndpointInvestigation,
+    output_dir: str | Path = "endpoint_profiles",
+) -> None:
+    """Write one four-panel physical profile for every investigated shock."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    labels = ("Temperature [K]", "Density", "Normal velocity [km/s]", "Entropy proxy")
+    for profile in investigation.profiles:
+        values = (
+            profile.temperature, profile.density,
+            profile.normal_velocity, profile.entropy_proxy,
+        )
+        fig, axes = plt.subplots(4, 1, figsize=(8, 10), sharex=True,
+                                 constrained_layout=True)
+        for index, (ax, value, label) in enumerate(zip(axes, values, labels)):
+            scatter = ax.scatter(
+                profile.s_over_dx, value, c=profile.radius_over_dx,
+                s=18, cmap="viridis_r", alpha=0.8,
+            )
+            ax.axvline(profile.upstream_s_over_dx, color="tab:blue", linestyle="--")
+            ax.axvline(profile.downstream_s_over_dx, color="tab:red", linestyle="--")
+            ax.set_ylabel(label)
+            if index in (0, 1, 3):
+                ax.set_yscale("log")
+        axes[-1].set_xlabel(r"Distance along shock normal / $dx_{center}$")
+        fig.colorbar(scatter, ax=axes, label=r"Transverse distance / $dx_{center}$")
+        fig.suptitle(
+            f"row={profile.result_row}, reported M={profile.mach_reported:.2f}, "
+            f"plateau M={profile.mach_from_plateaus:.2f}"
+        )
+        fig.savefig(output_dir / f"endpoint_profile_{profile.result_row}.png", dpi=180)
+        plt.close(fig)
+
+
 def _cell_field(cell, name: str, unit: str) -> np.ndarray:
     """Read a unit-aware cell field, falling back to a plain field lookup."""
 
