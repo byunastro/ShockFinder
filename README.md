@@ -52,6 +52,7 @@ finder.validate_mach = True
 finder.filter_inconsistent = False
 finder.consistency_factor = 1.5
 finder.density_check_max_mach = 3.0
+finder.mach_validation_dtype = "float64"  # or "float32" to reduce memory
 
 result = finder.ShockFinder(cell)
 
@@ -202,6 +203,16 @@ The default is diagnostic-only: validation does not change `result.shock` or
 filtered; the primary Mach and diagnostic values are retained for auditing.
 `examples/mach_validation.py` plots the estimator comparisons, pressure-ratio
 distribution, binned pass rate, reason counts, and per-AMR-level pass rates.
+
+`finder.mach_validation_dtype` accepts only `"float32"` or `"float64"` and
+defaults to float64 for backward compatibility. It controls the arithmetic and
+storage dtype of `mach_pressure`, `mach_density`, and the three ratio arrays.
+The adopted `result.mach`/`mach_temperature` remains the float64 value from the
+compiled temperature-jump kernel. Float32 halves the five large validation
+float arrays (from 40 to 20 bytes per retained cell); boolean masks and the
+uint16 status array are unchanged. Density inversion is intrinsically
+ill-conditioned near its strong-shock compression limit, but that estimator is
+already marked not applicable above the configured density-check Mach range.
 
 These Rankine--Hugoniot checks assume an ideal, adiabatic hydrodynamic shock.
 Radiative and multiphase flows, variable molecular weight, MHD, cosmic-ray

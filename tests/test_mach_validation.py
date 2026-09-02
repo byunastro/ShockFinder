@@ -51,6 +51,30 @@ def test_analytic_jump_estimators_recover_input_mach():
     )
 
 
+def test_float32_estimators_have_small_expected_roundoff():
+    temperature_ratio = np.array(
+        [temperature_jump_from_mach(value) for value in MACH_VALUES]
+    )
+    pressure_ratio = pressure_jump_from_mach(MACH_VALUES)
+    density_ratio = np.array(
+        [density_jump_from_mach(value) for value in MACH_VALUES]
+    )
+
+    mt = mach_from_temperature_ratio(temperature_ratio, dtype=np.float32)
+    mp = mach_from_pressure_ratio(pressure_ratio, dtype=np.float32)
+    md = mach_from_density_ratio(density_ratio, dtype=np.float32)
+
+    assert mt.dtype == np.float32
+    assert mp.dtype == np.float32
+    assert md.dtype == np.float32
+    np.testing.assert_allclose(mt, MACH_VALUES, rtol=2.0e-6)
+    np.testing.assert_allclose(mp, MACH_VALUES, rtol=2.0e-6)
+    # Density inversion becomes ill-conditioned toward its strong-shock
+    # compression limit. At M=100 the float32 error is still below 1e-4, and
+    # density consistency is not applied above the default Mach-3 threshold.
+    np.testing.assert_allclose(md, MACH_VALUES, rtol=1.0e-4)
+
+
 def test_endpoint_estimators_recover_input_mach():
     upstream = np.ones(MACH_VALUES.size)
     np.testing.assert_allclose(
@@ -132,6 +156,25 @@ def test_consistent_shock_populates_diagnostics_without_changing_primary_result(
         result.mach_validation_status[rows]
         & int(MachValidationFlag.PRESSURE_FROM_RHO_T)
     )
+
+
+@pytest.mark.parametrize("dtype", ["float32", np.float32, np.dtype("float32")])
+def test_finder_float32_validation_option_reduces_diagnostic_dtype(dtype):
+    result = configured_finder(mach_validation_dtype=dtype).find(
+        planar_shock_cell(2.0, n=18, shock_index=9)
+    )
+
+    assert result.mach.dtype == np.float64
+    assert result.mach_temperature is result.mach
+    for name in (
+        "mach_pressure",
+        "mach_density",
+        "temperature_ratio",
+        "pressure_ratio",
+        "density_ratio",
+    ):
+        assert getattr(result, name).dtype == np.float32
+    assert np.all(result.mach_consistent[result.shock])
 
 
 def test_explicit_thermal_pressure_is_preferred_and_can_fail_validation():
@@ -264,6 +307,7 @@ def test_unavailable_pressure_never_passes_overall_validation():
         ("consistency_factor", 0.9),
         ("density_check_max_mach", 1.0),
         ("density_saturation_rtol", -1.0),
+        ("mach_validation_dtype", np.int32),
     ],
 )
 def test_invalid_validation_settings_are_rejected(setting, value):

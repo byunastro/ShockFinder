@@ -28,17 +28,25 @@ class MachValidationFlag(IntFlag):
     ENDPOINT_INVALID = 1 << 8
 
 
-def _as_float_array(value):
-    return np.asarray(value, dtype=np.float64)
+def _validation_dtype(dtype):
+    resolved = np.dtype(dtype)
+    if resolved not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("dtype must be float32 or float64")
+    return resolved
 
 
-def jump_ratio(upstream, downstream):
+def _as_float_array(value, dtype=np.float64):
+    return np.asarray(value, dtype=_validation_dtype(dtype))
+
+
+def jump_ratio(upstream, downstream, *, dtype=np.float64):
     """Return ``downstream / upstream`` or NaN for invalid endpoint values."""
 
+    dtype = _validation_dtype(dtype)
     upstream, downstream = np.broadcast_arrays(
-        _as_float_array(upstream), _as_float_array(downstream)
+        _as_float_array(upstream, dtype), _as_float_array(downstream, dtype)
     )
-    ratio = np.full(upstream.shape, np.nan, dtype=np.float64)
+    ratio = np.full(upstream.shape, np.nan, dtype=dtype)
     valid = (
         np.isfinite(upstream)
         & np.isfinite(downstream)
@@ -49,7 +57,9 @@ def jump_ratio(upstream, downstream):
     return ratio
 
 
-def mach_from_temperature_ratio(ratio, gamma: float = 5.0 / 3.0):
+def mach_from_temperature_ratio(
+    ratio, gamma: float = 5.0 / 3.0, *, dtype=np.float64
+):
     """Analytically invert the ideal-gas temperature jump.
 
     Unlike the compiled detection kernel, which maps a non-shock ratio to
@@ -57,8 +67,9 @@ def mach_from_temperature_ratio(ratio, gamma: float = 5.0 / 3.0):
     NaN for ratios that do not imply a supersonic shock.
     """
 
-    ratio = _as_float_array(ratio)
-    mach = np.full(ratio.shape, np.nan, dtype=np.float64)
+    dtype = _validation_dtype(dtype)
+    ratio = _as_float_array(ratio, dtype)
+    mach = np.full(ratio.shape, np.nan, dtype=dtype)
     valid = np.isfinite(ratio) & (ratio > 1.0)
     if not np.any(valid) or not np.isfinite(gamma) or gamma <= 1.0:
         return mach
@@ -77,11 +88,14 @@ def mach_from_temperature_ratio(ratio, gamma: float = 5.0 / 3.0):
     return mach
 
 
-def mach_from_pressure_ratio(ratio, gamma: float = 5.0 / 3.0):
+def mach_from_pressure_ratio(
+    ratio, gamma: float = 5.0 / 3.0, *, dtype=np.float64
+):
     """Return Mach number inferred from the thermal-pressure ratio."""
 
-    ratio = _as_float_array(ratio)
-    mach = np.full(ratio.shape, np.nan, dtype=np.float64)
+    dtype = _validation_dtype(dtype)
+    ratio = _as_float_array(ratio, dtype)
+    mach = np.full(ratio.shape, np.nan, dtype=dtype)
     valid = np.isfinite(ratio) & (ratio > 1.0)
     if not np.any(valid) or not np.isfinite(gamma) or gamma <= 1.0:
         return mach
@@ -98,10 +112,11 @@ def density_saturation_mask(
     gamma: float = 5.0 / 3.0,
     *,
     saturation_rtol: float = 1.0e-6,
+    dtype=np.float64,
 ):
     """Identify compression ratios too close to the strong-shock limit."""
 
-    ratio = _as_float_array(ratio)
+    ratio = _as_float_array(ratio, dtype)
     if not np.isfinite(gamma) or gamma <= 1.0:
         return np.zeros(ratio.shape, dtype=bool)
     limit = (gamma + 1.0) / (gamma - 1.0)
@@ -117,19 +132,21 @@ def mach_from_density_ratio(
     gamma: float = 5.0 / 3.0,
     *,
     saturation_rtol: float = 1.0e-6,
+    dtype=np.float64,
 ):
     """Return density-jump Mach, leaving saturated/invalid values as NaN.
 
     No clipping is performed at the strong-shock compression limit.
     """
 
-    ratio = _as_float_array(ratio)
-    mach = np.full(ratio.shape, np.nan, dtype=np.float64)
+    dtype = _validation_dtype(dtype)
+    ratio = _as_float_array(ratio, dtype)
+    mach = np.full(ratio.shape, np.nan, dtype=dtype)
     if not np.isfinite(gamma) or gamma <= 1.0:
         return mach
     limit = (gamma + 1.0) / (gamma - 1.0)
     saturated = density_saturation_mask(
-        ratio, gamma, saturation_rtol=saturation_rtol
+        ratio, gamma, saturation_rtol=saturation_rtol, dtype=dtype
     )
     valid = (
         np.isfinite(ratio)
@@ -146,16 +163,24 @@ def mach_from_density_ratio(
     return mach
 
 
-def mach_from_temperature_jump(upstream, downstream, gamma: float = 5.0 / 3.0):
+def mach_from_temperature_jump(
+    upstream, downstream, gamma: float = 5.0 / 3.0, *, dtype=np.float64
+):
     """Temperature estimator accepting endpoint states directly."""
 
-    return mach_from_temperature_ratio(jump_ratio(upstream, downstream), gamma)
+    return mach_from_temperature_ratio(
+        jump_ratio(upstream, downstream, dtype=dtype), gamma, dtype=dtype
+    )
 
 
-def mach_from_pressure_jump(upstream, downstream, gamma: float = 5.0 / 3.0):
+def mach_from_pressure_jump(
+    upstream, downstream, gamma: float = 5.0 / 3.0, *, dtype=np.float64
+):
     """Thermal-pressure estimator accepting endpoint states directly."""
 
-    return mach_from_pressure_ratio(jump_ratio(upstream, downstream), gamma)
+    return mach_from_pressure_ratio(
+        jump_ratio(upstream, downstream, dtype=dtype), gamma, dtype=dtype
+    )
 
 
 def mach_from_density_jump(
@@ -164,13 +189,15 @@ def mach_from_density_jump(
     gamma: float = 5.0 / 3.0,
     *,
     saturation_rtol: float = 1.0e-6,
+    dtype=np.float64,
 ):
     """Density estimator accepting endpoint states directly."""
 
     return mach_from_density_ratio(
-        jump_ratio(upstream, downstream),
+        jump_ratio(upstream, downstream, dtype=dtype),
         gamma,
         saturation_rtol=saturation_rtol,
+        dtype=dtype,
     )
 
 

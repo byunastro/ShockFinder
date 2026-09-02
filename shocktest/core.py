@@ -118,6 +118,10 @@ class ShockFinder:
         self.consistency_factor = 1.5
         self.density_check_max_mach = 3.0
         self.density_saturation_rtol = 1.0e-6
+        # Controls the stored pressure/density Mach and jump-ratio arrays, and
+        # the arithmetic used to derive them. The adopted temperature Mach in
+        # result.mach remains the float64 Fortran-kernel result.
+        self.mach_validation_dtype = np.float64
         # Set this to the exact mapping key (including a unit tuple, if used)
         # for a directly stored *thermal* pressure.  Automatic discovery is
         # deliberately limited to names that explicitly say "thermal" so that
@@ -384,7 +388,8 @@ class ShockFinder:
         )
 
         n = result.mach.size
-        nan_values = lambda: np.full(n, np.nan, dtype=np.float64)
+        validation_dtype = np.dtype(self.mach_validation_dtype)
+        nan_values = lambda: np.full(n, np.nan, dtype=validation_dtype)
         mach_pressure = nan_values()
         mach_density = nan_values()
         temperature_ratio = nan_values()
@@ -420,28 +425,40 @@ class ShockFinder:
                 temp2 = arrays["temp"][down]
                 rho1 = arrays["rho"][up]
                 rho2 = arrays["rho"][down]
-                temperature_ratio[valid_rows] = jump_ratio(temp1, temp2)
-                density_ratio[valid_rows] = jump_ratio(rho1, rho2)
+                temperature_ratio[valid_rows] = jump_ratio(
+                    temp1, temp2, dtype=validation_dtype
+                )
+                density_ratio[valid_rows] = jump_ratio(
+                    rho1, rho2, dtype=validation_dtype
+                )
 
                 pressure, pressure_from_rho_t = self._thermal_pressure_values(
-                    cell, result.selected_indices, arrays
+                    cell,
+                    result.selected_indices,
+                    arrays,
+                    dtype=validation_dtype,
                 )
                 if pressure is None:
                     pressure_ratio[valid_rows] = jump_ratio(
-                        rho1 * temp1_raw, rho2 * temp2
+                        rho1 * temp1_raw,
+                        rho2 * temp2,
+                        dtype=validation_dtype,
                     )
                 else:
                     pressure_ratio[valid_rows] = jump_ratio(
-                        pressure[up], pressure[down]
+                        pressure[up], pressure[down], dtype=validation_dtype
                     )
 
                 mach_pressure[valid_rows] = mach_from_pressure_ratio(
-                    pressure_ratio[valid_rows], self.gamma
+                    pressure_ratio[valid_rows],
+                    self.gamma,
+                    dtype=validation_dtype,
                 )
                 mach_density[valid_rows] = mach_from_density_ratio(
                     density_ratio[valid_rows],
                     self.gamma,
                     saturation_rtol=self.density_saturation_rtol,
+                    dtype=validation_dtype,
                 )
 
                 mt = result.mach[valid_rows]
@@ -453,6 +470,7 @@ class ShockFinder:
                     density_ratio[valid_rows],
                     self.gamma,
                     saturation_rtol=self.density_saturation_rtol,
+                    dtype=validation_dtype,
                 )
                 factor = float(self.consistency_factor)
                 p_consistent = (
@@ -547,6 +565,8 @@ class ShockFinder:
         cell: Any,
         selected_indices: np.ndarray,
         arrays: dict[str, np.ndarray],
+        *,
+        dtype=np.float64,
     ) -> tuple[np.ndarray | None, bool]:
         """Return selected thermal pressure, or signal the rho*T fallback."""
 
@@ -581,7 +601,7 @@ class ShockFinder:
             raise ValueError("thermal pressure field is shorter than the cell table")
         if not selected_indices.size:
             return np.empty(0, dtype=np.float64), False
-        return np.asarray(pressure[selected_indices], dtype=np.float64), False
+        return np.asarray(pressure[selected_indices], dtype=dtype), False
 
     def _neighbor_tables_for_arrays(
         self,
@@ -699,6 +719,14 @@ class ShockFinder:
             raise ValueError(
                 "density_saturation_rtol must be finite and in [0, 1)"
             )
+        try:
+            validation_dtype = np.dtype(self.mach_validation_dtype)
+        except TypeError as exc:
+            raise ValueError(
+                "mach_validation_dtype must be float32 or float64"
+            ) from exc
+        if validation_dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+            raise ValueError("mach_validation_dtype must be float32 or float64")
 
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:
         x = self._field(cell, (("x", self.position_unit), "x"))
