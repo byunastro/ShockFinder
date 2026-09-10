@@ -204,8 +204,15 @@ def make_shock_maps(
     mu: float = 0.59,
     temperature_floor: float = 1.0e4,
     area_mode: str = "normal",
+    valid_mach=None,
+    fill_gaps: int = 0,
 ):
-    """Convenience wrapper returning both ``machmap`` and ``disspEmap``."""
+    """Convenience wrapper returning both ``machmap`` and ``disspEmap``.
+
+    ``valid_mach`` overrides the default ``result.mach_consistent`` selection.
+    ``fill_gaps`` is a display-only, narrow-gap inpainting width in pixels; it
+    defaults to zero so quantitative maps remain untouched.
+    """
 
     from shocktest import painter
 
@@ -239,6 +246,8 @@ def make_shock_maps(
         min_mach=min_mach,
         statistic=statistic,
         method=method,
+        valid_mach=valid_mach,
+        fill_gaps=fill_gaps,
     )
     disspEmap = painter.make_disspE_map(
         result,
@@ -251,6 +260,8 @@ def make_shock_maps(
         min_mach=min_mach,
         statistic=statistic,
         method=method,
+        valid_mach=valid_mach,
+        fill_gaps=fill_gaps,
     )
     return ShockMapResult(
         machmap=machmap,

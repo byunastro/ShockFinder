@@ -368,6 +368,13 @@ each projected AMR shock-cell footprint into the image. This is better for
 figure-quality AMR maps than point-binning the cell centers. Use
 `method="point"` to recover the older center-binned behavior.
 
+When Mach validation is available, both map functions select
+`result.shock & result.mach_consistent` in addition to the finite-value and
+`min_mach` cuts. Pass an explicit Boolean `valid_mach` array to override the
+validation mask. Narrow, bracketed missing-pixel bands can be filled for display
+with `fill_gaps=1`. Gap filling is off by default and should not be used when
+integrating shock area or dissipated energy.
+
 Available statistics are:
 
 - `max`: strongest value touching each pixel.
@@ -380,7 +387,7 @@ You can build mach map and shock dissipated energy map directly from `ShockResul
 import matplotlib.pyplot as plt
 import numpy as np
 import shocktest
-from shocktest import painter
+from shocktest import painter, pyShockFinder
 
 finder = shocktest.ShockFinder()
 finder.minlevel = 15
@@ -388,9 +395,19 @@ finder.maxlevel = 20
 finder.show_progress = True
 
 result = finder.ShockFinder(cell)
-machmap = painter.make_mach_map(result, plane="xy", statistic="max")
+machmap = painter.make_mach_map(
+    result, plane="xy", statistic="max", fill_gaps=1
+)
 diss = pyShockFinder.compute_dissipation(cell, result)
-dissEmap = shockpainter.make_disspE_map(result,diss,plane="xz",bins=400,statistic="mean",method='amr')
+dissEmap = painter.make_disspE_map(
+    result,
+    diss,
+    plane="xz",
+    bins=400,
+    statistic="mean",
+    method="amr",
+    fill_gaps=1,
+)
 
 fig, ax = plt.subplots(figsize=(8, 6))
 ax.imshow(np.log10(machmap))
@@ -399,4 +416,13 @@ plt.show()
 fig, ax = plt.subplots(figsize=(8, 6))
 ax.imshow(np.log10(dissEmap))
 plt.show()
+```
+
+For auditable figures, retain the raw map and the exact inpainting mask:
+
+```python
+raw_map = painter.make_disspE_map(result, diss, bins=400)
+display_map, filled_pixels = painter.fill_small_map_gaps(
+    raw_map, max_gap_pixels=1, return_mask=True
+)
 ```

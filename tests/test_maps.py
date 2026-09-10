@@ -94,6 +94,73 @@ def test_make_mach_map_accepts_dissipation_weights():
         painter.make_mach_map(result, statistic="max", weights=weights)
 
 
+def test_maps_use_both_shock_and_validated_mach_masks():
+    import shocktest
+
+    result = shocktest.ShockResult(
+        mach=np.array([2.0, 3.0, 4.0]),
+        shock=np.array([True, False, True]),
+        center_index=np.arange(3),
+        upstream_index=np.arange(3),
+        downstream_index=np.arange(3),
+        selected_indices=np.arange(3),
+        pos=np.array([[0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 0.5]]),
+        dx=np.ones(3),
+        mach_consistent=np.array([True, True, False]),
+    )
+    dissipation = pyShockFinder.DissipationResult(
+        flux=np.array([10.0, 20.0, 30.0]),
+        total=np.zeros(3),
+        area=np.ones(3),
+        efficiency=np.ones(3),
+        sound_speed=np.ones(3),
+    )
+    kwargs = {"bins": (1, 3), "extent": (0.0, 3.0, 0.0, 1.0)}
+
+    machmap = painter.make_mach_map(result, **kwargs)
+    dissp_map = painter.make_disspE_map(result, dissipation, **kwargs)
+
+    np.testing.assert_allclose(machmap, np.array([[2.0, np.nan, np.nan]]), equal_nan=True)
+    np.testing.assert_allclose(dissp_map, np.array([[10.0, np.nan, np.nan]]), equal_nan=True)
+
+    override = painter.make_mach_map(
+        result,
+        valid_mach=np.array([False, False, True]),
+        **kwargs,
+    )
+    np.testing.assert_allclose(override, np.array([[np.nan, np.nan, 4.0]]), equal_nan=True)
+
+
+def test_fill_small_map_gaps_uses_log_harmonic_interpolation():
+    raw = np.array(
+        [
+            [4.0, 4.0, 4.0],
+            [np.nan, np.nan, np.nan],
+            [16.0, 16.0, 16.0],
+        ]
+    )
+
+    filled, fill_mask = painter.fill_small_map_gaps(raw, return_mask=True)
+
+    np.testing.assert_allclose(filled[1], np.full(3, 8.0), rtol=1.0e-5)
+    np.testing.assert_array_equal(fill_mask[1], np.ones(3, dtype=bool))
+    np.testing.assert_array_equal(filled[[0, 2]], raw[[0, 2]])
+
+
+def test_fill_small_map_gaps_does_not_bridge_wide_or_unbounded_regions():
+    raw = np.array(
+        [
+            [4.0, np.nan, np.nan, np.nan, 16.0],
+            [np.nan, np.nan, np.nan, np.nan, np.nan],
+        ]
+    )
+
+    filled, fill_mask = painter.fill_small_map_gaps(raw, return_mask=True)
+
+    np.testing.assert_allclose(filled, raw, equal_nan=True)
+    assert not np.any(fill_mask)
+
+
 def test_area_painting_fills_projected_cell_footprint():
     x = np.array([0.5])
     y = np.array([0.5])

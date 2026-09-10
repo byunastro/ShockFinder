@@ -24,6 +24,8 @@ def make_mach_map(
     statistic: Statistic = "max",
     method: Literal["amr", "point"] = "amr",
     weights=None,
+    valid_mach=None,
+    fill_gaps: int = 0,
 ):
     """Make a regular 2D Mach map from a ``ShockResult``.
 
@@ -31,16 +33,21 @@ def make_mach_map(
     ``machmap = painter.make_mach_map(result, plane="xy")``.
     The default ``method="amr"`` paints each projected AMR cell footprint into
     the image. ``method="point"`` keeps the older center-binning behavior.
+    By default, ``result.mach_consistent`` is used as the validation mask when
+    it is available. Pass ``valid_mach`` explicitly to override that mask.
     Empty pixels are returned as NaN. Pass per-cell ``weights`` with
     ``statistic="mean"`` to make an area- and weight-averaged Mach map, for
-    example using shock dissipation energy as the weight.
+    example using shock dissipation energy as the weight. ``fill_gaps`` can be
+    set to a small positive pixel width (normally 1) to inpaint only narrow,
+    bracketed display gaps in log space. It is disabled by default so the raw
+    map remains suitable for quantitative work.
     """
 
     x, y, normal, dx = _project_result_geometry(result, plane)
     if extent is None:
         extent = map_extent_from_result(result, plane=plane)
 
-    draw = result.shock & (result.mach >= min_mach)
+    draw = _shock_draw_mask(result, min_mach=min_mach, valid_mach=valid_mach)
     map_weights = None
     if weights is not None:
         if statistic == "max":
@@ -52,7 +59,20 @@ def make_mach_map(
         draw &= np.abs(normal - z_center) <= 0.5 * z_width
     if map_weights is not None:
         map_weights = map_weights[draw]
-    return _values_to_map(x[draw], y[draw], dx[draw], result.mach[draw], bins, extent, statistic, method, weights=map_weights)
+    mapped = _values_to_map(
+        x[draw],
+        y[draw],
+        dx[draw],
+        result.mach[draw],
+        bins,
+        extent,
+        statistic,
+        method,
+        weights=map_weights,
+    )
+    if fill_gaps:
+        mapped = fill_small_map_gaps(mapped, max_gap_pixels=fill_gaps, log=True)
+    return mapped
 
 
 def make_disspE_map(
@@ -67,23 +87,41 @@ def make_disspE_map(
     min_mach: float = 1.0,
     statistic: Statistic = "max",
     method: Literal["amr", "point"] = "amr",
+    valid_mach=None,
+    fill_gaps: int = 0,
 ):
     """Make a regular 2D dissipation-flux map from a ``ShockResult``.
 
     The returned map is E_diss/A in ``erg s^-1 kpc^-2`` when ``dissipation`` is
     produced by ``pyShockFinder.compute_dissipation``. The default
     ``method="amr"`` paints each projected AMR shock-cell footprint into the
-    image. ``method="point"`` keeps the older center-binning behavior.
+    image. ``method="point"`` keeps the older center-binning behavior. By
+    default, ``result.mach_consistent`` is used as the validation mask when it
+    exists; pass ``valid_mach`` explicitly to override it. ``fill_gaps`` has
+    the same conservative, display-only meaning as in :func:`make_mach_map`.
     """
 
     x, y, normal, dx = _project_result_geometry(result, plane)
     if extent is None:
         extent = map_extent_from_result(result, plane=plane)
 
-    draw = result.shock & (result.mach >= min_mach) & (dissipation.flux > 0.0)
+    draw = _shock_draw_mask(result, min_mach=min_mach, valid_mach=valid_mach)
+    draw &= np.isfinite(dissipation.flux) & (dissipation.flux > 0.0)
     if z_center is not None and z_width is not None:
         draw &= np.abs(normal - z_center) <= 0.5 * z_width
-    return _values_to_map(x[draw], y[draw], dx[draw], dissipation.flux[draw], bins, extent, statistic, method)
+    mapped = _values_to_map(
+        x[draw],
+        y[draw],
+        dx[draw],
+        dissipation.flux[draw],
+        bins,
+        extent,
+        statistic,
+        method,
+    )
+    if fill_gaps:
+        mapped = fill_small_map_gaps(mapped, max_gap_pixels=fill_gaps, log=True)
+    return mapped
 
 
 def make_disspE_maps(*args, **kwargs):
@@ -102,6 +140,92 @@ def map_extent_from_result(result, *, plane: Plane = "xy"):
         float(np.min(y - 0.5 * dx)),
         float(np.max(y + 0.5 * dx)),
     )
+
+
+def fill_small_map_gaps(
+    data,
+    *,
+    max_gap_pixels: int = 1,
+    log: bool = True,
+    max_iterations: int = 200,
+    tolerance: float = 1.0e-6,
+    return_mask: bool = False,
+):
+    """Inpaint narrow, bracketed gaps without expanding the map boundary.
+
+    A missing pixel is eligible only when finite pixels bracket it along a
+    horizontal, vertical, or diagonal direction within ``max_gap_pixels``.
+    Eligible values are the discrete harmonic continuation of their eight
+    neighboring pixels. Positive maps should use the default ``log=True`` so
+    interpolation follows their multiplicative dynamic range.
+
+    This is intended for visualization, not for recomputing integrated shock
+    area or dissipated energy. ``return_mask=True`` also returns the pixels
+    actually filled, which should be retained for provenance and QA plots.
+    """
+
+    values = np.asarray(data, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("data must be a 2D map")
+    if not isinstance(max_gap_pixels, (int, np.integer)) or max_gap_pixels < 0:
+        raise ValueError("max_gap_pixels must be a non-negative integer")
+    if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer")
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("tolerance must be finite and positive")
+
+    out = values.copy()
+    empty_mask = np.zeros(values.shape, dtype=bool)
+    if max_gap_pixels == 0 or values.size == 0:
+        return (out, empty_mask) if return_mask else out
+
+    valid = np.isfinite(values)
+    if log:
+        valid &= values > 0.0
+    target = _bracketed_gap_mask(valid, int(max_gap_pixels))
+    if not np.any(target):
+        return (out, empty_mask) if return_mask else out
+
+    work = np.full(values.shape, np.nan, dtype=np.float64)
+    work[valid] = np.log(values[valid]) if log else values[valid]
+
+    for _ in range(int(max_iterations)):
+        neighbor_sum = np.zeros(values.shape, dtype=np.float64)
+        neighbor_count = np.zeros(values.shape, dtype=np.int16)
+        for dy, dx in (
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ):
+            neighbor = _shift_2d(work, dy, dx, np.nan)
+            finite_neighbor = np.isfinite(neighbor)
+            neighbor_sum[finite_neighbor] += neighbor[finite_neighbor]
+            neighbor_count[finite_neighbor] += 1
+
+        update = target & (neighbor_count > 0)
+        if not np.any(update):
+            break
+        next_work = work.copy()
+        next_work[update] = neighbor_sum[update] / neighbor_count[update]
+
+        comparable = update & np.isfinite(work)
+        converged = np.all(np.isfinite(next_work[target]))
+        if converged and np.any(comparable):
+            converged &= np.max(np.abs(next_work[comparable] - work[comparable])) <= tolerance
+        elif converged:
+            converged = False
+        work = next_work
+        if converged:
+            break
+
+    filled = target & np.isfinite(work)
+    out[filled] = np.exp(work[filled]) if log else work[filled]
+    return (out, filled) if return_mask else out
 
 
 def rgb_image(
@@ -288,6 +412,47 @@ def _project_result_geometry(result, plane: Plane):
     pos = np.asarray(result.pos, dtype=np.float64)
     dx = np.asarray(result.dx, dtype=np.float64)
     return pos[:, x_axis], pos[:, y_axis], pos[:, normal_axis], dx
+
+
+def _shock_draw_mask(result, *, min_mach: float, valid_mach=None):
+    mach = np.asarray(result.mach, dtype=np.float64)
+    shock = np.asarray(result.shock, dtype=bool)
+    if shock.shape != mach.shape:
+        raise ValueError("result.shock must have the same shape as result.mach")
+
+    if valid_mach is None:
+        valid_mach = getattr(result, "mach_consistent", None)
+    if valid_mach is None:
+        valid = np.ones(mach.shape, dtype=bool)
+    else:
+        valid = np.asarray(valid_mach, dtype=bool)
+        if valid.shape != mach.shape:
+            raise ValueError("valid_mach must have the same shape as result.mach")
+    return shock & valid & np.isfinite(mach) & (mach >= min_mach)
+
+
+def _bracketed_gap_mask(valid, max_gap_pixels: int):
+    missing = ~valid
+    bracketed = np.zeros(valid.shape, dtype=bool)
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        negative = np.zeros(valid.shape, dtype=bool)
+        positive = np.zeros(valid.shape, dtype=bool)
+        for distance in range(1, max_gap_pixels + 1):
+            negative |= _shift_2d(valid, -dy * distance, -dx * distance, False)
+            positive |= _shift_2d(valid, dy * distance, dx * distance, False)
+        bracketed |= negative & positive
+    return missing & bracketed
+
+
+def _shift_2d(values, dy: int, dx: int, fill_value):
+    shifted = np.full(values.shape, fill_value, dtype=values.dtype)
+    ny, nx = values.shape
+    src_y = slice(max(0, -dy), min(ny, ny - dy))
+    src_x = slice(max(0, -dx), min(nx, nx - dx))
+    dst_y = slice(max(0, dy), min(ny, ny + dy))
+    dst_x = slice(max(0, dx), min(nx, nx + dx))
+    shifted[dst_y, dst_x] = values[src_y, src_x]
+    return shifted
 
 
 def _bin_shape(bins: int | tuple[int, int]):
