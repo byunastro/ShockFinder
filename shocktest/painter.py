@@ -10,6 +10,18 @@ from matplotlib.patches import Circle
 
 Plane = Literal["xy", "xz", "yz"]
 Statistic = Literal["max", "sum", "mean"]
+MapBackend = Literal["auto", "fortran", "python"]
+
+try:
+    from . import _shockfinder as _shockfinder_extension
+except ImportError:  # pragma: no cover - supported pure-Python fallback
+    _shockfinder_extension = None
+
+_FORTRAN_MAP_KERNEL = getattr(
+    getattr(_shockfinder_extension, "shockfinder_kernel", None),
+    "paint_cells_to_map",
+    None,
+)
 
 
 def make_mach_map(
@@ -26,6 +38,7 @@ def make_mach_map(
     weights=None,
     valid_mach=None,
     fill_gaps: int = 0,
+    backend: MapBackend = "auto",
 ):
     """Make a regular 2D Mach map from a ``ShockResult``.
 
@@ -41,6 +54,8 @@ def make_mach_map(
     set to a small positive pixel width (normally 1) to inpaint only narrow,
     bracketed display gaps in log space. It is disabled by default so the raw
     map remains suitable for quantitative work.
+    ``backend="auto"`` uses the compiled Fortran rasterizer when the installed
+    extension contains it, otherwise it falls back to the Python reference.
     """
 
     x, y, normal, dx = _project_result_geometry(result, plane)
@@ -69,6 +84,7 @@ def make_mach_map(
         statistic,
         method,
         weights=map_weights,
+        backend=backend,
     )
     if fill_gaps:
         mapped = fill_small_map_gaps(mapped, max_gap_pixels=fill_gaps, log=True)
@@ -89,6 +105,7 @@ def make_disspE_map(
     method: Literal["amr", "point"] = "amr",
     valid_mach=None,
     fill_gaps: int = 0,
+    backend: MapBackend = "auto",
 ):
     """Make a regular 2D dissipation-flux map from a ``ShockResult``.
 
@@ -99,6 +116,7 @@ def make_disspE_map(
     default, ``result.mach_consistent`` is used as the validation mask when it
     exists; pass ``valid_mach`` explicitly to override it. ``fill_gaps`` has
     the same conservative, display-only meaning as in :func:`make_mach_map`.
+    ``backend`` selects the same automatic Fortran/Python rasterizer.
     """
 
     x, y, normal, dx = _project_result_geometry(result, plane)
@@ -118,6 +136,7 @@ def make_disspE_map(
         extent,
         statistic,
         method,
+        backend=backend,
     )
     if fill_gaps:
         mapped = fill_small_map_gaps(mapped, max_gap_pixels=fill_gaps, log=True)
@@ -463,11 +482,33 @@ def _bin_shape(bins: int | tuple[int, int]):
     return int(bins[0]), int(bins[1])
 
 
-def _values_to_map(x, y, dx, values, bins, extent, statistic: Statistic, method: Literal["amr", "point"], *, weights=None):
+def _values_to_map(
+    x,
+    y,
+    dx,
+    values,
+    bins,
+    extent,
+    statistic: Statistic,
+    method: Literal["amr", "point"],
+    *,
+    weights=None,
+    backend: MapBackend = "auto",
+):
     if method == "point":
         return _bin_to_map(x, y, values, bins, extent, statistic, weights=weights)
     if method == "amr":
-        return _paint_cells_to_map(x, y, dx, values, bins, extent, statistic, weights=weights)
+        return _paint_cells_to_map(
+            x,
+            y,
+            dx,
+            values,
+            bins,
+            extent,
+            statistic,
+            weights=weights,
+            backend=backend,
+        )
     raise ValueError("method must be one of: amr, point")
 
 
@@ -522,7 +563,18 @@ def _bin_to_map(x, y, values, bins, extent, statistic: Statistic, *, weights=Non
     raise ValueError("statistic must be one of: max, sum, mean")
 
 
-def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic, *, weights=None):
+def _paint_cells_to_map(
+    x,
+    y,
+    dx,
+    values,
+    bins,
+    extent,
+    statistic: Statistic,
+    *,
+    weights=None,
+    backend: MapBackend = "auto",
+):
     ny, nx = _bin_shape(bins)
     out = np.full((ny, nx), np.nan, dtype=np.float64)
     x = np.asarray(x, dtype=np.float64)
@@ -530,6 +582,10 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic, *,
     dx = np.asarray(dx, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
     weights = _optional_weights(weights, values.size)
+    if statistic not in {"max", "mean", "sum"}:
+        raise ValueError("statistic must be one of: max, sum, mean")
+    if backend not in {"auto", "fortran", "python"}:
+        raise ValueError("backend must be one of: auto, fortran, python")
     if values.size == 0:
         return out
 
@@ -553,6 +609,102 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic, *,
     values = values[finite]
     if weights is not None:
         weights = weights[finite]
+
+    use_fortran = backend == "fortran" or (
+        backend == "auto" and _FORTRAN_MAP_KERNEL is not None
+    )
+    if use_fortran:
+        if _FORTRAN_MAP_KERNEL is None:
+            raise ImportError(
+                "Fortran map rasterizer is unavailable; rebuild shocktest._shockfinder "
+                "from shocktest/fortran/shockfinder.f90 or use backend='python'"
+            )
+        return _paint_cells_to_map_fortran(
+            x,
+            y,
+            dx,
+            values,
+            weights,
+            statistic,
+            xmin,
+            ymin,
+            pixw,
+            pixh,
+            nx,
+            ny,
+        )
+
+    return _paint_cells_to_map_python(
+        x,
+        y,
+        dx,
+        values,
+        weights,
+        statistic,
+        xmin,
+        ymin,
+        pixw,
+        pixh,
+        nx,
+        ny,
+    )
+
+
+def _paint_cells_to_map_fortran(
+    x,
+    y,
+    dx,
+    values,
+    weights,
+    statistic,
+    xmin,
+    ymin,
+    pixw,
+    pixh,
+    nx,
+    ny,
+):
+    statistic_code = {"max": 0, "mean": 1, "sum": 2}[statistic]
+    kernel_weights = values if weights is None else weights
+    value_sum, area_sum = _FORTRAN_MAP_KERNEL(
+        x,
+        y,
+        dx,
+        values,
+        kernel_weights,
+        int(weights is not None),
+        statistic_code,
+        xmin,
+        ymin,
+        pixw,
+        pixh,
+        nx,
+        ny,
+    )
+    valid = area_sum > 0.0
+    if statistic == "mean":
+        np.divide(value_sum, area_sum, out=value_sum, where=valid)
+    elif statistic == "sum":
+        value_sum /= pixw * pixh
+    value_sum[~valid] = np.nan
+    return value_sum
+
+
+def _paint_cells_to_map_python(
+    x,
+    y,
+    dx,
+    values,
+    weights,
+    statistic,
+    xmin,
+    ymin,
+    pixw,
+    pixh,
+    nx,
+    ny,
+):
+    out = np.full((ny, nx), np.nan, dtype=np.float64)
 
     if statistic == "max":
         work = np.full((ny, nx), -np.inf, dtype=np.float64)
@@ -605,7 +757,7 @@ def _paint_cells_to_map(x, y, dx, values, bins, extent, statistic: Statistic, *,
             out[valid] = value_sum[valid] / pixel_area
         return out
 
-    raise ValueError("statistic must be one of: max, sum, mean")
+    raise AssertionError("unreachable statistic")
 
 
 def _optional_weights(weights, size: int):

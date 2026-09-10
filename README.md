@@ -375,6 +375,13 @@ validation mask. Narrow, bracketed missing-pixel bands can be filled for display
 with `fill_gaps=1`. Gap filling is off by default and should not be used when
 integrating shock area or dissipated energy.
 
+AMR footprint painting uses `backend="auto"`. A freshly built extension uses
+the Fortran rasterizer; an older or unavailable extension falls back to the
+Python reference implementation. After updating the Fortran source, rebuild
+the extension with the command in the Build section. Use `backend="fortran"`
+to require the fast path and receive an explicit error if it is unavailable,
+or `backend="python"` for reference comparisons.
+
 Available statistics are:
 
 - `max`: strongest value touching each pixel.

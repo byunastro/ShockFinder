@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from shocktest import painter, pyShockFinder
 
@@ -64,7 +65,6 @@ def test_make_mach_map_from_result_like_user_example():
 
 
 def test_make_mach_map_accepts_dissipation_weights():
-    import pytest
     import shocktest
 
     result = shocktest.ShockResult(
@@ -183,6 +183,56 @@ def test_area_sum_scales_by_pixel_coverage():
     area_map = painter._paint_cells_to_map(x, y, dx, values, bins=(1, 1), extent=(0.0, 1.0, 0.0, 1.0), statistic="sum")
 
     np.testing.assert_allclose(area_map, np.array([[2.0]]))
+
+
+def test_amr_auto_backend_falls_back_when_fortran_kernel_is_unavailable(monkeypatch):
+    x = np.array([0.25, 0.75])
+    y = np.array([0.25, 0.75])
+    dx = np.array([0.5, 0.5])
+    values = np.array([8.0, 4.0])
+    kwargs = {"bins": (2, 2), "extent": (0.0, 1.0, 0.0, 1.0)}
+    monkeypatch.setattr(painter, "_FORTRAN_MAP_KERNEL", None)
+
+    automatic = painter._paint_cells_to_map(
+        x, y, dx, values, statistic="mean", backend="auto", **kwargs
+    )
+    reference = painter._paint_cells_to_map(
+        x, y, dx, values, statistic="mean", backend="python", **kwargs
+    )
+
+    np.testing.assert_allclose(automatic, reference, equal_nan=True)
+    with pytest.raises(ImportError, match="rebuild"):
+        painter._paint_cells_to_map(
+            x, y, dx, values, statistic="mean", backend="fortran", **kwargs
+        )
+
+
+@pytest.mark.parametrize("statistic", ["max", "mean", "sum"])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_amr_fortran_backend_matches_python(statistic, weighted):
+    if painter._FORTRAN_MAP_KERNEL is None:
+        pytest.skip("Fortran map rasterizer is not built")
+
+    x = np.array([-0.1, 0.15, 0.5, 0.85, 1.1, np.nan])
+    y = np.array([0.5, 0.15, 0.5, 0.85, 0.5, 0.5])
+    dx = np.array([0.4, 0.3, 0.6, 0.3, 0.4, 0.2])
+    values = np.array([2.0, 4.0, 8.0, 16.0, 32.0, 64.0])
+    weights = np.array([1.0, 2.0, 0.5, 3.0, 1.5, 1.0]) if weighted else None
+    kwargs = {
+        "bins": (7, 9),
+        "extent": (0.0, 1.0, 0.0, 1.0),
+        "statistic": statistic,
+        "weights": weights,
+    }
+
+    expected = painter._paint_cells_to_map(
+        x, y, dx, values, backend="python", **kwargs
+    )
+    actual = painter._paint_cells_to_map(
+        x, y, dx, values, backend="fortran", **kwargs
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1.0e-13, equal_nan=True)
 
 
 def test_normal_shock_surface_area_matches_cell_area_for_axis_aligned_shock():

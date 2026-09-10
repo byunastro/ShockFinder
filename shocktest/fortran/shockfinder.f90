@@ -3,9 +3,74 @@ module shockfinder_kernel
   implicit none
   integer, parameter :: dp = kind(1.0d0)
   private
-  public :: find_shocks, build_neighbor_index, fill_fine_neighbors
+  public :: find_shocks, build_neighbor_index, fill_fine_neighbors, paint_cells_to_map
 
 contains
+
+  ! Rasterize projected AMR cell footprints onto a regular image.  Python
+  ! performs input filtering and converts the two accumulators into max, mean,
+  ! or sum output, keeping this kernel small and reusable through f2py.
+  subroutine paint_cells_to_map(x, y, width, values, weights, use_weights, statistic, &
+       xmin, ymin, pixw, pixh, nx, ny, n, value_sum, area_sum)
+    integer, intent(in) :: n, nx, ny, use_weights, statistic
+    real(8), intent(in) :: x(n), y(n), width(n), values(n), weights(n)
+    real(8), intent(in) :: xmin, ymin, pixw, pixh
+    real(8), intent(out) :: value_sum(ny, nx), area_sum(ny, nx)
+
+    integer :: i, ix, iy, ix0, ix1, iy0, iy1
+    real(8) :: left, right, bottom, top, px0, py0, ox, oy
+    real(8) :: overlap, weighted_overlap, weight
+
+    value_sum = 0.0_dp
+    area_sum = 0.0_dp
+
+    do i = 1, n
+      left = x(i) - 0.5_dp * width(i)
+      right = x(i) + 0.5_dp * width(i)
+      bottom = y(i) - 0.5_dp * width(i)
+      top = y(i) + 0.5_dp * width(i)
+      if (right <= xmin .or. left >= xmin + real(nx, dp) * pixw .or. &
+          top <= ymin .or. bottom >= ymin + real(ny, dp) * pixh) cycle
+
+      ix0 = max(1, floor((left - xmin) / pixw) + 1)
+      ix1 = min(nx, ceiling((right - xmin) / pixw))
+      iy0 = max(1, floor((bottom - ymin) / pixh) + 1)
+      iy1 = min(ny, ceiling((top - ymin) / pixh))
+      if (ix0 > ix1 .or. iy0 > iy1) cycle
+
+      if (statistic == 0) then
+        do ix = ix0, ix1
+          do iy = iy0, iy1
+            if (area_sum(iy, ix) == 0.0_dp .or. values(i) > value_sum(iy, ix)) then
+              value_sum(iy, ix) = values(i)
+            end if
+            area_sum(iy, ix) = 1.0_dp
+          end do
+        end do
+        cycle
+      end if
+
+      if (use_weights /= 0) then
+        weight = weights(i)
+      else
+        weight = 1.0_dp
+      end if
+      do ix = ix0, ix1
+        px0 = xmin + real(ix - 1, dp) * pixw
+        ox = max(0.0_dp, min(right, px0 + pixw) - max(left, px0))
+        if (ox <= 0.0_dp) cycle
+        do iy = iy0, iy1
+          py0 = ymin + real(iy - 1, dp) * pixh
+          oy = max(0.0_dp, min(top, py0 + pixh) - max(bottom, py0))
+          if (oy <= 0.0_dp) cycle
+          overlap = ox * oy
+          weighted_overlap = weight * overlap
+          value_sum(iy, ix) = value_sum(iy, ix) + values(i) * weighted_overlap
+          area_sum(iy, ix) = area_sum(iy, ix) + weighted_overlap
+        end do
+      end do
+    end do
+  end subroutine paint_cells_to_map
 
   ! Return the ideal-gas entropy proxy T/rho^(gamma-1).
   pure real(8) function entropy_value(temp, rho, gamma) result(s)

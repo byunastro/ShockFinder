@@ -206,12 +206,14 @@ def make_shock_maps(
     area_mode: str = "normal",
     valid_mach=None,
     fill_gaps: int = 0,
+    backend: str = "auto",
 ):
     """Convenience wrapper returning both ``machmap`` and ``disspEmap``.
 
     ``valid_mach`` overrides the default ``result.mach_consistent`` selection.
     ``fill_gaps`` is a display-only, narrow-gap inpainting width in pixels; it
     defaults to zero so quantitative maps remain untouched.
+    ``backend="auto"`` uses the Fortran rasterizer when it is available.
     """
 
     from shocktest import painter
@@ -248,6 +250,7 @@ def make_shock_maps(
         method=method,
         valid_mach=valid_mach,
         fill_gaps=fill_gaps,
+        backend=backend,
     )
     disspEmap = painter.make_disspE_map(
         result,
@@ -262,6 +265,7 @@ def make_shock_maps(
         method=method,
         valid_mach=valid_mach,
         fill_gaps=fill_gaps,
+        backend=backend,
     )
     return ShockMapResult(
         machmap=machmap,
