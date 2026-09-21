@@ -1,3 +1,8 @@
+from .exposure import (
+    ShockFrame, MergerEvent, MergerAttribution, ExposureRecord, ExposureInterval,
+    ExposureAccumulator, attribute_merger_shocks, integrate_galaxy_exposure,
+)
+from .compact import ShockSamples, compact_shocks
 from .core import ShockFinder, ShockResult
 from .mach_validation import (
     MachValidationFlag,
@@ -25,6 +30,10 @@ from .catalog import (
 )
 
 __all__ = [
+    "ShockFrame", "MergerEvent", "MergerAttribution", "ExposureRecord", "ExposureInterval",
+    "ExposureAccumulator", "attribute_merger_shocks", "integrate_galaxy_exposure",
+    "ShockSamples",
+    "compact_shocks",
     "ShockCatalog",
     "ShockAnalysis",
     "CatalogSensitivity",

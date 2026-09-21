@@ -110,6 +110,7 @@ def build_shock_catalog(
     maximum_normal_dispersion: float = 0.3,
     provenance: dict[str, object] | None = None,
     _neighbor_tables=None,
+    _dissipation_rows=None,
 ) -> ShockCatalog:
     """Group AMR face-connected shock centers and summarize each surface.
 
@@ -162,8 +163,8 @@ def build_shock_catalog(
 
     shock_rows = np.nonzero(result.shock & (result.mach >= min_mach))[0]
     labels = np.full(n, -1, dtype=np.int64)
-    representatives = np.full(n, -1, dtype=np.int64)
     if shock_rows.size == 0:
+        representatives = np.full(n, -1, dtype=np.int64)
         return ShockCatalog(
             group_id=labels,
             center_representative=representatives,
@@ -189,15 +190,10 @@ def build_shock_catalog(
         )
     else:
         neighbors, fine_face_index, fine_neighbors = _neighbor_tables
-    shock_position = np.full(n, -1, dtype=np.int64)
-    shock_position[shock_rows] = np.arange(shock_rows.size)
-    union_find = _UnionFind(shock_rows.size)
-
     normals = result.normal
     if normals is None:
         normals = np.zeros((n, 3), dtype=np.float64)
 
-    representatives[shock_rows] = shock_rows
     if deduplicate:
         representatives = _center_representatives(
             result,
@@ -209,10 +205,17 @@ def build_shock_catalog(
             duplicate_normal_cosine,
         )
         shock_rows = shock_rows[representatives[shock_rows] == shock_rows]
-        shock_position.fill(-1)
-        shock_position[shock_rows] = np.arange(shock_rows.size)
-        union_find = _UnionFind(shock_rows.size)
-
+    else:
+        representatives = np.full(n, -1, dtype=np.int64)
+        representatives[shock_rows] = shock_rows
+    # Only local center IDs need this dense scratch index; output IDs stay int64.
+    local_dtype = np.int32 if shock_rows.size <= np.iinfo(np.int32).max else np.int64
+    shock_position = np.full(n, -1, dtype=local_dtype)
+    shock_position[shock_rows] = np.arange(shock_rows.size, dtype=local_dtype)
+    union_find = _UnionFind(shock_rows.size)
+    # Reuse exactly the previous scalar norm calculation for each edge.
+    normal_lengths = np.fromiter((np.linalg.norm(normals[row]) for row in shock_rows),
+                                 dtype=np.float64, count=shock_rows.size)
     for local_i, row in enumerate(shock_rows):
         adjacent = _adjacent_encoded(row, neighbors, fine_face_index, fine_neighbors)
         for encoded in adjacent:
@@ -227,8 +230,8 @@ def build_shock_catalog(
                 continue
             ni = normals[row]
             nj = normals[other]
-            ni_norm = float(np.linalg.norm(ni))
-            nj_norm = float(np.linalg.norm(nj))
+            ni_norm = float(normal_lengths[local_i])
+            nj_norm = float(normal_lengths[local_j])
             if ni_norm > 0.0 and nj_norm > 0.0:
                 alignment = abs(float(np.dot(ni, nj))) / (ni_norm * nj_norm)
                 if alignment < normal_cosine:
@@ -236,26 +239,31 @@ def build_shock_catalog(
             union_find.union(local_i, local_j)
 
     roots = np.array([union_find.find(i) for i in range(shock_rows.size)], dtype=np.int64)
-    unique_roots = np.unique(roots)
-    for group_id, root in enumerate(unique_roots):
-        labels[shock_rows[roots == root]] = group_id
+    unique_roots, inverse = np.unique(roots, return_inverse=True)
+    labels[shock_rows] = inverse
+    # Sort center rows once; never rescan the retained mesh per component.
+    order = np.argsort(inverse, kind="stable")
+    group_positions = np.split(order, np.cumsum(np.bincount(inverse))[:-1])
+    del shock_position, normal_lengths, union_find, roots, inverse
+    # Statistics need only representative centers, not full-mesh float arrays.
+    if dissipation is None:
+        area = _surface_area_centers(result, shock_rows)
+        total = np.zeros(shock_rows.size, dtype=np.float64)
+    else:
+        source_rows = shock_rows if _dissipation_rows is None else np.searchsorted(_dissipation_rows, shock_rows)
+        expected = n if _dissipation_rows is None else len(_dissipation_rows)
+        if dissipation.area.shape != (expected,) or dissipation.total.shape != (expected,):
+            raise ValueError("dissipation arrays must align with the supplied cell rows")
+        area = np.asarray(dissipation.area[source_rows], dtype=np.float64)
+        total = np.asarray(dissipation.total[source_rows], dtype=np.float64)
 
-    area = _surface_area(result, shock_rows)
-    total = np.zeros(n, dtype=np.float64)
-    if dissipation is not None:
-        area = np.asarray(dissipation.area, dtype=np.float64)
-        total = np.asarray(dissipation.total, dtype=np.float64)
-        if area.shape != (n,) or total.shape != (n,):
-            raise ValueError("dissipation arrays must have one value per retained cell")
-
-    upstream_temperature, upstream_density = _upstream_fields(cell, result)
-    region_lower = np.min(result.pos - 0.5 * result.dx[:, None], axis=0)
-    region_upper = np.max(result.pos + 0.5 * result.dx[:, None], axis=0)
+    upstream_temperature, upstream_density = _upstream_fields(cell, result, rows=shock_rows)
+    region_lower, region_upper = _region_bounds(result.pos, result.dx)
 
     groups: list[ShockGroup] = []
-    for group_id in range(unique_roots.size):
-        rows = np.nonzero(labels == group_id)[0]
-        weights = area[rows]
+    for group_id, local_rows in enumerate(group_positions):
+        rows = shock_rows[local_rows]
+        weights = area[local_rows]
         if not np.any(weights > 0.0):
             weights = np.ones(rows.size, dtype=np.float64)
         weight_sum = float(np.sum(weights))
@@ -267,22 +275,22 @@ def build_shock_catalog(
         half_width = 0.5 * result.dx[rows, None]
         lower = np.min(result.pos[rows] - half_width, axis=0)
         upper = np.max(result.pos[rows] + half_width, axis=0)
-        valid_upstream = np.isfinite(upstream_temperature[rows])
+        valid_upstream = np.isfinite(upstream_temperature[local_rows])
         if np.any(valid_upstream):
             upstream_weights = weights[valid_upstream]
             upstream_weight_sum = float(np.sum(upstream_weights))
             group_temperature = float(
-                np.sum(upstream_temperature[rows][valid_upstream] * upstream_weights)
+                np.sum(upstream_temperature[local_rows][valid_upstream] * upstream_weights)
                 / upstream_weight_sum
             )
             group_density = float(
-                np.sum(upstream_density[rows][valid_upstream] * upstream_weights)
+                np.sum(upstream_density[local_rows][valid_upstream] * upstream_weights)
                 / upstream_weight_sum
             )
             external_fraction = float(
                 np.sum(
                     upstream_weights[
-                        upstream_temperature[rows][valid_upstream]
+                        upstream_temperature[local_rows][valid_upstream]
                         <= external_temperature
                     ]
                 )
@@ -369,7 +377,7 @@ def build_shock_catalog(
                 mach_mean=mach_mean,
                 area=weight_sum,
                 area_unit="kpc2" if dissipation is not None else "position_unit2",
-                dissipation_total=float(np.sum(total[rows])),
+                dissipation_total=float(np.sum(total[local_rows])),
                 centroid=np.asarray(centroid),
                 mean_normal=np.asarray(mean_normal),
                 bounds=np.stack((lower, upper)),
@@ -405,8 +413,7 @@ def build_shock_catalog(
     for new_id, group in enumerate(groups):
         old_to_new[group.group_id] = new_id
         group.group_id = new_id
-    grouped = labels >= 0
-    labels[grouped] = old_to_new[labels[grouped]]
+    labels[shock_rows] = old_to_new[labels[shock_rows]]
     return ShockCatalog(
         group_id=labels,
         center_representative=representatives,
@@ -447,6 +454,11 @@ def _catalog_metadata(
         "external_temperature": float(external_temperature),
         "classification_fraction": float(classification_fraction),
         "boundary": "open",
+        "gamma": float(result.gamma),
+        "temperature_floor": float(result.temperature_floor),
+        "position_unit": result.position_unit,
+        "normal_method": "temperature_gradient",
+        "zone_width_method": "endpoint_separation_projected_on_normal",
     }
     if result.level is not None and result.level.size:
         metadata["level_min"] = int(np.min(result.level))
@@ -456,10 +468,11 @@ def _catalog_metadata(
     return metadata
 
 
-def _upstream_fields(cell, result: ShockResult) -> tuple[np.ndarray, np.ndarray]:
+def _upstream_fields(cell, result: ShockResult, *, rows=None) -> tuple[np.ndarray, np.ndarray]:
     n = result.mach.size
-    temperature = np.full(n, np.nan, dtype=np.float64)
-    density = np.full(n, np.nan, dtype=np.float64)
+    size = n if rows is None else len(rows)
+    temperature = np.full(size, np.nan, dtype=np.float64)
+    density = np.full(size, np.nan, dtype=np.float64)
     if cell is None:
         return temperature, density
 
@@ -471,13 +484,14 @@ def _upstream_fields(cell, result: ShockResult) -> tuple[np.ndarray, np.ndarray]
         cell,
         (("rho", "Msol/kpc3"), "rho", "density"),
     )
-    valid = (result.upstream_index >= 0) & (result.upstream_index < n)
+    upstream = result.upstream_index if rows is None else result.upstream_index[rows]
+    valid = (upstream >= 0) & (upstream < n)
     if not np.any(valid):
         return temperature, density
-    upstream_retained = result.upstream_index[valid]
+    upstream_retained = upstream[valid]
     upstream_original = result.selected_indices[upstream_retained]
-    temperature[valid] = np.asarray(temp_all, dtype=np.float64)[upstream_original]
-    density[valid] = np.asarray(rho_all, dtype=np.float64)[upstream_original]
+    temperature[valid] = np.asarray(temp_all[upstream_original], dtype=np.float64)
+    density[valid] = np.asarray(rho_all[upstream_original], dtype=np.float64)
     return temperature, density
 
 
@@ -574,7 +588,8 @@ def _center_representatives(
     n = result.mach.size
     representatives = np.full(n, -1, dtype=np.int64)
     representatives[shock_rows] = shock_rows
-    shock_position = np.full(n, -1, dtype=np.int64)
+    local_dtype = np.int32 if shock_rows.size <= np.iinfo(np.int32).max else np.int64
+    shock_position = np.full(n, -1, dtype=local_dtype)
     shock_position[shock_rows] = np.arange(shock_rows.size)
     union_find = _UnionFind(shock_rows.size)
 
@@ -634,3 +649,24 @@ def _surface_area(result: ShockResult, rows: np.ndarray) -> np.ndarray:
     corrected[valid] /= np.clip(dominant[valid], 1.0 / np.sqrt(3.0), 1.0)
     area[rows] = corrected
     return area
+
+
+def _surface_area_centers(result, rows):
+    area = result.dx[rows]**2
+    if result.normal is not None:
+        dominant = np.max(np.abs(result.normal[rows]), axis=1)
+        valid = dominant > 0
+        area[valid] /= np.clip(dominant[valid], 1.0 / np.sqrt(3.0), 1.0)
+    return area
+
+
+def _region_bounds(pos, dx, chunk_size=262144):
+    lower = np.full(3, np.inf)
+    upper = np.full(3, -np.inf)
+    for start in range(0, len(dx), chunk_size):
+        stop = min(start + chunk_size, len(dx))
+        half = .5 * dx[start:stop]
+        for axis in range(3):
+            lower[axis] = np.minimum(lower[axis], np.min(pos[start:stop, axis] - half))
+            upper[axis] = np.maximum(upper[axis], np.max(pos[start:stop, axis] + half))
+    return lower, upper

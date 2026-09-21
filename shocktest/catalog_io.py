@@ -41,6 +41,11 @@ def load_shock_catalog(path) -> ShockCatalog:
         if missing:
             raise ValueError(f"catalog archive is missing fields: {', '.join(missing)}")
         arrays = {name: np.asarray(archive[name]).copy() for name in required}
+    return _catalog_from_arrays(arrays, version)
+
+
+def _catalog_from_arrays(arrays, version):
+    """Shared validated decoder for standalone and compact catalog archives."""
     if version == 1:
         arrays = _upgrade_v1(arrays)
 

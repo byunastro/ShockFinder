@@ -18,6 +18,7 @@ import numpy as np
 
 import shocktest
 from shocktest import pyShockFinder
+from shocktest.spatial import nearest_points, connected_components, nearest_segment_shock
 
 
 KPC_IN_KM = 3.0856775814913673e16
@@ -47,13 +48,19 @@ def shock_front_catalog(result, dissipation, *, min_mach=1.5, min_flux=0.0):
     shock_dx = result.dx[shock_rows]
     shock_mach = result.mach[shock_rows]
     shock_flux = dissipation.flux[shock_rows]
+    shock_zone_width = (
+        np.asarray(result.zone_width, dtype=np.float64)[shock_rows]
+        if getattr(result, "zone_width", None) is not None
+        else np.zeros(shock_rows.size, dtype=np.float64)
+    )
 
     upstream = result.upstream_index[shock_rows]
     downstream = result.downstream_index[shock_rows]
     valid = (upstream >= 0) & (downstream >= 0)
 
     normal = np.zeros_like(shock_pos)
-    normal[valid] = result.pos[downstream[valid]] - result.pos[upstream[valid]]
+    normal[valid] = (result.normal[shock_rows[valid]] if result.normal is not None
+                     else result.pos[downstream[valid]] - result.pos[upstream[valid]])
     norm = np.linalg.norm(normal, axis=1)
     valid &= norm > 0.0
     normal[valid] /= norm[valid, None]
@@ -64,6 +71,7 @@ def shock_front_catalog(result, dissipation, *, min_mach=1.5, min_flux=0.0):
         "dx": shock_dx,
         "mach": shock_mach,
         "flux": shock_flux,
+        "zone_width": shock_zone_width,
         "normal": normal,
         "valid_normal": valid,
     }
@@ -132,8 +140,10 @@ def classify_galaxy_shock_crossing(
     *,
     search_radius_km=100.0 * KPC_IN_KM,
     width_factor=2.0,
+    zone_width_factor=0.5,
+    memory_budget_bytes=32 * 1024**2,
 ):
-    """Classify whether each galaxy crossed a nearby shock plane.
+    """Classify whether each galaxy crossed or entered a nearby shock zone.
 
     Parameters
     ----------
@@ -142,14 +152,18 @@ def classify_galaxy_shock_crossing(
     shock_catalog:
         Output from ``shock_front_catalog``.
     search_radius_km:
-        Maximum distance from the current galaxy position to a shock cell.
+        Maximum distance from the galaxy trajectory samples to a shock cell.
     width_factor:
-        Allowed transverse distance in units of the local shock-cell ``dx``.
+        Geometric tolerance in units of the local shock-cell ``dx``.
+    zone_width_factor:
+        Multiplier applied to ``shock_catalog["zone_width"]`` when building the
+        finite shock-zone half-width. The default 0.5 treats ``zone_width`` as
+        the upstream-to-downstream full span around the shock center.
     """
 
     galaxy_pos_prev = np.asarray(galaxy_pos_prev, dtype=np.float64)
     galaxy_pos_now = np.asarray(galaxy_pos_now, dtype=np.float64)
-    if galaxy_pos_prev.shape != galaxy_pos_now.shape or galaxy_pos_now.shape[1] != 3:
+    if galaxy_pos_now.ndim != 2 or galaxy_pos_prev.shape != galaxy_pos_now.shape or galaxy_pos_now.shape[1] != 3:
         raise ValueError("galaxy positions must both have shape (ngal, 3)")
 
     shock_pos = shock_catalog["pos"]
@@ -158,12 +172,24 @@ def classify_galaxy_shock_crossing(
     if shock_pos.size == 0:
         return _empty_classification(galaxy_pos_now.shape[0])
 
-    nearest, distance = _nearest_shock(galaxy_pos_now, shock_pos)
-    near = (distance <= search_radius_km) & valid_normal[nearest]
+    nearest, distance = nearest_segment_shock(
+        galaxy_pos_prev, galaxy_pos_now, shock_catalog,
+        search_radius=search_radius_km, width_factor=width_factor,
+        zone_width_factor=zone_width_factor, memory_budget_bytes=memory_budget_bytes,
+    )
+    catalog_zone_width = np.asarray(shock_catalog.get("zone_width", np.zeros(shock_pos.shape[0])), dtype=np.float64)
+    search_zone_half_width = (
+        zone_width_factor * catalog_zone_width[nearest]
+        + width_factor * shock_catalog["dx"][nearest]
+    )
+    near = ((distance <= search_radius_km) | (distance <= search_zone_half_width)) & valid_normal[nearest]
 
     crossed = np.zeros(galaxy_pos_now.shape[0], dtype=bool)
+    affected_zone = np.zeros(galaxy_pos_now.shape[0], dtype=bool)
     signed_prev = np.full(galaxy_pos_now.shape[0], np.nan, dtype=np.float64)
     signed_now = np.full(galaxy_pos_now.shape[0], np.nan, dtype=np.float64)
+    zone_distance = np.full(galaxy_pos_now.shape[0], np.nan, dtype=np.float64)
+    zone_half_width = np.full(galaxy_pos_now.shape[0], np.nan, dtype=np.float64)
     transverse = np.full(galaxy_pos_now.shape[0], np.nan, dtype=np.float64)
 
     if np.any(near):
@@ -176,16 +202,30 @@ def classify_galaxy_shock_crossing(
         signed_prev[near] = np.sum((p0 - xs) * ns, axis=1)
         signed_now[near] = np.sum((p1 - xs) * ns, axis=1)
 
-        segment_mid = 0.5 * (p0 + p1)
-        offset = segment_mid - xs
+        delta_signed = signed_now[near] - signed_prev[near]
+        step = p1 - p0
+        length2 = np.sum(step * step, axis=1)
+        fraction = np.divide(np.sum((xs - p0) * step, axis=1), length2,
+                             out=np.zeros(len(p0)), where=length2 > 0)
+        fraction = np.divide(-signed_prev[near], delta_signed,
+                             out=fraction, where=delta_signed != 0)
+        intersection = p0 + np.clip(fraction, 0, 1)[:, None] * step
+        offset = intersection - xs
         normal_offset = np.sum(offset * ns, axis=1)[:, None] * ns
         transverse[near] = np.linalg.norm(offset - normal_offset, axis=1)
 
-        local_width = width_factor * shock_catalog["dx"][shock_idx]
-        crossed[near] = (signed_prev[near] * signed_now[near] <= 0.0) & (transverse[near] <= local_width)
+        transverse_width = width_factor * shock_catalog["dx"][shock_idx]
+        zone_half_width[near] = zone_width_factor * catalog_zone_width[shock_idx] + transverse_width
+        zone_distance[near] = _minimum_segment_plane_distance(
+            signed_prev[near],
+            signed_now[near],
+        )
+        crossed[near] = (signed_prev[near] * signed_now[near] <= 0.0) & (transverse[near] <= transverse_width)
+        affected_zone[near] = (zone_distance[near] <= zone_half_width[near]) & (transverse[near] <= transverse_width)
 
     return {
         "crossed": crossed,
+        "affected_zone": affected_zone,
         "near_shock": near,
         "nearest_shock_row": np.where(near, shock_catalog["rows"][nearest], -1),
         "nearest_component_id": _catalog_lookup(shock_catalog, "component_id", nearest, near, -1),
@@ -193,9 +233,12 @@ def classify_galaxy_shock_crossing(
         "nearest_component_extent": _catalog_lookup(shock_catalog, "component_extent", nearest, near, np.nan),
         "nearest_mach": np.where(near, shock_catalog["mach"][nearest], np.nan),
         "nearest_flux": np.where(near, shock_catalog["flux"][nearest], np.nan),
+        "nearest_zone_width": np.where(near, catalog_zone_width[nearest], np.nan),
         "distance_to_shock": np.where(near, distance, np.nan),
         "signed_distance_prev": signed_prev,
         "signed_distance_now": signed_now,
+        "zone_distance": zone_distance,
+        "zone_half_width": zone_half_width,
         "transverse_distance": transverse,
     }
 
@@ -203,8 +246,9 @@ def classify_galaxy_shock_crossing(
 def compact_classification_results(classification, *, keep="near_or_crossed", keep_keys=None):
     """Copy only useful galaxy-classification rows into a compact result dict.
 
-    ``keep="near_or_crossed"`` keeps galaxies flagged by either ``near_shock``
-    or ``crossed`` and records their original row numbers as ``galaxy_index``.
+    ``keep="near_or_crossed"`` keeps galaxies flagged by ``near_shock``,
+    ``crossed``, or ``affected_zone`` and records their original row numbers as
+    ``galaxy_index``.
     Use ``keep="crossed"`` for the smallest post-analysis table.
     """
 
@@ -259,29 +303,11 @@ def release_shock_work_arrays(*objects):
 
 
 def _connected_components(points, link_length):
-    """Return component labels for points connected within ``link_length``."""
-
-    try:
-        from scipy.spatial import cKDTree
-    except ImportError:
-        return _connected_components_numpy(points, link_length)
-
-    tree = cKDTree(points)
-    neighbors = tree.query_ball_tree(tree, link_length)
-    return _label_neighbors(neighbors)
+    return connected_components(points, link_length)
 
 
 def _connected_components_numpy(points, link_length, chunk_size=2048):
-    neighbors = [[] for _ in range(points.shape[0])]
-    link2 = link_length * link_length
-    for start in range(0, points.shape[0], chunk_size):
-        stop = min(start + chunk_size, points.shape[0])
-        delta = points[start:stop, None, :] - points[None, :, :]
-        dist2 = np.einsum("ijk,ijk->ij", delta, delta)
-        rows, cols = np.nonzero(dist2 <= link2)
-        for row, col in zip(rows, cols):
-            neighbors[start + row].append(int(col))
-    return _label_neighbors(neighbors)
+    return connected_components(points, link_length, use_scipy=False)
 
 
 def _label_neighbors(neighbors):
@@ -337,7 +363,10 @@ def _classification_keep_mask(classification, keep, n_galaxies):
     if keep == "near_or_crossed":
         near = np.asarray(classification.get("near_shock", False), dtype=bool)
         crossed = np.asarray(classification.get("crossed", False), dtype=bool)
-        return near | crossed
+        affected = np.asarray(classification.get("affected_zone", False), dtype=bool)
+        return near | crossed | affected
+    if keep == "affected_zone":
+        return np.asarray(classification["affected_zone"], dtype=bool)
     if keep == "near_shock":
         return np.asarray(classification["near_shock"], dtype=bool)
     if keep == "crossed":
@@ -361,23 +390,42 @@ def _nearest_shock(points, shock_pos):
     return nearest.astype(np.int64), distance
 
 
-def _nearest_shock_numpy(points, shock_pos, chunk_size=4096):
-    """Numpy fallback for systems without SciPy."""
+def _nearest_shock_trajectory(points_prev, points_now, shock_pos):
+    """Return nearest shock to the previous, current, or midpoint position."""
 
-    nearest = np.empty(points.shape[0], dtype=np.int64)
-    distance = np.empty(points.shape[0], dtype=np.float64)
-    for start in range(0, points.shape[0], chunk_size):
-        stop = min(start + chunk_size, points.shape[0])
-        delta = points[start:stop, None, :] - shock_pos[None, :, :]
-        dist2 = np.einsum("ijk,ijk->ij", delta, delta)
-        nearest[start:stop] = np.argmin(dist2, axis=1)
-        distance[start:stop] = np.sqrt(dist2[np.arange(stop - start), nearest[start:stop]])
+    points_mid = 0.5 * (points_prev + points_now)
+    nearest_prev, distance_prev = _nearest_shock(points_prev, shock_pos)
+    nearest_now, distance_now = _nearest_shock(points_now, shock_pos)
+    nearest_mid, distance_mid = _nearest_shock(points_mid, shock_pos)
+
+    nearest = nearest_now.copy()
+    distance = distance_now.copy()
+
+    use_prev = distance_prev < distance
+    nearest[use_prev] = nearest_prev[use_prev]
+    distance[use_prev] = distance_prev[use_prev]
+
+    use_mid = distance_mid < distance
+    nearest[use_mid] = nearest_mid[use_mid]
+    distance[use_mid] = distance_mid[use_mid]
     return nearest, distance
+
+
+def _minimum_segment_plane_distance(signed_prev, signed_now):
+    crosses_plane = signed_prev * signed_now <= 0.0
+    distance = np.minimum(np.abs(signed_prev), np.abs(signed_now))
+    distance[crosses_plane] = 0.0
+    return distance
+
+
+def _nearest_shock_numpy(points, shock_pos, chunk_size=4096):
+    return nearest_points(points, shock_pos)
 
 
 def _empty_classification(n_galaxies):
     return {
         "crossed": np.zeros(n_galaxies, dtype=bool),
+        "affected_zone": np.zeros(n_galaxies, dtype=bool),
         "near_shock": np.zeros(n_galaxies, dtype=bool),
         "nearest_shock_row": np.full(n_galaxies, -1, dtype=np.int64),
         "nearest_component_id": np.full(n_galaxies, -1, dtype=np.int64),
@@ -385,9 +433,12 @@ def _empty_classification(n_galaxies):
         "nearest_component_extent": np.full(n_galaxies, np.nan, dtype=np.float64),
         "nearest_mach": np.full(n_galaxies, np.nan, dtype=np.float64),
         "nearest_flux": np.full(n_galaxies, np.nan, dtype=np.float64),
+        "nearest_zone_width": np.full(n_galaxies, np.nan, dtype=np.float64),
         "distance_to_shock": np.full(n_galaxies, np.nan, dtype=np.float64),
         "signed_distance_prev": np.full(n_galaxies, np.nan, dtype=np.float64),
         "signed_distance_now": np.full(n_galaxies, np.nan, dtype=np.float64),
+        "zone_distance": np.full(n_galaxies, np.nan, dtype=np.float64),
+        "zone_half_width": np.full(n_galaxies, np.nan, dtype=np.float64),
         "transverse_distance": np.full(n_galaxies, np.nan, dtype=np.float64),
     }
 
@@ -415,6 +466,7 @@ if __name__ == "__main__":
 
     print("N galaxies near shocks:", np.count_nonzero(classification["near_shock"]))
     print("N galaxies crossed shocks:", np.count_nonzero(classification["crossed"]))
+    print("N galaxies affected by shock zones:", np.count_nonzero(classification["affected_zone"]))
 
     classification = finalize_shock_classification(
         classification,

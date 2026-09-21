@@ -100,10 +100,11 @@ def compute_dissipation(
     cell,
     result,
     *,
-    gamma: float = 5.0 / 3.0,
+    gamma: float | None = None,
     mu: float = 0.59,
-    temperature_floor: float = 1.0e4,
+    temperature_floor: float | None = None,
     area_mode: str = "normal",
+    _compact: bool = False,
 ):
     """Compute E_diss/A in erg s^-1 kpc^-2 and cell total in erg s^-1.
 
@@ -112,7 +113,14 @@ def compute_dissipation(
     area approximation.
     """
 
-    n = result.mach.size
+    gamma = result.gamma if gamma is None else float(gamma)
+    temperature_floor = result.temperature_floor if temperature_floor is None else float(temperature_floor)
+    if not np.isclose(gamma, result.gamma) or not np.isclose(temperature_floor, result.temperature_floor):
+        raise ValueError("dissipation gamma and temperature_floor must match detection settings")
+    if not np.isfinite(mu) or mu <= 0:
+        raise ValueError("mu must be finite and positive")
+    center_selection = np.flatnonzero(result.shock) if _compact else None
+    n = center_selection.size if _compact else result.mach.size
     flux = np.zeros(n, dtype=np.float64)
     total = np.zeros(n, dtype=np.float64)
     area = np.zeros(n, dtype=np.float64)
@@ -127,10 +135,10 @@ def compute_dissipation(
     upstream_rows = retained_rows[result.upstream_index[valid]]
     center_rows = retained_rows[np.nonzero(valid)[0]]
 
-    temp1 = np.asarray(cell["T", "K"], dtype=np.float64)[upstream_rows]
+    temp1 = np.asarray(np.asarray(cell["T", "K"])[upstream_rows], dtype=np.float64)
     temp1 = np.maximum(temp1, float(temperature_floor))
-    rho1 = np.asarray(cell["rho", "Msol/kpc3"], dtype=np.float64)[upstream_rows]
-    dx = np.asarray(cell["dx", "km"], dtype=np.float64)[center_rows]
+    rho1 = np.asarray(np.asarray(cell["rho", "Msol/kpc3"])[upstream_rows], dtype=np.float64)
+    dx = np.asarray(np.asarray(cell["dx", "km"])[center_rows], dtype=np.float64)
     mach = result.mach[valid]
 
     rho_cgs = rho1 * MSUN / KPC**3
@@ -141,13 +149,14 @@ def compute_dissipation(
     # the plotting unit used in many shock papers: erg s^-1 kpc^-2.
     flux_valid = 0.5 * rho_cgs * (mach * cs_cgs) ** 3 * delta * KPC**2
 
-    flux[valid] = flux_valid
+    target = valid[center_selection] if _compact else valid
+    flux[target] = flux_valid
     dx_kpc = dx / (KPC / 1.0e5)
     area_valid = shock_surface_area(result, valid, dx_kpc, mode=area_mode)
-    area[valid] = area_valid
-    total[valid] = flux_valid * area_valid
-    efficiency[valid] = delta
-    sound_speed[valid] = cs_cgs / 1.0e5
+    area[target] = area_valid
+    total[target] = flux_valid * area_valid
+    efficiency[target] = delta
+    sound_speed[target] = cs_cgs / 1.0e5
     return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency, sound_speed=sound_speed)
 
 
@@ -169,7 +178,8 @@ def shock_surface_area(result, valid, dx_kpc, *, mode: str = "normal"):
     if result.pos is None or not np.any(ok):
         return area
 
-    normal = result.pos[downstream[ok]] - result.pos[upstream[ok]]
+    normal = (result.normal[rows[ok]] if result.normal is not None
+              else result.pos[downstream[ok]] - result.pos[upstream[ok]])
     norm = np.linalg.norm(normal, axis=1)
     ok_norm = norm > 0.0
     if not np.any(ok_norm):

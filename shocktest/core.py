@@ -54,6 +54,14 @@ class ShockResult:
     mach_consistent: np.ndarray | None = None
     mach_validation_status: np.ndarray | None = None
 
+    gamma: float = 5.0 / 3.0
+    temperature_floor: float = 1.0e4
+    position_unit: str = "km"
+
+    def to_compact(self, **options):
+        from .compact import compact_shocks
+        return compact_shocks(self, **options)
+
     def clear(self) -> None:
         """Release arrays held by this result object."""
 
@@ -122,6 +130,8 @@ class ShockFinder:
         # the arithmetic used to derive them. The adopted temperature Mach in
         # result.mach remains the float64 Fortran-kernel result.
         self.mach_validation_dtype = np.float64
+        # Exact integer narrowing is opt-in; floating-point physics is unchanged.
+        self.index_dtype = "int64"
         # Set this to the exact mapping key (including a unit tuple, if used)
         # for a directly stored *thermal* pressure.  Automatic discovery is
         # deliberately limited to names that explicitly say "thermal" so that
@@ -153,6 +163,8 @@ class ShockFinder:
         maximum_normal_dispersion: float = 0.3,
         provenance: dict[str, object] | None = None,
         dissipation_options: dict[str, Any] | None = None,
+        compact: bool = False,
+        compact_options: dict[str, Any] | None = None,
     ):
         """Run shock detection and optional post-processing in one pass.
 
@@ -166,7 +178,13 @@ class ShockFinder:
         from .pyShockFinder import compute_dissipation as make_dissipation
 
         analysis_start = time.perf_counter()
-        result, neighbor_tables, timings = self._find_internal(cell)
+        if compact_options is not None and not compact:
+            raise ValueError("compact_options requires compact=True")
+        validation_sink = {} if compact else None
+        result, neighbor_tables, timings = self._find_internal(cell, validation_sink=validation_sink)
+        # Neighbor arrays are only needed by the optional catalog after detection.
+        if not build_catalog:
+            neighbor_tables = None
         dissipation = None
         catalog = None
         if compute_dissipation:
@@ -177,9 +195,14 @@ class ShockFinder:
                     "dissipation gamma must match finder.gamma for a physically "
                     "consistent single-pass analysis"
                 )
+            if "temperature_floor" in options and not np.isclose(
+                float(options["temperature_floor"]), float(self.temperature_floor)
+            ):
+                raise ValueError("dissipation temperature_floor must match finder.temperature_floor")
             options["gamma"] = float(self.gamma)
+            options["temperature_floor"] = float(self.temperature_floor)
             dissipation = make_dissipation(
-                cell, result, **options
+                cell, result, _compact=compact, **options
             )
             timings["dissipation"] = time.perf_counter() - stage_start
         if build_catalog:
@@ -201,15 +224,29 @@ class ShockFinder:
                 maximum_normal_dispersion=maximum_normal_dispersion,
                 provenance=provenance,
                 _neighbor_tables=neighbor_tables,
+                _dissipation_rows=np.flatnonzero(result.shock) if compact and dissipation is not None else None,
             )
             timings["catalog"] = time.perf_counter() - stage_start
         timings["total"] = time.perf_counter() - analysis_start
-        return ShockAnalysis(
+        analysis = ShockAnalysis(
             result=result,
             dissipation=dissipation,
             catalog=catalog,
             timings=timings,
         )
+        if compact:
+            compact_start = time.perf_counter()
+            from .compact import compact_shocks
+            samples = compact_shocks(
+                result, dissipation, catalog, timings=timings,
+                _validation=validation_sink.get("result"),
+                _compact_dissipation=True, **(compact_options or {}),
+            )
+            analysis.clear()
+            samples.timings["compact"] = time.perf_counter() - compact_start
+            samples.timings["total"] = time.perf_counter() - analysis_start
+            return samples
+        return analysis
 
     def clear(self) -> None:
         """Compatibility cleanup hook.
@@ -221,11 +258,16 @@ class ShockFinder:
 
         gc.collect()
 
-    def find(self, cell: Any) -> ShockResult:
+    def find(self, cell: Any, *, compact: bool = False, compact_options=None):
+        if compact:
+            return self.analyze(cell, compute_dissipation=False, build_catalog=False,
+                                compact=True, compact_options=compact_options)
+        if compact_options is not None:
+            raise ValueError("compact_options requires compact=True")
         result, _, _ = self._find_internal(cell)
         return result
 
-    def _find_internal(self, cell: Any):
+    def _find_internal(self, cell: Any, *, validation_sink=None):
         total_start = time.perf_counter()
         timings: dict[str, float] = {}
         self._validate_settings()
@@ -240,6 +282,9 @@ class ShockFinder:
                 "`cd shocktest && python3 -m numpy.f2py -c fortran/shockfinder.f90 "
                 "-m _shockfinder` from the project root."
             ) from _IMPORT_ERROR
+
+        if not hasattr(_shockfinder.shockfinder_kernel, "shock_normals"):
+            raise ImportError("The compiled ShockFinder extension is outdated; rebuild for this Python interpreter (see README Build).")
 
         self._progress("ShockFinder: reading AMR cell fields")
         stage_start = time.perf_counter()
@@ -279,8 +324,11 @@ class ShockFinder:
                 zone_width=empty_float.copy(),
                 diagnostics={},
             )
+            result.gamma = float(self.gamma)
+            result.temperature_floor = float(self.temperature_floor)
+            result.position_unit = self.position_unit
             if self.validate_mach:
-                self._populate_mach_validation(cell, arrays, result)
+                self._validate_result(cell, arrays, result, validation_sink)
             timings["scan"] = 0.0
             timings["detection_total"] = time.perf_counter() - total_start
             return result, (neighbors, fine_face_index, fine_neighbors), timings
@@ -325,17 +373,20 @@ class ShockFinder:
             upstream_rows = np.asarray(upstream[valid_normal], dtype=np.int64) - 1
             downstream_rows = np.asarray(downstream[valid_normal], dtype=np.int64) - 1
             vectors = result_pos[downstream_rows] - result_pos[upstream_rows]
-            lengths = np.linalg.norm(vectors, axis=1)
-            zone_width[np.nonzero(valid_normal)[0]] = lengths
-            nonzero = lengths > 0.0
             valid_rows = np.nonzero(valid_normal)[0]
-            normal[valid_rows[nonzero]] = vectors[nonzero] / lengths[nonzero, None]
+            normal[valid_rows] = _shockfinder.shockfinder_kernel.shock_normals(
+                arrays["pos"], arrays["vel"], arrays["dx"], arrays["temp"], arrays["rho"],
+                neighbors, fine_face_index, fine_neighbors,
+                np.asarray(valid_rows + 1, dtype=np.int32), float(self.gamma),
+                n, fine_neighbors.shape[0], valid_rows.size,
+            )
+            zone_width[valid_rows] = np.abs(np.sum(vectors * normal[valid_rows], axis=1))
         result = ShockResult(
             mach=np.asarray(mach, dtype=np.float64),
             shock=np.asarray(shock, dtype=np.int32).astype(bool),
-            center_index=self._to_python_indices(center),
-            upstream_index=self._to_python_indices(upstream),
-            downstream_index=self._to_python_indices(downstream),
+            center_index=self._to_python_indices(center, mode=self.index_dtype),
+            upstream_index=self._to_python_indices(upstream, mode=self.index_dtype),
+            downstream_index=self._to_python_indices(downstream, mode=self.index_dtype),
             selected_indices=selected_indices,
             pos=result_pos,
             dx=result_dx,
@@ -360,11 +411,38 @@ class ShockFinder:
                 )
             ),
         )
+        result.gamma = float(self.gamma)
+        result.temperature_floor = float(self.temperature_floor)
+        result.position_unit = self.position_unit
+        # Release f2py integer outputs and velocity storage before validation.
+        del shock, center, upstream, downstream
+        arrays.pop("vel", None)
+        arrays.pop("detection_mask", None)
         if self.validate_mach:
-            self._populate_mach_validation(cell, arrays, result)
+            self._validate_result(cell, arrays, result, validation_sink)
         del arrays
         timings["detection_total"] = time.perf_counter() - total_start
         return result, (neighbors, fine_face_index, fine_neighbors), timings
+
+    def _validate_result(self, cell, arrays, result, validation_sink):
+        if validation_sink is None:
+            self._populate_mach_validation(cell, arrays, result)
+            return
+        # Internal validation has one row per detected center while endpoint
+        # indices still address the retained input mesh. Never expose this view
+        # as a dense ShockResult; compact_shocks consumes its diagnostic columns.
+        rows = np.flatnonzero(result.shock)
+        validation = ShockResult(
+            mach=result.mach[rows], shock=np.ones(rows.size, dtype=bool),
+            center_index=result.center_index[rows],
+            upstream_index=result.upstream_index[rows],
+            downstream_index=result.downstream_index[rows],
+            selected_indices=result.selected_indices,
+        )
+        self._populate_mach_validation(cell, arrays, validation)
+        if self.filter_inconsistent:
+            result.shock[rows] = validation.shock
+        validation_sink["result"] = validation
 
     def _populate_mach_validation(
         self,
@@ -409,9 +487,9 @@ class ShockFinder:
             downstream = result.downstream_index[rows]
             endpoints_ok = (
                 (upstream >= 0)
-                & (upstream < n)
+                & (upstream < arrays["temp"].size)
                 & (downstream >= 0)
-                & (downstream < n)
+                & (downstream < arrays["temp"].size)
             )
             bad_rows = rows[~endpoints_ok]
             status[bad_rows] |= np.uint16(MachValidationFlag.ENDPOINT_INVALID)
@@ -437,6 +515,7 @@ class ShockFinder:
                     result.selected_indices,
                     arrays,
                     dtype=validation_dtype,
+                    endpoint_rows=np.concatenate((up, down)),
                 )
                 if pressure is None:
                     pressure_ratio[valid_rows] = jump_ratio(
@@ -446,7 +525,7 @@ class ShockFinder:
                     )
                 else:
                     pressure_ratio[valid_rows] = jump_ratio(
-                        pressure[up], pressure[down], dtype=validation_dtype
+                        pressure[:up.size], pressure[up.size:], dtype=validation_dtype
                     )
 
                 mach_pressure[valid_rows] = mach_from_pressure_ratio(
@@ -567,6 +646,7 @@ class ShockFinder:
         arrays: dict[str, np.ndarray],
         *,
         dtype=np.float64,
+        endpoint_rows=None,
     ) -> tuple[np.ndarray | None, bool]:
         """Return selected thermal pressure, or signal the rho*T fallback."""
 
@@ -601,7 +681,8 @@ class ShockFinder:
             raise ValueError("thermal pressure field is shorter than the cell table")
         if not selected_indices.size:
             return np.empty(0, dtype=np.float64), False
-        return np.asarray(pressure[selected_indices], dtype=dtype), False
+        source_rows = selected_indices if endpoint_rows is None else selected_indices[endpoint_rows]
+        return np.asarray(pressure[source_rows], dtype=dtype), False
 
     def _neighbor_tables_for_arrays(
         self,
@@ -658,6 +739,8 @@ class ShockFinder:
         return digest.hexdigest()
 
     def _validate_settings(self) -> None:
+        if self.index_dtype not in ("int64", "auto"):
+            raise ValueError("index_dtype must be 'int64' or 'auto'")
         if not np.isfinite(self.gamma) or self.gamma <= 1.0:
             raise ValueError("gamma must be finite and greater than 1")
         if not np.isfinite(self.temperature_floor) or self.temperature_floor <= 0.0:
@@ -768,6 +851,8 @@ class ShockFinder:
         # cells remain available as neighbors and walk endpoints.
         mask = (level >= int(self.minlevel)) & (level <= int(self.maxlevel))
         selected_indices = np.nonzero(mask)[0].astype(np.int64, copy=False)
+        if self.index_dtype == "auto" and n <= np.iinfo(np.int32).max:
+            selected_indices = selected_indices.astype(np.int32)
         del mask
 
         selected_temp = temp[selected_indices]
@@ -817,8 +902,12 @@ class ShockFinder:
         }
 
     @staticmethod
-    def _to_python_indices(values: np.ndarray) -> np.ndarray:
-        out = np.asarray(values, dtype=np.int64) - 1
+    def _to_python_indices(values: np.ndarray, *, mode="int64") -> np.ndarray:
+        # f2py emits signed int32 mesh indices. Keep that lossless representation
+        # when requested; do not narrow wider external values without checking.
+        dtype = np.int32 if mode == "auto" and values.dtype == np.int32 else np.int64
+        out = np.array(values, dtype=dtype, copy=True)
+        out -= 1
         out[out < 0] = -1
         return out
 

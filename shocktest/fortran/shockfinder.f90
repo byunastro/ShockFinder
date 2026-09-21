@@ -3,7 +3,7 @@ module shockfinder_kernel
   implicit none
   integer, parameter :: dp = kind(1.0d0)
   private
-  public :: find_shocks, build_neighbor_index, fill_fine_neighbors, paint_cells_to_map
+  public :: find_shocks, build_neighbor_index, fill_fine_neighbors, paint_cells_to_map, shock_normals
 
 contains
 
@@ -126,7 +126,6 @@ contains
     logical, intent(out) :: ok
 
     integer :: nb, k, count, group
-    real(8) :: sign
 
     ok = .false.
     value_pos = 0.0_dp
@@ -152,18 +151,14 @@ contains
       if (nb <= 0) cycle
       if (temp(nb) <= 0.0_dp .or. rho(nb) <= 0.0_dp) cycle
       count = count + 1
+      value_pos = value_pos + pos(nb, axis)
       value_vel = value_vel + vel(nb, axis)
       value_temp = value_temp + temp(nb)
       value_entropy = value_entropy + entropy_value(temp(nb), rho(nb), gamma)
     end do
     if (count <= 0) return
 
-    if (mod(face, 2) == 0) then
-      sign = 1.0_dp
-    else
-      sign = -1.0_dp
-    end if
-    value_pos = pos(i, axis) + sign * 0.5_dp * dx(i)
+    value_pos = value_pos / real(count, 8)
     value_vel = value_vel / real(count, 8)
     value_temp = value_temp / real(count, 8)
     value_entropy = value_entropy / real(count, 8)
@@ -208,6 +203,27 @@ contains
       valid = .true.
     end do
   end subroutine local_quantities
+
+  ! Export the temperature-gradient normals at detected centers. Endpoint
+  ! center displacements are quantized by the mesh and are not shock normals.
+  subroutine shock_normals(pos, vel, dx, temp, rho, neighbors, fine_face_index, &
+       fine_neighbors, centers, gamma, n, nfine, ns, normals)
+    integer, intent(in) :: n, nfine, ns, centers(ns)
+    integer, intent(in) :: neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
+    real(8), intent(out) :: normals(ns, 3)
+    integer :: j, i
+    real(8) :: divv, gt(3), gs(3)
+    logical :: valid, ok
+    normals = 0.0_dp
+    do j = 1, ns
+      i = centers(j)
+      if (i < 1 .or. i > n) cycle
+      call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_face_index, &
+           fine_neighbors, n, nfine, i, gamma, divv, gt, gs, valid)
+      if (valid) call normalize_vector(gt, normals(j, :), ok)
+    end do
+  end subroutine shock_normals
 
   ! Normalize a vector and report whether its magnitude was non-zero.
   pure subroutine normalize_vector(vector, unit_vector, ok)
@@ -266,7 +282,7 @@ contains
     integer, intent(out) :: next_cell
     real(8), intent(out) :: xnew(3)
 
-    integer :: axis, face
+    integer :: axis, face, current, pass, crossed
     real(8) :: t, tbest, half_width, eps
 
     next_cell = 0
@@ -297,7 +313,43 @@ contains
     xnew = xold + direction * (tbest + eps)
     next_cell = choose_face_neighbor(pos, neighbors, fine_face_index, fine_neighbors, &
          n, nfine, i, face, xnew)
+    ! At an edge/corner the ray crosses several faces simultaneously. Follow
+    ! those links until the returned cell actually contains the advanced point.
+    do pass = 1, 3
+      if (next_cell <= 0) return
+      current = next_cell
+      crossed = 0
+      do axis = 1, 3
+        if (xnew(axis) > pos(current, axis) + 0.5_dp * dx(current)) then
+          crossed = plus_face(axis)
+          exit
+        else if (xnew(axis) < pos(current, axis) - 0.5_dp * dx(current)) then
+          crossed = minus_face(axis)
+          exit
+        end if
+      end do
+      if (crossed == 0) return
+      next_cell = choose_face_neighbor(pos, neighbors, fine_face_index, fine_neighbors, &
+           n, nfine, current, crossed, xnew)
+    end do
+    ! An incomplete face topology must not return a cell off the physical ray.
+    next_cell = 0
   end subroutine next_along_gradient
+
+  ! Break convergence plateaus by physical position, independent of input order.
+  pure logical function position_precedes(a, b) result(precedes)
+    real(8), intent(in) :: a(3), b(3)
+    integer :: axis
+    precedes = .false.
+    do axis = 1, 3
+      if (a(axis) < b(axis)) then
+        precedes = .true.
+        return
+      else if (a(axis) > b(axis)) then
+        return
+      end if
+    end do
+  end function position_precedes
 
   ! Resolve every candidate to a deterministic local convergence minimum along
   ! the shock normal. Previously resolved paths are reused (path compression),
@@ -322,7 +374,7 @@ contains
 
     resolved_center = 0
     limit_count = 0_8
-    allocate(path(n))
+    allocate(path(max_center_steps + 1))
 
     do i = 1, n
       if (.not. candidate(i) .or. resolved_center(i) > 0) cycle
@@ -352,16 +404,19 @@ contains
         call next_along_gradient(pos, dx, neighbors, fine_face_index, fine_neighbors, &
              n, nfine, center, xwalk, dirvec, &
              trial, xnext)
-        if (trial > 0 .and. candidate(trial)) then
-          call normalize_vector(grad_t_arr(trial, :), trial_dir, ok_trial_direction)
-          scale = max(1.0_dp, abs(best_divv), abs(divv_arr(trial)))
-          tolerance = plateau_tolerance * scale
-          if (ok_trial_direction .and. abs(dot_product(dirvec, trial_dir)) >= normal_cosine) then
-            if (divv_arr(trial) < best_divv - tolerance .or. &
-                 (abs(divv_arr(trial) - best_divv) <= tolerance .and. trial < next_center)) then
-              next_center = trial
-              best_divv = divv_arr(trial)
-              center_changed = .true.
+        if (trial > 0) then
+          if (candidate(trial)) then
+            call normalize_vector(grad_t_arr(trial, :), trial_dir, ok_trial_direction)
+            scale = max(tiny(1.0_dp), abs(best_divv), abs(divv_arr(trial)))
+            tolerance = plateau_tolerance * scale
+            if (ok_trial_direction .and. abs(dot_product(dirvec, trial_dir)) >= normal_cosine) then
+              if (divv_arr(trial) < best_divv - tolerance .or. &
+                   (abs(divv_arr(trial) - best_divv) <= tolerance .and. &
+                    position_precedes(pos(trial, :), pos(next_center, :)))) then
+                next_center = trial
+                best_divv = divv_arr(trial)
+                center_changed = .true.
+              end if
             end if
           end if
         end if
@@ -369,16 +424,19 @@ contains
         call next_along_gradient(pos, dx, neighbors, fine_face_index, fine_neighbors, &
              n, nfine, center, xwalk, -dirvec, &
              trial, xnext)
-        if (trial > 0 .and. candidate(trial)) then
-          call normalize_vector(grad_t_arr(trial, :), trial_dir, ok_trial_direction)
-          scale = max(1.0_dp, abs(best_divv), abs(divv_arr(trial)))
-          tolerance = plateau_tolerance * scale
-          if (ok_trial_direction .and. abs(dot_product(dirvec, trial_dir)) >= normal_cosine) then
-            if (divv_arr(trial) < best_divv - tolerance .or. &
-                 (abs(divv_arr(trial) - best_divv) <= tolerance .and. trial < next_center)) then
-              next_center = trial
-              best_divv = divv_arr(trial)
-              center_changed = .true.
+        if (trial > 0) then
+          if (candidate(trial)) then
+            call normalize_vector(grad_t_arr(trial, :), trial_dir, ok_trial_direction)
+            scale = max(tiny(1.0_dp), abs(best_divv), abs(divv_arr(trial)))
+            tolerance = plateau_tolerance * scale
+            if (ok_trial_direction .and. abs(dot_product(dirvec, trial_dir)) >= normal_cosine) then
+              if (divv_arr(trial) < best_divv - tolerance .or. &
+                   (abs(divv_arr(trial) - best_divv) <= tolerance .and. &
+                    position_precedes(pos(trial, :), pos(next_center, :)))) then
+                next_center = trial
+                best_divv = divv_arr(trial)
+                center_changed = .true.
+              end if
             end if
           end if
         end if
@@ -519,9 +577,11 @@ contains
           key = packed_cell_key(target(1), target(2), target(3), level(i), &
                spans, spatial_size, level_min)
           found = hash_lookup(key, hash_keys, hash_rows, table_size)
-          if (found > 0 .and. widths(found) == widths(i)) then
-            neighbors(i, face) = found
-            cycle
+          if (found > 0) then
+            if (widths(found) == widths(i)) then
+              neighbors(i, face) = found
+              cycle
+            end if
           end if
 
           cw = 2_8 * widths(i)
@@ -535,9 +595,11 @@ contains
           key = packed_cell_key(coarse_lo(1), coarse_lo(2), coarse_lo(3), level(i) - 1, &
                spans, spatial_size, level_min)
           found = hash_lookup(key, hash_keys, hash_rows, table_size)
-          if (found > 0 .and. widths(found) == cw) then
-            neighbors(i, face) = found
-            cycle
+          if (found > 0) then
+            if (widths(found) == cw) then
+              neighbors(i, face) = found
+              cycle
+            end if
           end if
 
           if (mod(widths(i), 2_8) /= 0_8) cycle
@@ -595,6 +657,8 @@ contains
     integer(8) :: spans(3), spatial_size, target(3), key, fw
     integer :: level_min, table_size, i, axis, face, direction, group, slot, k0, k1
 
+    fine_neighbors = 0
+    if (nfine == 0 .or. n == 0) return
     allocate(lo(n, 3), widths(n))
     call make_integer_geometry(pos, dx, level, n, lo, widths, spans, spatial_size, level_min)
     table_size = 1
@@ -676,7 +740,7 @@ contains
     real(8) :: grad_t(3), grad_s(3), dirvec(3), xwalk(3), xnext(3)
     real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m, elapsed
     real(8), allocatable :: divv_arr(:), grad_t_arr(:, :)
-    logical, allocatable :: candidate(:)
+    logical, allocatable :: candidate(:), eligible_center(:)
     integer, allocatable :: resolved_center(:)
     logical :: valid, ok_direction, endpoint_found
 
@@ -687,7 +751,7 @@ contains
     downstream_index = 0
     diagnostics = 0_8
 
-    allocate(divv_arr(n), grad_t_arr(n, 3), candidate(n), resolved_center(n))
+    allocate(divv_arr(n), grad_t_arr(n, 3), candidate(n), resolved_center(n), eligible_center(n))
 
     ! Precompute all local shock diagnostics once. This loop is independent for
     ! each AMR cell and is therefore a good OpenMP target.
@@ -701,14 +765,14 @@ contains
       call local_quantities(pos, vel, dx, temp, rho, neighbors, fine_face_index, &
            fine_neighbors, n, nfine, i, &
            gamma, divv_arr(i), grad_t_arr(i, :), grad_s, valid)
-      candidate(i) = detection_mask(i) /= 0 .and. valid .and. divv_arr(i) < 0.0_dp .and. &
+      candidate(i) = valid .and. divv_arr(i) < 0.0_dp .and. &
            dot_product(grad_t_arr(i, :), grad_s) > 0.0_dp
       if (show_progress /= 0 .and. progress_interval > 0) then
         !$omp atomic capture
         progress_count = progress_count + 1
         done = progress_count
         !$omp end atomic
-        if (done >= next_progress) then
+        if (mod(done, progress_interval) == 0) then
           !$omp critical(progress_write)
           if (done >= next_progress) then
             call system_clock(clock_now)
@@ -726,7 +790,7 @@ contains
       end if
     end do
     !$omp end parallel do
-    if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, progress_interval) /= 0)) then
+    if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, max(1, progress_interval)) /= 0)) then
       call system_clock(clock_now)
       elapsed = real(clock_now - pre_start, 8) / real(max(clock_rate, 1), 8)
       write(output_unit, '(A,I0,A,I0,A,F10.1,A)') "ShockFinder Fortran precompute: ", &
@@ -739,8 +803,15 @@ contains
          grad_t_arr, max_center_steps, center_normal_cosine, center_plateau_tolerance, &
          resolved_center, diagnostics(1))
 
-    ! Candidate paths are independent after center resolution. Several paths
-    ! can share a center, so the small critical section protects that write.
+    ! Selection controls seeds, never the physical shock-zone endpoints.
+    eligible_center = .false.
+    do i = 1, n
+      if (detection_mask(i) == 0) cycle
+      center = resolved_center(i)
+      if (center > 0) eligible_center(center) = .true.
+    end do
+
+    ! Each resolved center is processed exactly once.
     progress_count = 0
     next_progress = progress_interval
     call system_clock(scan_start)
@@ -755,7 +826,7 @@ contains
         progress_count = progress_count + 1
         done = progress_count
         !$omp end atomic
-        if (done >= next_progress) then
+        if (mod(done, progress_interval) == 0) then
           !$omp critical(progress_write)
           if (done >= next_progress) then
             call system_clock(clock_now)
@@ -776,6 +847,7 @@ contains
       center = resolved_center(i)
       if (center <= 0) cycle
       if (center /= i) cycle
+      if (.not. eligible_center(i)) cycle
 
       grad_t = grad_t_arr(center, :)
       call normalize_vector(grad_t, dirvec, ok_direction)
@@ -888,7 +960,6 @@ contains
         cycle
       end if
 
-      !$omp critical(shock_update)
       if (m > mach(center)) then
         mach(center) = m
         shock(center) = 1
@@ -896,10 +967,9 @@ contains
         upstream_index(center) = upstream
         downstream_index(center) = downstream
       end if
-      !$omp end critical(shock_update)
     end do
     !$omp end parallel do
-    if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, progress_interval) /= 0)) then
+    if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, max(1, progress_interval)) /= 0)) then
       call system_clock(clock_now)
       elapsed = real(clock_now - scan_start, 8) / real(max(clock_rate, 1), 8)
       write(output_unit, '(A,I0,A,I0,A,F10.1,A)') "ShockFinder Fortran scan: ", &
@@ -907,7 +977,7 @@ contains
       flush(output_unit)
     end if
 
-    deallocate(divv_arr, grad_t_arr, candidate, resolved_center)
+    deallocate(divv_arr, grad_t_arr, candidate, resolved_center, eligible_center)
   end subroutine find_shocks
 
 end module shockfinder_kernel

@@ -27,13 +27,7 @@ class ShockAnalysis:
         representative_count = shock_count
         group_count = 0
         if self.catalog is not None:
-            representatives = self.catalog.center_representative
-            representative_count = int(
-                np.count_nonzero(
-                    (representatives >= 0)
-                    & (representatives == np.arange(result.mach.size))
-                )
-            )
+            representative_count = sum(group.n_centers for group in self.catalog.groups)
             group_count = len(self.catalog.groups)
         return {
             "retained": int(result.mach.size),
@@ -41,6 +35,12 @@ class ShockAnalysis:
             "representative": representative_count,
             "groups": group_count,
         }
+
+    def to_compact(self, **options):
+        from .compact import compact_shocks
+        if self.result is None:
+            raise ValueError("analysis has been cleared")
+        return compact_shocks(self.result, self.dissipation, self.catalog, timings=self.timings, **options)
 
     def clear(self) -> None:
         if self.result is not None:
