@@ -16,4 +16,8 @@ dist/
 tests/output/
 /amr_data/
 
+# Local Codex performance and analysis support files; never stage or commit.
+/local_work/
+/artifacts/merger_shock_performance/
+
 .DS_Store

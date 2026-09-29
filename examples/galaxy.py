@@ -30,11 +30,11 @@ from shocktest.spatial import nearest_points, connected_components, nearest_segm
 KPC_IN_KM = 3.0856775814913673e16
 _GYR_IN_S = 1.e9 * 365.25 * 86400.
 _LENGTH_TO_KPC = {"km": 1. / KPC_IN_KM, "kpc": 1., "Mpc": 1000.}
+# Common column names for explicit selections; these are not mandatory inputs.
 GAS_TRACERS = (
     "m_ism", "m_gas_r90", "mcold_gas_r50", "mcold_gas_r90",
     "HI_gas_mass_r50", "HI_gas_mass_r90",
 )
-_TRACER_FAMILY = dict(zip(GAS_TRACERS, ("ISM", "total", "cold", "cold", "HI", "HI")))
 STRIPPING_CATEGORIES = (
     "merger_shock_stripping_candidate", "ordinary_infall_rps_candidate",
     "mixed_or_ambiguous", "no_strong_stripping",
@@ -44,6 +44,11 @@ STRIPPING_CATEGORIES = (
 @dataclass(frozen=True)
 class StrippingOptions:
     """Starting thresholds, NOT calibrated probabilities or universal cuts.
+
+    ``tracers`` selects exact history column names; a string or a nonempty
+    list/tuple is accepted. Every selected tracer is analyzed independently.
+    One significant tracer episode can support stripping; neither tracer
+    counts/families nor P_ram enter detection, scores, or confidence.
 
     Times/widths are Gyr, rates are inverse Gyr, distances are physical kpc.
     Smoothing is a centered log-mass median within a TOTAL width, restricted
@@ -55,12 +60,15 @@ class StrippingOptions:
 
     Association half-windows use max(window_gyr, association_cadences * local
     cadence). Cadence exceeding max_association_window_gyr is unresolved.
-    Cold r50/r90 and HI r50/r90 count as one family each. Evidence scores use
-    fixed, documented weights in _stripping_assess_episode; score_cut and
+    Evidence scores use fixed weights in _stripping_assess_episode; score_cut and
     score_margin control decisions. Uncertain encounters block an ordinary
     RPS attribution. The sensitivity sweep varies one option at a time.
-    A no-strong-stripping assessment requires min_mass_history_coverage in
-    enough independent tracer families. Pericenter confidence measures the
+    agreement_window_gyr groups coincident events for diagnostics only; their
+    timing agreement never changes a score. All significant episodes enter
+    the galaxy classification. Conflicting mechanisms or uncertain episodes
+    remain mixed. A no-strong-stripping assessment requires adequate sampling
+    and min_mass_history_coverage for each selected tracer.
+    Pericenter confidence measures the
     smaller inbound/outbound distance rise within window_gyr, relative to
     pericenter_depth_fraction * minimum distance (with a 1 kpc noise scale).
     Turning points below pericenter_confidence_cut cannot support RPS.
@@ -74,6 +82,7 @@ class StrippingOptions:
     and a residual <= patch_match_cells * mean dx, never equality of row IDs.
     """
 
+    tracers: str | tuple[str, ...] | list[str] = ("m_gas_r90",)
     smoothing_width_gyr: float = .03
     min_fractional_loss: float = .30
     min_loss_rate_gyr: float = 2.
@@ -87,10 +96,6 @@ class StrippingOptions:
     association_cadences: float = 1.5
     max_association_window_gyr: float = .40
     agreement_window_gyr: float = .10
-    min_tracers: int = 2
-    min_tracer_families: int = 2
-    ram_enhancement: float = 2.
-    ram_jump_rate_gyr: float = 4.
     score_cut: float = .65
     score_margin: float = .12
     encounter_score_cut: float = .65
@@ -129,8 +134,11 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         ``velocity='km/s'`` (common Cartesian simulation frame). Their angle
         is reported as a stored-velocity angle; crossing geometry uses the
         measured galaxy motion relative to the moving front instead.
-        Gas masses may use any consistent unit PER tracer; P_ram ratios need
-        any consistent pressure unit. No absolute pressure cut is applied.
+        Gas masses may use any consistent unit PER tracer. Each column named
+        in options.tracers must exist and have shape (N,). The default is only
+        m_gas_r90. Other gas fields are preserved without being analyzed.
+        P_ram is optional and used only in diagnostic plots, never in episode
+        detection, mechanism scores, confidence, or sensitivity decisions.
 
         Optional ``resolved`` and ``valid`` map tracer -> boolean (N,) masks.
         Optional ``mass_limits`` maps tracer -> nonnegative scalar/(N,) upper
@@ -145,11 +153,13 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         orbital turning-point detection.
     merger_shocks : mapping or callable
         Snapshot -> product, or callable(iout) -> product/None for streaming.
-        A product is either ``{'catalog': finalized_merger_catalog,
+        A product is either ``{'catalog': snapshot_merger_catalog,
         'result': saved_result, 'dissipation': saved_dissipation, ...}`` or
         ``{'members': [get_merger_shock_members(...) outputs], ...}``.
         Front assessments MUST carry independently established classification,
-        evidence and track_origin. Existing shock IDs remain snapshot-local.
+        evidence and a snapshot-local front_id, or an independently supplied
+        track_origin for crossing measurements across outputs. Snapshot-local
+        IDs support proximity only; they do not establish temporal crossings.
         No gas history is used to change merger-shock attribution.
 
         Set ``complete=True`` ONLY if the saved search covers the galaxies'
@@ -181,8 +191,13 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         gas_loss_events, classifications, shock_encounters, pericenters,
         episode_assessments, sensitivity, population, diagnostic_series,
         configuration and input_histories. Tables are lists of row dictionaries
-        (pandas.DataFrame(...) is optional). Every tracer has a status and
-        measurements in each classification, even when unavailable.
+        (pandas.DataFrame(...) is optional). Every selected tracer has its own
+        status, events, and episode assessments in gas_loss_by_tracer.
+        Galaxy decisions consider ALL significant selected-tracer episodes,
+        without voting or requiring multiple tracers to lose gas. Different
+        mechanisms or an unresolved episode produce mixed_or_ambiguous.
+        The top-level loss/timing measurements describe the largest-loss
+        episode, identified by summary_gas_event_id; all episodes are retained.
         Evidence scores are indices in [0,1], NOT membership probabilities.
         ``causal_confirmation`` is always False. Gas loss alone cannot rule
         out phase changes, consumption, tides, or aperture changes.
@@ -191,7 +206,8 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
     -------
     >>> analysis = galaxy_stripping_catalog(
     ...     {branch_id: history}, products_by_iout, cluster_info,
-    ...     options={"min_fractional_loss": .3}, output_dir="stripping_output")
+    ...     options={"tracers": ["m_gas_r90", "HI_gas_mass_r90"],
+    ...              "min_fractional_loss": .3}, output_dir="stripping_output")
     >>> events = analysis["gas_loss_events"]
     >>> category = analysis["classifications"][0]["category"]
     """
@@ -204,7 +220,7 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         series[galaxy_id] = _stripping_history(
             galaxy_id, history, cluster_info, cfg, shared_clusters=shared_clusters)
     encounters, provenance = _stripping_associate_shocks(series, merger_shocks, cfg)
-    result = {"schema_version": 1, "configuration": asdict(cfg),
+    result = {"schema_version": 2, "configuration": asdict(cfg),
               "input_histories": galaxy_histories, "diagnostic_series": series,
               "shock_encounters": encounters, "shock_provenance": provenance, "gas_loss_events": [],
               "classifications": [], "episode_assessments": [],
@@ -236,6 +252,13 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
 
 def _stripping_options(options):
     cfg = options if isinstance(options, StrippingOptions) else StrippingOptions(**(options or {}))
+    tracers = (cfg.tracers,) if isinstance(cfg.tracers, str) else cfg.tracers
+    if (not isinstance(tracers, (list, tuple)) or not tracers
+            or any(not isinstance(name, str) or not name.strip() for name in tracers)):
+        raise ValueError("tracers must be a column name or a nonempty list/tuple of column names")
+    if len(set(tracers)) != len(tracers):
+        raise ValueError("tracers must contain unique column names")
+    cfg = replace(cfg, tracers=tuple(tracers))
     bounded = ("min_fractional_loss", "onset_rate_fraction", "rebound_fraction", "score_cut",
                "score_margin", "encounter_score_cut", "min_front_evidence", "normal_cosine_min",
                "min_shock_coverage", "min_mass_history_coverage", "pericenter_confidence_cut",
@@ -245,18 +268,15 @@ def _stripping_options(options):
             raise ValueError(f"{key} must be in (0,1]")
     for key in ("min_loss_rate_gyr", "max_episode_duration_gyr", "max_gap_gyr", "gap_factor",
                 "window_gyr", "association_cadences", "max_association_window_gyr",
-                "agreement_window_gyr", "ram_jump_rate_gyr", "patch_match_cells", "max_motion_km_s"):
+                "agreement_window_gyr", "patch_match_cells", "max_motion_km_s"):
         if not np.isfinite(getattr(cfg, key)) or getattr(cfg, key) <= 0:
             raise ValueError(f"{key} must be finite and positive")
     for key in ("smoothing_width_gyr", "zone_width_factor"):
         if not np.isfinite(getattr(cfg, key)) or getattr(cfg, key) < 0:
             raise ValueError(f"{key} must be nonnegative")
-    if not np.isfinite(cfg.ram_enhancement) or cfg.ram_enhancement <= 1:
-        raise ValueError("ram_enhancement must exceed one")
-    for key, maximum in (("min_valid_samples", None), ("min_tracers", len(GAS_TRACERS)), ("min_tracer_families", 4)):
-        value = getattr(cfg, key)
-        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1 or (maximum and value > maximum):
-            raise ValueError(f"invalid {key}")
+    if (isinstance(cfg.min_valid_samples, bool) or not isinstance(cfg.min_valid_samples, (int, np.integer))
+            or cfg.min_valid_samples < 1):
+        raise ValueError("invalid min_valid_samples")
     for field, grid in (("min_fractional_loss", cfg.sensitivity_fractions), ("min_loss_rate_gyr", cfg.sensitivity_rates_gyr),
                         ("smoothing_width_gyr", cfg.sensitivity_smoothing_gyr), ("window_gyr", cfg.sensitivity_windows_gyr)):
         for value in grid:
@@ -321,6 +341,9 @@ def _stripping_clusters(info):
 
 
 def _stripping_history(gid, history, cluster_info, cfg, *, shared_clusters=None):
+    missing = [name for name in cfg.tracers if name not in history]
+    if missing:
+        raise ValueError(f"galaxy {gid}: selected tracer columns missing from history: {missing}")
     units = history.get("units", {})
     if (units.get("time") != "Gyr" or units.get("coordinate_frame") != "physical"
             or units.get("position") not in _LENGTH_TO_KPC or units.get("radius") not in _LENGTH_TO_KPC):
@@ -329,6 +352,9 @@ def _stripping_history(gid, history, cluster_info, cfg, *, shared_clusters=None)
     if snapshots.ndim != 1 or snapshots.dtype.kind not in "iu" or len(np.unique(snapshots)) != len(snapshots):
         raise ValueError(f"galaxy {gid}: iout must contain unique integer snapshots")
     n = len(snapshots)
+    for tracer in cfg.tracers:
+        if np.shape(history[tracer]) != (n,):
+            raise ValueError(f"galaxy {gid}: {tracer} must have shape {(n,)}")
     times = _stripping_column(history, "t_BB", n)
     if not np.all(np.isfinite(times)) or len(np.unique(times)) != n or n == 0:
         raise ValueError(f"galaxy {gid}: cosmic times must be finite, unique and nonempty")
@@ -395,7 +421,7 @@ def _stripping_history(gid, history, cluster_info, cfg, *, shared_clusters=None)
             "velocity_km_s": velocity, "box_kpc": box, "host_cluster": host,
             "cluster_distance_kpc": selected_distance, "primary_distance_kpc": distances[0],
             "secondary_distance_kpc": distances[1], "merger_epoch": clusters["epoch"],
-            "P_ram": _stripping_column(history, "P_ram", n)[order], "raw": history,
+            "raw": history,
             "cadence_gyr": cadence, "gap_limit_gyr": gap_limit, "quality_flags": flags}
     data["pericenters"] = _stripping_pericenters(data, cfg)
     return data
@@ -467,8 +493,6 @@ def _stripping_mass_series(data, tracer, cfg):
     positive = finite & valid & resolved & (mass > 0) & (mass > limits)
     status[censored] = "upper_limit"
     status[positive] = "resolved_positive"
-    if tracer not in history:
-        flags.append("tracer_missing")
     if not known_resolution:
         flags.append("resolution_not_supplied")
     if np.any(status == "invalid_negative"):
@@ -563,7 +587,7 @@ def _stripping_events(gid, data, tracer, mass_data, cfg):
         if rebound or duration > cfg.max_episode_duration_gyr:
             strength *= .25
         rows.append({"event_id": f"{gid}:{tracer}:{int(data['iout'][a])}", "galaxy_id": gid,
-                     "tracer": tracer, "tracer_family": _TRACER_FAMILY[tracer],
+                     "tracer": tracer,
                      "onset_time_gyr": float(t[a]), "peak_time_gyr": float(.5*(t[peak_index]+t[peak_index+1])),
                      "end_time_gyr": float(t[b]), "onset_snapshot": int(data["iout"][a]),
                      "end_snapshot": int(data["iout"][b]), "peak_loss_rate_gyr": float(rate[peak_index]),
@@ -588,49 +612,10 @@ def _stripping_local_cadence(data, time):
     return float(np.median(diffs)) if len(diffs) else data["cadence_gyr"]
 
 
-def _stripping_ram(data, onset, window, cfg):
-    t, p = data["time_gyr"], data["P_ram"]
-    good = np.isfinite(p) & (p > 0)
-    before = good & (t < onset) & (t >= onset-2*window)
-    during = good & (t >= onset-window*.5) & (t <= onset+window)
-    flags = []
-    result = {"enhancement": np.nan, "peak_time_gyr": np.nan, "enhancement_time_gyr": np.nan,
-              "peak_log_jump_rate_gyr": np.nan, "sudden_evidence": 0., "smooth_evidence": 0., "quality_flags": flags}
-    if not np.any(before) or not np.any(during):
-        flags.append("P_ram_baseline_or_peak_missing")
-        return result
-    baseline = float(np.median(p[before]))
-    idx = np.flatnonzero(during)
-    peak = idx[np.argmax(p[idx])]
-    result["enhancement"], result["peak_time_gyr"] = float(p[peak]/baseline), float(t[peak])
-    if np.count_nonzero(before) < 2:
-        flags.append("P_ram_baseline_single_output")
-    valid_pairs = good[:-1] & good[1:] & (np.diff(t) <= data["gap_limit_gyr"])
-    valid_pairs &= (t[:-1] >= onset-window) & (t[1:] <= onset+window)
-    ii = np.flatnonzero(valid_pairs)
-    if not len(ii):
-        flags.append("P_ram_rise_unresolved")
-        return result
-    jumps = np.log(p[ii+1])-np.log(p[ii])
-    rates = jumps/(t[ii+1]-t[ii])
-    j = int(np.argmax(rates))
-    result["enhancement_time_gyr"] = float(.5*(t[ii[j]]+t[ii[j]+1]))
-    result["peak_log_jump_rate_gyr"] = float(rates[j])
-    amplitude = float(np.clip(np.log(max(result["enhancement"], 1.))/np.log(cfg.ram_enhancement), 0., 1.))
-    jump = float(np.clip(max(jumps[j], 0.)/np.log(cfg.ram_enhancement), 0., 1.))
-    result["sudden_evidence"] = amplitude*jump*float(np.clip(rates[j]/cfg.ram_jump_rate_gyr, 0., 1.))
-    if len(ii) >= 3:
-        increasing = np.mean(jumps >= -0.05)
-        dominance = max(float(np.max(jumps)), 0.) / max(float(np.sum(np.maximum(jumps, 0))), 1.e-30)
-        result["smooth_evidence"] = amplitude * float(increasing) * float(np.clip((1.-dominance)/.5, 0., 1.))
-    else:
-        flags.append("P_ram_smoothness_under_sampled")
-    return result
-
-
 def _stripping_groups(events, data, cfg):
+    """Group onset times for reporting only; never determine a mechanism."""
     groups = []
-    for event in sorted((e for e in events if e["significant"]), key=lambda e: e["onset_time_gyr"]):
+    for event in sorted((e for e in events if e["significant"]), key=lambda e: (e["onset_time_gyr"], e["tracer"])):
         window = max(cfg.agreement_window_gyr, _stripping_local_cadence(data, event["onset_time_gyr"]))
         target = next((g for g in groups if abs(g[0]["onset_time_gyr"]-event["onset_time_gyr"]) <= window
                        and event["tracer"] not in [e["tracer"] for e in g]), None)
@@ -657,22 +642,14 @@ def _stripping_coverage(data, onset, window):
     return fraction
 
 
-def _stripping_assess_episode(gid, group, data, tracer_data, cfg):
-    onset = float(np.median([e["onset_time_gyr"] for e in group]))
-    peak = float(np.median([e["peak_time_gyr"] for e in group]))
+def _stripping_assess_episode(gid, event, data, cfg):
+    """Assess one tracer's significant episode without any tracer voting."""
+    onset, peak = event["onset_time_gyr"], event["peak_time_gyr"]
     cadence = _stripping_local_cadence(data, onset)
     cadence = cadence if np.isfinite(cadence) else cfg.max_association_window_gyr*2
     window = max(cfg.window_gyr, cfg.association_cadences*cadence)
-    uncertainty = max(e["onset_uncertainty_gyr"] for e in group)
-    families = set(e["tracer_family"] for e in group)
-    tracers = set(e["tracer"] for e in group)
-    available = {name for name, md in tracer_data.items() if md["valid_sample_count"] >= cfg.min_valid_samples}
-    available_families = {_TRACER_FAMILY[n] for n in available}
-    multitracer = min(1., len(tracers)/cfg.min_tracers)*min(1., len(families)/cfg.min_tracer_families)
-    dispersion = float(np.std([e["onset_time_gyr"] for e in group]))
-    temporal_agreement = float(np.exp(-dispersion/max(cfg.agreement_window_gyr, cadence)))
-    family_agreement = len(families)/len(available_families) if available_families else 0.
-    gas_evidence = multitracer*temporal_agreement*float(np.median([e["gas_loss_evidence"] for e in group]))
+    uncertainty = event["onset_uncertainty_gyr"]
+    gas_evidence = event["gas_loss_evidence"]
     near = [e for e in data["encounters"] if e["end_time_gyr"] >= onset-window and e["start_time_gyr"] <= onset+uncertainty]
     def encounter_rank(e):
         lag = onset-e["peak_time_gyr"]
@@ -690,19 +667,21 @@ def _stripping_assess_episode(gid, group, data, tracer_data, cfg):
     lag_peri = onset-peri_time
     peri_timing = float(np.exp(-abs(lag_peri)/window)*peri["confidence_score"]) if peri else 0.
     coverage = _stripping_coverage(data, onset, window)
-    ram = _stripping_ram(data, onset, window, cfg)
     t, r = data["time_gyr"], data["cluster_distance_kpc"]
     inward_pairs = (t[:-1] >= onset-2*window) & (t[1:] <= onset+uncertainty)
     inward_pairs &= np.isfinite(r[:-1]) & np.isfinite(r[1:]) & (np.diff(t) <= data["gap_limit_gyr"])
     inward_pairs &= data["host_cluster"][:-1] == data["host_cluster"][1:]
     inward = float(np.mean(np.diff(r)[inward_pairs] < 0)) if np.any(inward_pairs) else 0.
     no_shock = min(1., coverage/cfg.min_shock_coverage) if not near else 0.
-    # Scores retain separate physical, temporal, gas, and pressure contributions.
-    shock_score = .30*exposure + .20*shock_timing*exposure + .20*gas_evidence + .15*ram["sudden_evidence"] + .15*geometry
-    rps_score = .25*peri_timing + .20*gas_evidence + .20*ram["smooth_evidence"] + .15*inward + .20*no_shock
+    # Normalize the remaining geometric/timing/gas weights to sum to one.
+    # Shock: exposure .30/.85, timing*exposure .20/.85, gas .20/.85,
+    # geometry .15/.85. Infall: pericenter .25/.80, gas .20/.80,
+    # inward motion .15/.80, covered absence of shocks .20/.80.
+    # Neither pressure nor the number/type of other tracers enters these scores.
+    shock_score = (.30*exposure + .20*shock_timing*exposure + .20*gas_evidence + .15*geometry)/.85
+    rps_score = (.25*peri_timing + .20*gas_evidence + .15*inward + .20*no_shock)/.80
     reasons = []
-    flags = list(ram["quality_flags"])+[f for e in group for f in e["quality_flags"]]
-    enough_tracers = len(tracers) >= cfg.min_tracers and len(families) >= cfg.min_tracer_families
+    flags = list(event["quality_flags"])
     credible = bool(encounter and encounter["confirmed"] and exposure >= cfg.encounter_score_cut)
     confounded = bool(credible and peri and abs(shock_time-peri_time) <= max(cadence, uncertainty+peri["time_uncertainty_gyr"]))
     # Onset exactly at a sampled encounter remains interval-order ambiguous.
@@ -711,12 +690,10 @@ def _stripping_assess_episode(gid, group, data, tracer_data, cfg):
         reasons.append("shock_and_pericenter_times_unresolved")
     if ordering_unresolved:
         reasons.append("shock_and_loss_order_unresolved")
-    if all(any(f in e["quality_flags"] for f in ("onset_left_censored", "onset_after_missing_or_unresolved_mass")) for e in group):
+    if any(f in flags for f in ("onset_left_censored", "onset_after_missing_or_unresolved_mass")):
         reasons.append("loss_onset_not_observed")
-    if not enough_tracers:
-        reasons.append("gas_tracers_disagree_or_insufficient_independent_families")
-    if len(families) < len(available_families) and len(families) < 2:
-        reasons.append("available_gas_tracers_do_not_agree")
+    if "insufficient_resolved_mass_samples" in flags:
+        reasons.append("insufficient_resolved_mass_samples")
     if near and not credible:
         reasons.append("merger_shock_association_uncertain")
     if coverage < cfg.min_shock_coverage:
@@ -728,9 +705,9 @@ def _stripping_assess_episode(gid, group, data, tracer_data, cfg):
         reasons.append("important_history_gap_near_loss")
     if np.any(local_indices & ~np.isfinite(r)):
         reasons.append("cluster_center_gap_near_loss")
-    shock_ok = (credible and -uncertainty <= lag_shock <= window and enough_tracers
+    shock_ok = (credible and -uncertainty <= lag_shock <= window
                 and shock_score >= cfg.score_cut and not confounded and not ordering_unresolved)
-    rps_ok = (peri is not None and abs(lag_peri) <= window and enough_tracers
+    rps_ok = (peri is not None and abs(lag_peri) <= window
               and coverage >= cfg.min_shock_coverage and not near and rps_score >= cfg.score_cut)
     both_scores = shock_score >= cfg.score_cut and rps_score >= cfg.score_cut
     if both_scores and abs(shock_score-rps_score) < cfg.score_margin:
@@ -750,15 +727,10 @@ def _stripping_assess_episode(gid, group, data, tracer_data, cfg):
     if max(shock_score, rps_score) >= .85 and not flags and category != "mixed_or_ambiguous":
         confidence = "high"
     core = data["merger_epoch"]["core_passage_time_gyr"]
-    return {"galaxy_id": gid, "gas_event_ids": [e["event_id"] for e in group],
-            "onset_time_gyr": onset, "peak_time_gyr": peak, "end_time_gyr": float(max(e["end_time_gyr"] for e in group)),
-            "fractional_loss": float(np.median([e["fractional_loss"] for e in group])),
-            "peak_loss_rate_gyr": float(max(e["peak_loss_rate_gyr"] for e in group)),
-            "timescale_gyr": float(np.median([e["timescale_gyr"] for e in group])),
-            "tracers": sorted(tracers), "tracer_families": sorted(families),
-            "tracer_temporal_agreement": temporal_agreement, "onset_dispersion_gyr": dispersion,
-            "fraction_of_available_families_with_loss": family_agreement,
-            "available_tracer_families": sorted(available_families),
+    return {"galaxy_id": gid, "gas_event_ids": [event["event_id"]], "tracer": event["tracer"],
+            "onset_time_gyr": onset, "peak_time_gyr": peak, "end_time_gyr": event["end_time_gyr"],
+            "fractional_loss": event["fractional_loss"], "peak_loss_rate_gyr": event["peak_loss_rate_gyr"],
+            "timescale_gyr": event["timescale_gyr"],
             "shock_encounter_id": encounter["encounter_id"] if encounter else None,
             "associated_front_id": encounter["front_id"] if encounter else None,
             "shock_encounter_time_gyr": shock_time, "pericenter_time_gyr": peri_time,
@@ -772,9 +744,6 @@ def _stripping_assess_episode(gid, group, data, tracer_data, cfg):
             "encounter_geometry_evidence": geometry,
             "merger_shock_origin_evidence": encounter["merger_evidence"] if encounter else np.nan,
             "temporal_coincidence_score": shock_timing, "gas_loss_evidence": gas_evidence,
-            "P_ram_enhancement": ram["enhancement"], "P_ram_peak_time_gyr": ram["peak_time_gyr"],
-            "P_ram_enhancement_time_gyr": ram["enhancement_time_gyr"],
-            "P_ram_sudden_evidence": ram["sudden_evidence"], "P_ram_smooth_evidence": ram["smooth_evidence"],
             "merger_shock_stripping_score": float(shock_score), "ordinary_rps_score": float(rps_score),
             "merger_phase": "unresolved" if not np.isfinite(core) else "before_core_passage" if onset < core else "after_core_passage",
             "delta_t_cluster_core_passage_gyr": float(onset-core),
@@ -784,29 +753,51 @@ def _stripping_assess_episode(gid, group, data, tracer_data, cfg):
 
 def _stripping_analyze_galaxy(gid, data, cfg, *, store=True):
     tracer_data, events = {}, []
-    for tracer in GAS_TRACERS:
+    for tracer in cfg.tracers:
         md = _stripping_mass_series(data, tracer, cfg)
         tracer_data[tracer] = md
         events.extend(_stripping_events(gid, data, tracer, md, cfg))
     if store:
         data["gas_tracers"] = tracer_data
-    assessments = [_stripping_assess_episode(gid, group, data, tracer_data, cfg) for group in _stripping_groups(events, data, cfg)]
+    assessments = [_stripping_assess_episode(gid, event, data, cfg) for event in events if event["significant"]]
+    groups = _stripping_groups(events, data, cfg)
+    by_event = {a["gas_event_ids"][0]: a for a in assessments}
+    # Temporal agreement is descriptive. No timing is averaged before assessing
+    # a tracer, and no score or decision below uses these group measurements.
+    for group in groups:
+        dispersion = float(np.std([e["onset_time_gyr"] for e in group]))
+        cadence = _stripping_local_cadence(data, group[0]["onset_time_gyr"])
+        scale = max(cfg.agreement_window_gyr, cadence) if np.isfinite(cadence) else cfg.agreement_window_gyr
+        for event in group:
+            by_event[event["event_id"]].update(
+                tracer_temporal_agreement=float(np.exp(-dispersion/scale)),
+                onset_dispersion_gyr=dispersion,
+                coincident_gas_event_ids=[e["event_id"] for e in group])
     flags = list(data["quality_flags"])
     for md in tracer_data.values():
         flags.extend(md["quality_flags"])
     if assessments:
-        main = max(assessments, key=lambda a: (a["gas_loss_evidence"], a["fractional_loss"]))
+        main = max(assessments, key=lambda a: (a["fractional_loss"], a["peak_loss_rate_gyr"],
+                                             -a["onset_time_gyr"], a["tracer"]))
         row = dict(main)
-        row["ambiguity_reasons"] = list(main["ambiguity_reasons"])
-        row["quality_flags"] = list(main["quality_flags"])
+        row["summary_gas_event_id"] = main["gas_event_ids"][0]
+        row["summary_tracer"] = row.pop("tracer")
+        row["ambiguity_reasons"] = sorted({r for a in assessments for r in a["ambiguity_reasons"]})
+        row["quality_flags"] = sorted({f for a in assessments for f in a["quality_flags"]})
+        row["merger_shock_stripping_score"] = max(a["merger_shock_stripping_score"] for a in assessments)
+        row["ordinary_rps_score"] = max(a["ordinary_rps_score"] for a in assessments)
+        row["confidence"] = min((a["confidence"] for a in assessments), key=("low", "medium", "high").index)
         mechanisms = {a["category"] for a in assessments if a["category"] != "mixed_or_ambiguous"}
         if len(mechanisms) > 1:
             row["category"], row["confidence"] = "mixed_or_ambiguous", "low"
             row["ambiguity_reasons"].append("different_episodes_favor_different_mechanisms")
+        if any(a["category"] == "mixed_or_ambiguous" for a in assessments):
+            row["category"], row["confidence"] = "mixed_or_ambiguous", "low"
+            if mechanisms:
+                row["ambiguity_reasons"].append("uncertain_gas_loss_episode")
     else:
-        observed = {k for k, md in tracer_data.items() if md["valid_sample_count"] >= cfg.min_valid_samples
-                    and np.mean(md["positive"]) >= cfg.min_mass_history_coverage}
-        enough = len(observed) >= cfg.min_tracers and len({_TRACER_FAMILY[k] for k in observed}) >= cfg.min_tracer_families
+        enough = all(md["valid_sample_count"] >= cfg.min_valid_samples
+                     and np.mean(md["positive"]) >= cfg.min_mass_history_coverage for md in tracer_data.values())
         enough &= not any(f in data["quality_flags"] for f in ("history_time_gaps", "galaxy_position_gaps"))
         row = {"galaxy_id": gid, "category": "no_strong_stripping" if enough else "mixed_or_ambiguous",
                "confidence": "medium" if enough else "low", "ambiguity_reasons": [] if enough else ["insufficient_gas_history"],
@@ -815,23 +806,36 @@ def _stripping_analyze_galaxy(gid, data, cfg, *, store=True):
                "fractional_loss": np.nan, "timescale_gyr": np.nan,
                "shock_encounter_time_gyr": np.nan, "pericenter_time_gyr": np.nan,
                "delta_t_shock_gyr": np.nan, "delta_t_peri_gyr": np.nan,
-               "P_ram_enhancement": np.nan, "tracer_temporal_agreement": np.nan, "causal_confirmation": False}
+               "summary_gas_event_id": None, "summary_tracer": None,
+               "tracer_temporal_agreement": np.nan, "causal_confirmation": False}
+    row["tracers"] = list(cfg.tracers)
+    row["gas_event_ids"] = [a["gas_event_ids"][0] for a in assessments]
+    row["ambiguity_reasons"] = sorted(set(row["ambiguity_reasons"]))
     row["quality_flags"] = sorted(set(row["quality_flags"]+flags))
     if flags and row["confidence"] == "high":
         row["confidence"] = "medium"
     row["gas_loss_by_tracer"] = {}
     for tracer, md in tracer_data.items():
         selected = [e for e in events if e["tracer"] == tracer]
+        selected_assessments = [a for a in assessments if a["tracer"] == tracer]
+        categories = {a["category"] for a in selected_assessments}
+        sufficient = (md["valid_sample_count"] >= cfg.min_valid_samples
+                      and np.mean(md["positive"]) >= cfg.min_mass_history_coverage
+                      and not any(f in data["quality_flags"] for f in ("history_time_gaps", "galaxy_position_gaps")))
+        tracer_category = (next(iter(categories)) if len(categories) == 1 else "mixed_or_ambiguous"
+                           if categories or not sufficient else "no_strong_stripping")
         row["gas_loss_by_tracer"][tracer] = {"status": "measured" if md["valid_sample_count"] >= cfg.min_valid_samples else "insufficient_history",
                                             "valid_sample_count": md["valid_sample_count"],
                                             "event_count": len(selected), "significant_event_count": sum(e["significant"] for e in selected),
-                                            "events": selected, "quality_flags": md["quality_flags"]}
+                                            "events": selected, "episode_assessments": selected_assessments,
+                                            "category": tracer_category, "quality_flags": md["quality_flags"]}
     credible = [e for e in data["encounters"] if e["confirmed"] and e["confidence_score"] >= cfg.encounter_score_cut]
     row["shock_encounter_times_gyr"] = [e["peak_time_gyr"] for e in credible]
     row["pericenter_times_gyr"] = [p["time_gyr"] for p in data["pericenters"] if p["verified_turning_point"]]
     complete = bool(np.all(data["shock_output_covered"]) and len(data["shock_interval_covered"]) and np.all(data["shock_interval_covered"]))
     row["exposure_status"] = "shock_exposed" if credible else "no_detected_exposure_with_coverage" if complete and not data["encounters"] else "unknown_or_uncertain_exposure"
-    row["episode_count"] = len(assessments)
+    row["episode_count"] = len(groups)
+    row["tracer_episode_count"] = len(assessments)
     return row, events, assessments
 
 
@@ -869,7 +873,7 @@ def _stripping_frame(product, snapshot, box, cfg):
         catalog = product["catalog"]
         if int(catalog["iout"]) != snapshot:
             raise ValueError("shock catalog snapshot does not match its product key")
-        metadata = catalog.get("tracking_state", {}).get("metadata", {}).get(snapshot, {})
+        metadata = catalog.get("metadata", {})
         time_gyr = metadata.get("time_gyr", time_gyr)
         epoch = catalog.get("epoch_verification", {}).get("pericenter")
         members = [get_merger_shock_members(catalog, f["shock_id"], result, product["dissipation"])
@@ -882,9 +886,9 @@ def _stripping_frame(product, snapshot, box, cfg):
         assessment = member["assessment"]
         if assessment["classification"] not in ("candidate", "uncertain") or assessment["evidence"] < cfg.min_front_evidence:
             continue
-        track = assessment.get("track_origin")
+        track = assessment.get("track_origin") or assessment.get("front_id")
         if not isinstance(track, str) or not track or track in fronts:
-            raise ValueError("plausible merger fronts require unique track_origin values from temporal tracking")
+            raise ValueError("plausible merger fronts require unique front_id or independently supplied track_origin values")
         factor = _LENGTH_TO_KPC.get(member.get("position_unit"))
         if factor is None:
             raise ValueError("shock members require explicit physical km/kpc/Mpc position_unit")
@@ -1325,13 +1329,12 @@ def plot_galaxy_stripping(analysis, galaxy_id):
     axes[0].plot(t, data["cluster_distance_kpc"], "k--", label="adopted host")
     axes[0].set_ylabel("Cluster distance [kpc]")
     axes[0].legend(loc="best", ncol=3)
-    colors = dict(zip(GAS_TRACERS, plt.get_cmap("tab10").colors))
-    for tracer in GAS_TRACERS:
-        md = data["gas_tracers"][tracer]
+    palette = plt.get_cmap("tab10").colors
+    for number, (tracer, md) in enumerate(data["gas_tracers"].items()):
         positive = md["positive"]
         scale = md["raw_mass"][np.flatnonzero(positive)[0]] if np.any(positive) else np.nan
         if np.isfinite(scale):
-            color = colors[tracer]
+            color = palette[number % len(palette)]
             axes[1].plot(t, np.where(positive, md["raw_mass"]/scale, np.nan), ".", color=color, alpha=.5)
             axes[1].plot(t, md["smoothed_mass"]/scale, color=color, label=tracer)
             censored = md["censored"]
@@ -1343,11 +1346,12 @@ def plot_galaxy_stripping(analysis, galaxy_id):
     axes[2].axhline(analysis["configuration"]["min_loss_rate_gyr"], color="k", ls="--", label="rapid-loss threshold")
     axes[2].set_ylabel("−d ln M / dt [Gyr⁻¹]")
     axes[2].legend(fontsize=8)
-    p = data["P_ram"]
+    # Pressure is read only for this diagnostic, after all decisions are made.
+    p = _stripping_column(data["raw"], "P_ram", len(t))[data["order"]]
     axes[3].plot(t, np.where(np.isfinite(p) & (p > 0), p, np.nan), color="purple")
     if np.any(np.isfinite(p) & (p > 0)):
         axes[3].set_yscale("log")
-    axes[3].set_ylabel("P_ram [input unit]")
+    axes[3].set_ylabel("P_ram [input unit]\nDiagnostic only")
     d = data["shock_distance_kpc"]
     axes[4].plot(t, np.where(np.isfinite(d), d, np.nan), label="nearest plausible merger surface")
     axes[4].plot(t, np.where(data["radius_valid"], data["radius_kpc"], np.nan), ls="--", label="gas aperture")

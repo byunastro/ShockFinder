@@ -12,8 +12,49 @@ module merger_neighbor_kernel
   use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   implicit none
   private
-  public :: merge_neighbor_pairs, connect_bucket
+  public :: merge_neighbor_pairs, connect_bucket, merge_component_labels, measure_geometry
 contains
+  ! Open-boundary front reductions. Read compact fields through row indices;
+  ! no (m,3) geometry, area, or weight temporaries are allocated for a front.
+  subroutine measure_geometry(pos, dx, normal, area, rows, margin, n, m, &
+       area_sum, center, normal_sum, lower, upper, guarded_lower, guarded_upper)
+    integer, intent(in) :: n, m, rows(m)
+    real(8), intent(in) :: pos(3,n), dx(n), normal(3,n), area(n), margin
+    real(8), intent(out) :: area_sum, center(3), normal_sum(3), lower(3), upper(3)
+    real(8), intent(out) :: guarded_lower(3), guarded_upper(3)
+    integer :: k, row, reference_row
+    real(8) :: reference(3), sign_normal, weight, half_width, guard
+    area_sum = 0.0d0
+    center = 0.0d0
+    normal_sum = 0.0d0
+    lower = huge(0.0d0)
+    upper = -huge(0.0d0)
+    guarded_lower = lower
+    guarded_upper = upper
+    if (m == 0) return
+    reference_row = rows(1)+1
+    do k = 1, m
+      row = rows(k)+1
+      area_sum = area_sum + area(row)
+      if (area(row) > area(reference_row)) reference_row = row
+    end do
+    reference = normal(:,reference_row)
+    do k = 1, m
+      row = rows(k)+1
+      weight = area(row)/area_sum
+      center = center + pos(:,row)*weight
+      sign_normal = 1.0d0
+      if (dot_product(normal(:,row), reference) < 0.0d0) sign_normal = -1.0d0
+      normal_sum = normal_sum + normal(:,row)*(sign_normal*area(row))
+      half_width = 0.5d0*dx(row)
+      guard = (0.5d0+margin)*dx(row)
+      lower = min(lower, pos(:,row)-half_width)
+      upper = max(upper, pos(:,row)+half_width)
+      guarded_lower = min(guarded_lower, pos(:,row)-guard)
+      guarded_upper = max(guarded_upper, pos(:,row)+guard)
+    end do
+  end subroutine measure_geometry
+
   ! Generic spatial bins, not an assumption that shocks fill an AMR lattice.
   ! Each cell is placed in a bin at least as wide as the largest permitted
   ! reach for this target AMR bucket. Query at most 27 bins and apply the same
@@ -175,6 +216,33 @@ contains
                        normal_cosine, box_size, n, nvalid)
     end do
   end subroutine merge_neighbor_pairs
+
+  ! Reconcile completed local graphs by existing global detected-cell indices.
+  ! ALL ghost memberships are supplied. No geometry is accepted here and no
+  ! workers write this parent: the caller reduces already verified components.
+  subroutine merge_component_labels(cells, labels, parent, n, m)
+    integer, intent(in) :: n, m, cells(m), labels(m)
+    integer, intent(inout) :: parent(n)
+    integer :: k, a, b, following
+    do k = 1, m
+      a = cells(k)
+      b = labels(k)
+      do
+        following = parent(a+1)
+        if (following == a) exit
+        parent(a+1) = parent(following+1)
+        a = parent(a+1)
+      end do
+      do
+        following = parent(b+1)
+        if (following == b) exit
+        parent(b+1) = parent(following+1)
+        b = parent(b+1)
+      end do
+      if (a < b) parent(b+1) = a
+      if (b < a) parent(a+1) = b
+    end do
+  end subroutine merge_component_labels
 
   subroutine accept_pair(pos, dx, normal, rows, i, j, parent, gap_factor, &
                          normal_cosine, box_size, n, nvalid)

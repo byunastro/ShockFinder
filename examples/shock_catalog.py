@@ -22,15 +22,16 @@ import hashlib
 import json
 import math
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields
+from multiprocessing import get_context, shared_memory
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-
-import matplotlib.pyplot as plt
 
 import shocktest
 
@@ -40,13 +41,14 @@ except ImportError:
     _merger_neighbors = None
 
 _MERGER_KPC_KM = 3.0856775814913673e16
-_MERGER_KPC_PER_GYR_TO_KMS = _MERGER_KPC_KM / (1.0e9 * 365.25 * 86400.0)
 _MERGER_LENGTH_TO_KPC = {"km": 1.0 / _MERGER_KPC_KM, "kpc": 1.0, "Mpc": 1000.0}
-_MERGER_SCHEMA_VERSION = 2
-_MERGER_EVIDENCE_NAMES = ("epoch", "extent", "normal", "axis", "continuity", "outward_motion", "dissipation", "origin")
+_MERGER_SCHEMA_VERSION = 4
+_MERGER_EVIDENCE_NAMES = ("epoch", "extent", "normal", "axis", "dissipation")
+_MERGER_NEIGHBOR_POOL = None
 
 
-def merger_shock_catalog(iout, result, dissipation, cluster_info):
+# Public catalog API. Implementation helpers are grouped by analysis stage below.
+def merger_shock_catalog(iout, result, dissipation, cluster_info, thread=None):
     """Identify plausible merger shocks using already computed dense results.
 
     Parameters
@@ -67,11 +69,18 @@ def merger_shock_catalog(iout, result, dissipation, cluster_info):
         Fill secondary coordinates/radius with NaN after its branch ends.
         Virial masses may be included but are not required by this method.
 
-        ``previous_catalog`` optionally contains the previous return value;
-        pass it when advancing through outputs to measure propagation.
+        Cluster history supplies merger geometry/epoch context only;
+        no shock outputs are linked.
         ``merger_shock_options`` optionally overrides documented thresholds.
         Performance options: ``cell_chunk_size`` (131072),
         ``spatial_query_chunk`` (5000), ``max_neighbor_pairs`` (200000).
+        ``neighbor_workers`` defaults to 1; values above 1 enable open-slab multiprocessing
+        above ``neighbor_min_parallel_cells`` (1000000). Overlapping
+        ghost cells preserve connections across INTERNAL partition boundaries;
+        the extraction faces never wrap. ``neighbor_max_halo_ratio`` (2.)
+        limits repeated work and falls back to serial when overlap is excessive.
+        Use ``with merger_neighbor_pool(workers=4):`` around consecutive calls
+        to amortize spawn startup. Scripts require the usual __main__ guard.
         ``neighbor_backend`` is 'auto' (compiled Fortran when available),
         'scipy', or 'fortran'. The separate optional post-processing extension
         is built from shocktest/fortran/merger_neighbors.f90; it never calls
@@ -81,6 +90,19 @@ def merger_shock_catalog(iout, result, dissipation, cluster_info):
         center IDs and assessments once per candidate front; complete reversible
         cell membership remains available. Default True preserves the old API.
         This dictionary and both ShockFinder inputs are not modified.
+
+        NewCluster extraction bounds use ``extraction_box_length_kpc`` (3000)
+        and ``extraction_midpoint_until_snapshot`` (870): before 870 the box
+        center is the measured midpoint, afterwards the primary center.
+        ``boundary_margin_cells`` (1.) adds an AMR-sized outer guard. Entire
+        connected fronts intersecting an extraction face/guard are recorded
+        as excluded_boundary and omitted from evidence and
+        merger candidates. Their existing IDs/membership remain recoverable.
+
+    thread : int, optional
+        Maximum worker processes for cell grouping (not OpenMP threads).
+        Overrides ``neighbor_workers``. Small inputs and excessive slab overlap
+        use one worker; inspect ``neighbor_execution`` for the actual choice.
 
     Returns
     -------
@@ -96,12 +118,15 @@ def merger_shock_catalog(iout, result, dissipation, cluster_info):
         center to its front (``front_index=-1`` for invalid detections), and
         preserves original input rows via ``input_cell_id``. Fronts use an
         existing member center index as their representative, not a new ID.
-        ``tracking_state`` stores only front summaries for subsequent calls.
-        No dense result/dissipation object is retained.
+        ``configuration`` and ``metadata`` describe this snapshot.
+        No dense result/dissipation object is retained. To release originals
+        BEFORE grouping, call prepare_merger_shock_inputs, then del the caller's
+        result/dissipation and pass the compact input with dissipation=None.
 
         Evidence is an index in [0,1], not a probability or proof of origin.
-        An isolated call has unmeasured propagation. After the sequence, call
-        ``finalize_merger_shock_catalogs`` to update earlier provisional scores.
+        Snapshot scoring uses epoch, extent, normal, axis and dissipation only,
+        renormalizing their original weights to sum to one. Candidates
+        remain uncertain because one snapshot cannot establish propagation.
         ``timings_seconds`` reports analysis stages, excluding input file I/O.
         A ``MergerShockInputs`` cache can replace result with dissipation=None.
     """
@@ -111,67 +136,49 @@ def merger_shock_catalog(iout, result, dissipation, cluster_info):
         raise ValueError("iout must be an integer snapshot number")
     iout = int(iout)
     config = _merger_config(cluster_info)
-    centers, meta, history, signature = _merger_center_history(iout, cluster_info, config)
-    previous = cluster_info.get("previous_catalog")
-    if previous is None:
-        frames = ()
-        epochs = _merger_verify_epochs(config, centers, meta, history)
-        geoms = _merger_geometry_history(centers, meta, history, config)
-    else:
-        state = previous.get("tracking_state", {})
-        if state.get("schema_version") != _MERGER_SCHEMA_VERSION:
-            raise ValueError("previous_catalog is not a compatible merger catalog")
-        if not _merger_same_scientific_options(state["configuration"], vars(config)) or state["center_history_signature"] != signature:
-            raise ValueError("center history or options changed; start a new sequence with previous_catalog=None")
-        frames = state["frames"]
-        if frames and iout <= frames[-1]["snapshot"]:
-            raise ValueError("calls with previous_catalog must advance in snapshot order")
-        # Reuse immutable history metadata. No retained-cell arrays are shared
-        # with the inputs, and no earlier state is updated during scoring.
-        meta, epochs = state["metadata"], state["epochs"]
-        geoms = state.get("geometry_history") or _merger_geometry_history(centers, meta, history, config)
+    if thread is not None:
+        if isinstance(thread, (bool, np.bool_)) or not isinstance(thread, (int, np.integer)) or thread < 1:
+            raise ValueError("thread must be a positive integer")
+        config.neighbor_workers = int(thread)
+    configuration = vars(config)
+    # 1. Validate the center history and prepare the measured merger geometry.
+    centers, meta, history = _merger_center_history(iout, cluster_info, config)
+    extraction = _merger_extraction_bounds(iout, centers, config)
+    epochs = _merger_verify_epochs(config, centers, meta, history)
+    geoms = _merger_geometry_history(centers, meta, history, config)
     timings["metadata"] = time.perf_counter()-started
+    # 2. Read valid saved detections and connect their AMR cells.
     stage = time.perf_counter()
     data = _merger_compact_results(result, dissipation, snapshot=iout, chunk_size=config.cell_chunk_size)
-    n = data["retained_count"]
+    # Drop our references too. Only the caller can release its own originals.
+    del result, dissipation
     timings["compact"] = time.perf_counter()-stage
     stage = time.perf_counter()
-    groups = _merger_group_cells(data, config)
+    neighbor_execution = {}
+    groups = _merger_group_cells(data, config, diagnostics=neighbor_execution)
     timings["group"] = time.perf_counter()-stage
-    current = []
-    labels = np.full(len(data["retained_row"]), -1, dtype=np.int32)
-    fingerprints = []
-    timings["summarize"], timings["fingerprint"] = 0., 0.
-    for group_index, rows in enumerate(groups):
-        stage = time.perf_counter()
-        front = _merger_summarize_front(rows, data, geoms[iout], iout, meta[iout]["time_gyr"], meta[iout]["redshift"], config)
-        front["representative_shock_id"] = int(np.min(data["retained_row"][rows]))
-        front["base_quality_flags"] = tuple(front["quality_flags"])
-        labels[rows] = group_index
-        timings["summarize"] += time.perf_counter()-stage
-        stage = time.perf_counter()
-        fingerprints.append(_merger_group_fingerprint(rows, data, config.cell_chunk_size))
-        timings["fingerprint"] += time.perf_counter()-stage
-        del front["rows"]  # No member arrays or dense inputs in tracking state.
-        current.append(front)
+    # 3. Measure fronts and record reversible membership without dense inputs.
+    fronts, membership, measurements = _merger_measure_fronts(
+        groups, data, geoms[iout], iout, meta[iout], config, extraction)
+    timings.update(measurements)
     del groups
-    frames = frames + ({"snapshot": iout, "fronts": current,
-                        "source_fingerprint": tuple(fingerprints)},)
-    state = {"schema_version": _MERGER_SCHEMA_VERSION, "configuration": vars(config),
-             "center_history_signature": signature, "metadata": meta, "epochs": epochs,
-             "geometry_history": geoms, "frames": frames}
+    # 4. Score this snapshot independently.
     stage = time.perf_counter()
-    scored, diss_scale = _merger_score_sequence(state)
-    timings["score_and_track"] = time.perf_counter()-stage
+    diss_scale = _merger_score_fronts(fronts, epochs, config)
+    timings["score"] = time.perf_counter()-stage
     catalog = {"schema_version": _MERGER_SCHEMA_VERSION, "iout": iout,
-        "fronts": _merger_public_fronts(scored[iout]),
-        "membership": {"shock_id": data["retained_row"], "input_cell_id": data["cell_id"],
-                       "front_index": labels, "source_fingerprint": tuple(fingerprints)},
-        "source": {"retained_count": n, "position_unit": data["result_position_unit"],
-                   "id_space": "dense retained result row / center_index", "snapshot": iout},
+        "analysis_mode": "snapshot",
+        "configuration": configuration, "metadata": dict(meta[iout]),
+        "fronts": _merger_public_fronts(fronts),
+        "membership": membership,
+        "source": {"retained_count": data["retained_count"], "position_unit": data["result_position_unit"],
+                   "id_space": "dense retained result row / center_index", "snapshot": iout,
+                   "boundary": "open", "extraction": extraction},
         "epoch_verification": epochs, "dissipation_reference_p75_erg_s": diss_scale,
         "neighbor_backend": _merger_neighbor_backend(data, config),
-        "tracking_state": state, "timings_seconds": timings,
+        "geometry_backend": ("fortran" if _merger_geometry_kernel(data, config) is not None else "numpy"),
+        "neighbor_execution": neighbor_execution,
+        "timings_seconds": timings,
     }
     stage = time.perf_counter()
     _merger_selection(catalog)
@@ -256,43 +263,7 @@ def get_merger_shock_members(catalog, shock_id, result, dissipation=None):
     return recovered
 
 
-def finalize_merger_shock_catalogs(catalogs):
-    """Refresh earlier assessments using the final sequence's temporal evidence.
-
-    No cell measurements are reloaded. The returned dictionaries have new
-    assessment tables and reuse their unchanged membership arrays. Inputs are
-    not mutated. Empty input returns an empty list.
-    """
-    catalogs = list(catalogs)
-    if not catalogs:
-        return []
-    state = catalogs[-1]["tracking_state"]
-    started = time.perf_counter()
-    scored, diss_scale = _merger_score_sequence(state)
-    frames = {frame["snapshot"]: frame for frame in state["frames"]}
-    refreshed = []
-    for catalog in catalogs:
-        own_state = catalog["tracking_state"]
-        if (not _merger_same_scientific_options(own_state["configuration"], state["configuration"]) or
-                own_state["center_history_signature"] != state["center_history_signature"]):
-            raise ValueError("catalogs must belong to one unchanged analysis sequence")
-        fronts = scored.get(catalog["iout"])
-        if fronts is None or [f["representative_shock_id"] for f in fronts] != [f["shock_id"] for f in catalog["fronts"]]:
-            raise ValueError("catalog is not represented in the final tracking state")
-        if catalog["membership"]["source_fingerprint"] != frames[catalog["iout"]]["source_fingerprint"]:
-            raise ValueError("catalog cell measurements differ from the final sequence")
-        updated = dict(catalog)
-        updated["fronts"] = _merger_public_fronts(fronts)
-        updated["tracking_state"] = state
-        updated["dissipation_reference_p75_erg_s"] = diss_scale
-        updated["timings_seconds"] = dict(catalog.get("timings_seconds", {}))
-        refreshed.append(_merger_selection(updated))
-    elapsed = time.perf_counter()-started
-    for updated in refreshed:
-        updated["timings_seconds"]["finalize_sequence"] = elapsed
-    return refreshed
-
-
+# Input contracts and disk-backed caches.
 @dataclass
 class _MergerOptions:
     """Configurable merger evidence scales; all lengths are physical kpc.
@@ -312,11 +283,7 @@ class _MergerOptions:
     minimum_front_cells: int = 3
     cluster_extent_kpc: float = 300.0
     axis_offset_scale_kpc: float = 400.0
-    origin_scale_kpc: float = 500.0
     passage_window_gyr: float = 0.5
-    max_link_interval_gyr: float = 0.3
-    max_front_speed_kpc_gyr: float = 3000.0
-    minimum_track_length: int = 3
     candidate_score: float = 0.65
     uncertain_score: float = 0.35
     thresholds_calibrated: bool = False
@@ -326,8 +293,14 @@ class _MergerOptions:
     cell_chunk_size: int = 131072
     max_neighbor_pairs: int = 200000
     neighbor_backend: str = "auto"
+    neighbor_workers: int = 1
+    neighbor_min_parallel_cells: int = 1000000
+    neighbor_max_halo_ratio: float = 2.0
     expand_candidate_cells: bool = True
     box_size_kpc: float | None = None
+    extraction_box_length_kpc: float = 3000.0
+    extraction_midpoint_until_snapshot: int = 870
+    boundary_margin_cells: float = 1.0
     post_merger_axis_policy: str = "last_measured"
     reference_epochs: dict = field(default_factory=lambda: {
         "overlap": {"snapshot": 605, "redshift": 0.85},
@@ -347,14 +320,14 @@ class _MergerOptions:
         for name, unit in expected_units.items():
             if getattr(config, name) != unit:
                 raise ValueError(f"{name} must be declared as {unit!r}; convert saved fields explicitly for other units")
-        for name in ("cluster_extent_kpc", "axis_offset_scale_kpc", "origin_scale_kpc", "passage_window_gyr", "max_link_interval_gyr", "max_front_speed_kpc_gyr"):
+        for name in ("cluster_extent_kpc", "axis_offset_scale_kpc", "passage_window_gyr"):
             if not np.isfinite(getattr(config, name)) or getattr(config, name) <= 0:
                 raise ValueError(f"{name} must be positive and finite")
         if not np.isfinite(config.max_cell_gap_factor) or config.max_cell_gap_factor < 0:
             raise ValueError("max_cell_gap_factor must be nonnegative and finite")
-        if config.minimum_front_cells < 1 or config.minimum_track_length < 1 or config.spatial_query_chunk < 1:
-            raise ValueError("cell, track, and query counts must be positive")
-        for name in ("cell_chunk_size", "max_neighbor_pairs", "spatial_query_chunk"):
+        if config.minimum_front_cells < 1 or config.spatial_query_chunk < 1:
+            raise ValueError("cell and query counts must be positive")
+        for name in ("cell_chunk_size", "max_neighbor_pairs", "spatial_query_chunk", "neighbor_workers", "neighbor_min_parallel_cells"):
             value = getattr(config, name)
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -366,8 +339,17 @@ class _MergerOptions:
             raise ValueError("minimum_neighbor_normal_cosine must be in [0, 1]")
         if not 0 <= config.uncertain_score < config.candidate_score <= 1:
             raise ValueError("score cutoffs must satisfy 0 <= uncertain < candidate <= 1")
-        if config.box_size_kpc is not None and config.box_size_kpc <= 0:
-            raise ValueError("box_size_kpc must be positive")
+        if config.box_size_kpc is not None:
+            raise ValueError("saved ShockFinder cubes have open boundaries; box_size_kpc must be None")
+        if not np.isfinite(config.neighbor_max_halo_ratio) or config.neighbor_max_halo_ratio < 1:
+            raise ValueError("neighbor_max_halo_ratio must be finite and at least one")
+        if not np.isfinite(config.extraction_box_length_kpc) or config.extraction_box_length_kpc <= 0:
+            raise ValueError("extraction_box_length_kpc must be positive and finite")
+        if (isinstance(config.extraction_midpoint_until_snapshot, bool) or
+                not isinstance(config.extraction_midpoint_until_snapshot, (int, np.integer))):
+            raise ValueError("extraction_midpoint_until_snapshot must be an integer")
+        if not np.isfinite(config.boundary_margin_cells) or config.boundary_margin_cells < 0:
+            raise ValueError("boundary_margin_cells must be finite and nonnegative")
         if config.post_merger_axis_policy not in {"last_measured", "unavailable"}:
             raise ValueError("post_merger_axis_policy must be 'last_measured' or 'unavailable'")
         return self
@@ -375,9 +357,9 @@ class _MergerOptions:
 
 @dataclass(frozen=True)
 class MergerShockInputs:
-    """Read-only, memory-mapped detected cells from saved ShockFinder outputs.
+    """Read-only detected cells from saved ShockFinder outputs, in RAM or mapped.
 
-    Construct with cache_merger_shock_inputs/load_merger_shock_inputs. data
+    Construct with prepare/cache/load_merger_shock_inputs. data
     holds ALL detections and their existing validity mask, including invalid
     detections; geometry is physical kpc with unit normals. This is not a dense
     ShockResult: use get_merger_shock_members for original center-ID lookup.
@@ -385,7 +367,29 @@ class MergerShockInputs:
     snapshot: int
     data: dict
     extras: dict
-    directory: str
+    directory: str | None
+
+
+def prepare_merger_shock_inputs(iout, result, dissipation, *, chunk_size=131072):
+    """Copy only detected-cell fields needed for merger analysis into RAM.
+
+    The arrays own their storage and retain no dense input views. Once this
+    returns, delete result and dissipation in the CALLER before grouping.
+    No input is modified; endpoint/temperature/velocity arrays are not kept.
+    For a reusable disk-backed alternative use cache_merger_shock_inputs.
+    """
+    if isinstance(iout, (bool, np.bool_)) or not isinstance(iout, (int, np.integer)):
+        raise ValueError("iout must be an integer snapshot number")
+    if isinstance(chunk_size, (bool, np.bool_)) or not isinstance(chunk_size, (int, np.integer)) or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+    if isinstance(result, MergerShockInputs):
+        _merger_compact_results(result, dissipation, snapshot=int(iout))
+        return result
+    data = _merger_compact_results(result, dissipation, snapshot=int(iout), chunk_size=int(chunk_size))
+    for value in data.values():
+        if isinstance(value, np.ndarray):
+            value.flags.writeable = False
+    return MergerShockInputs(int(iout), data, {}, None)
 
 
 def cache_merger_shock_inputs(iout, result, dissipation, directory, *,
@@ -522,6 +526,7 @@ def load_merger_shock_inputs(directory):
     return MergerShockInputs(int(metadata["snapshot"]), data, extras, str(directory))
 
 
+# Cluster-center geometry and saved-field normalization.
 def _merger_value(obj, name, default=None):
     return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
 
@@ -531,6 +536,99 @@ def _merger_required(obj, name):
     if value is None:
         raise ValueError(f"saved input lacks required field {name!r}")
     return value
+
+
+def _merger_config(info):
+    options = copy.deepcopy(dict(info.get("merger_shock_options", {})))
+    allowed = {f.name for f in fields(_MergerOptions)} - {
+        "center_position_unit", "center_coordinate_frame", "result_coordinate_frame"}
+    unknown = set(options) - allowed
+    if unknown:
+        raise ValueError(f"unknown merger_shock_options: {sorted(unknown)}")
+    return _MergerOptions(center_position_unit=info.get("position_unit", "kpc"),
+                  center_coordinate_frame=info.get("coordinate_frame", "physical"),
+                  result_coordinate_frame=info.get("result_coordinate_frame", "physical"), **options).validate()
+
+
+def _merger_column(info, names, n, *, required=True):
+    present = [name for name in names if name in info]
+    if not present:
+        if required:
+            raise ValueError(f"cluster_info requires {names[0]!r}")
+        return np.full(n, math.nan)
+    values = []
+    for name in present:
+        value = np.asarray(info[name], dtype=float)
+        if value.ndim == 0 and n == 1:
+            value = value.reshape(1)
+        if value.shape != (n,):
+            raise ValueError(f"cluster_info[{name!r}] must have shape ({n},)")
+        values.append(value)
+    if any(not np.array_equal(values[0], value, equal_nan=True) for value in values[1:]):
+        raise ValueError(f"conflicting cluster_info aliases {present}")
+    return values[0]
+
+
+def _merger_center_history(iout, info, config):
+    first = np.asarray(_merger_required(info, "ccen1"), dtype=float)
+    if first.shape == (3,):
+        first = first.reshape(1, 3)
+    if first.ndim != 2 or first.shape[1] != 3 or not len(first):
+        raise ValueError("cluster_info['ccen1'] must have shape (N, 3)")
+    n = len(first)
+    if n == 1 and "iout" not in info and "snapshot" not in info:
+        snapshots = np.array([iout])
+    else:
+        numbers = _merger_column(info, ("iout", "snapshot"), n)
+        if not np.all(np.isfinite(numbers)) or np.any(numbers != np.floor(numbers)):
+            raise ValueError("cluster_info snapshot numbers must be finite integers")
+        snapshots = numbers.astype(np.int64)
+    if len(np.unique(snapshots)) != n or iout not in snapshots:
+        raise ValueError("cluster_info snapshot numbers must be unique and include iout")
+    if "ccen2" not in info:
+        raise ValueError("cluster_info requires 'ccen2'; use NaN after secondary termination")
+    second = np.asarray(info["ccen2"], dtype=float) if info["ccen2"] is not None else np.full((n, 3), math.nan)
+    if second.shape == (3,) and n == 1:
+        second = second.reshape(1, 3)
+    if second.shape != first.shape:
+        raise ValueError("cluster_info['ccen2'] must match the shape of ccen1")
+    available = np.all(np.isfinite(second), axis=1)
+    absent = np.all(np.isnan(second), axis=1)
+    if not np.all(np.isfinite(first)) or not np.all(available | absent):
+        raise ValueError("centers must be finite 3-vectors; an absent secondary needs three NaNs")
+    if "secondary_center_available" in info:
+        declared = np.asarray(info["secondary_center_available"])
+        if declared.ndim == 0 and n == 1:
+            declared = declared.reshape(1)
+        if declared.shape != (n,) or declared.dtype.kind != "b" or not np.array_equal(declared, available):
+            raise ValueError("secondary_center_available must be a boolean array matching ccen2")
+    age = _merger_column(info, ("time_gyr", "t_BB"), n)
+    z = _merger_column(info, ("redshift",), n)
+    r1 = _merger_column(info, ("rvir1", "cluster_rvir"), n, required=False)
+    r2 = _merger_column(info, ("rvir2", "cluster_rvir2"), n, required=False)
+    if np.any(np.isinf(r1) | np.isinf(r2)) or np.any((np.isfinite(r1) & (r1 <= 0)) | (np.isfinite(r2) & (r2 <= 0))):
+        raise ValueError("virial radii must be positive or NaN when unavailable")
+    if np.any(absent & np.isfinite(r2)):
+        raise ValueError("rvir2 must be NaN after secondary termination")
+    order = np.argsort(age)
+    if (not np.all(np.isfinite(age)) or np.any(np.diff(age[order]) <= 0) or
+            np.any(np.diff(snapshots[order]) <= 0) or not np.all(np.isfinite(z)) or np.any(np.diff(z[order]) > 0)):
+        raise ValueError("snapshots and cosmic ages must strictly increase; redshift must not increase")
+    ordered_available = available[order]
+    if np.any(np.diff(ordered_available.astype(int)) > 0):
+        raise ValueError("secondary absence must be terminal; interior gaps cannot establish coalescence")
+    if not np.any(available) and np.min(snapshots) <= info.get("secondary_branch_last_snapshot", 875):
+        raise ValueError("an entirely primary-only history must start after secondary_branch_last_snapshot (default 875)")
+    factor = _MERGER_LENGTH_TO_KPC[config.center_position_unit]
+    centers, meta = {}, {}
+    for index in order:
+        snap = int(snapshots[index])
+        radii = tuple(float(r[index]) * factor if np.isfinite(r[index]) else None for r in (r1, r2))
+        centers[snap] = (first[index] * factor, second[index] * factor if available[index] else None,
+                         radii if any(r is not None for r in radii) else None)
+        meta[snap] = {"time_gyr": float(age[index]), "redshift": float(z[index])}
+    history = list(centers)
+    return centers, meta, history
 
 
 def _merger_minimum_image(vec, box_size):
@@ -543,7 +641,7 @@ def _merger_geometry(centers, config):
     c1, c2, _ = centers
     if c2 is None:
         return {"center1": c1, "center2": None, "midpoint": None,
-                "origin": c1.copy(), "propagation_origin_type": "primary_remnant",
+                "origin": c1.copy(), "origin_type": "primary_remnant",
                 "separation_vector": None, "separation_kpc": math.nan,
                 "axis": np.full(3, math.nan), "axis_source": "unavailable",
                 "secondary_center_available": False, "geometry_source": "primary_only_after_secondary_termination",
@@ -552,7 +650,7 @@ def _merger_geometry(centers, config):
     distance = float(np.linalg.norm(sep))
     midpoint = c1 + 0.5 * sep
     return {"center1": c1, "center2": c2, "midpoint": midpoint,
-            "origin": midpoint.copy(), "propagation_origin_type": "two_center_midpoint",
+            "origin": midpoint.copy(), "origin_type": "two_center_midpoint",
             "separation_vector": sep, "separation_kpc": distance,
             "axis": sep / distance if distance > 0 else np.full(3, math.nan),
             "axis_source": "instantaneous_separation" if distance > 0 else "unavailable",
@@ -589,6 +687,23 @@ def _merger_geometry_history(centers, meta, history, config):
     return result
 
 
+def _merger_extraction_bounds(snapshot, centers, config):
+    """Actual NewCluster set_box cube, distinct from the geometry origin."""
+    primary, secondary, _ = centers[snapshot]
+    if snapshot < config.extraction_midpoint_until_snapshot:
+        if secondary is None:
+            raise ValueError("the pre-switch extraction cube requires both measured centers")
+        center = .5*(primary+secondary)
+        origin = "two_center_midpoint"
+    else:
+        center, origin = primary, "primary_center"
+    half = .5*config.extraction_box_length_kpc
+    return {"lower_kpc": (center-half).tolist(), "upper_kpc": (center+half).tolist(),
+            "center_source": origin, "midpoint_until_snapshot": config.extraction_midpoint_until_snapshot,
+            "side_length_kpc": config.extraction_box_length_kpc,
+            "guard_cells": config.boundary_margin_cells}
+
+
 def _merger_verify_epochs(config, centers, meta, history):
     paired = [snap for snap in history if centers[snap][1] is not None]
     distances = np.array([_merger_geometry(centers[s], config)["separation_kpc"] for s in paired])
@@ -597,7 +712,9 @@ def _merger_verify_epochs(config, centers, meta, history):
     overlap = overlap_candidates[0] if overlap_candidates else None
     start = overlap if overlap is not None else 0
     minima = [i for i in range(max(1, start), len(paired) - 1) if distances[i] <= distances[i-1] and distances[i] < distances[i+1]]
-    peri = minima[0] if minima else int(np.argmin(distances[start:]) + start) if len(paired) else None
+    # The supplied center history has small early centroid oscillations.
+    # A first local minimum is not core passage; use the measured minimum.
+    peri = int(np.argmin(distances[start:]) + start) if len(paired) else None
     maxima = [i for i in range(peri + 1, len(paired)-1) if distances[i] >= distances[i-1] and distances[i] > distances[i+1]] if peri is not None else []
     apo = maxima[0] if maxima else None
     found = {"overlap": overlap, "pericenter": peri, "apocenter": apo}
@@ -627,7 +744,7 @@ def _merger_verify_epochs(config, centers, meta, history):
         bracketed_overlap = (name != "overlap" or
             (index > 0 and complete_radii(paired[index - 1]) and
              distances[index - 1] > sum(centers[paired[index - 1]][2])))
-        extremum_bracketed = name != "pericenter" or bool(minima)
+        extremum_bracketed = name != "pericenter" or peri in minima
         report[name] = {"snapshot": snap, "time_gyr": meta[snap]["time_gyr"],
             "redshift": meta[snap]["redshift"], "separation_kpc": distances[index],
             "verified": bool(bracketed_overlap and extremum_bracketed and delta_snap <= config.reference_snapshot_tolerance and delta_z <= config.reference_redshift_tolerance),
@@ -735,10 +852,32 @@ def _merger_compact_results(result, dissipation, *, snapshot=None, chunk_size=13
     return data
 
 
+# AMR connectivity: the same component forest serves both numerical backends.
+class _MergerGroups:
+    """CSR-style membership: two arrays, no array/Python object per component."""
+    def __init__(self, members, offsets):
+        self.members, self.offsets = members, offsets
+
+    def __len__(self):
+        return len(self.offsets)-1
+
+    def __iter__(self):
+        for start, stop in zip(self.offsets[:-1], self.offsets[1:]):
+            yield self.members[start:stop]
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return self.members[self.offsets[index]:self.offsets[index+1]]
+
+
 class _MergerComponents:
-    """Merge bounded edge batches in SciPy, without retaining the full graph."""
-    def __init__(self, n):
+    """One component forest for serial, regional, and reconciled graphs."""
+    def __init__(self, n, backend="scipy"):
         self.parent = np.arange(n, dtype=np.int32 if n <= np.iinfo(np.int32).max else np.int64)
+        self.kernel = _merger_neighbors.merger_neighbor_kernel if backend == "fortran" else None
 
     def roots(self, indices):
         roots = self.parent[indices]
@@ -749,6 +888,30 @@ class _MergerComponents:
             roots = next_roots
         self.parent[indices] = roots
         return roots
+
+    def accept(self, left, right, rows, data, dx, config, same_bucket):
+        """Apply the same exact AMR contact and normal cuts in either backend."""
+        if self.kernel is not None:
+            self.kernel.merge_neighbor_pairs(
+                data["pos"].T, data["dx"], data["normal"].T, rows, left, right, self.parent,
+                config.max_cell_gap_factor, config.minimum_neighbor_normal_cosine,
+                config.box_size_kpc or 0., int(same_bucket))
+            return
+        if same_bucket:
+            use = right > left
+            left, right = left[use], right[use]
+        if not len(left):
+            return
+        reach = .5*(dx[left]+dx[right])+config.max_cell_gap_factor*np.maximum(dx[left], dx[right])
+        a, b = rows[left], rows[right]
+        delta = _merger_minimum_image(data["pos"][a]-data["pos"][b], config.box_size_kpc)
+        close = np.all(np.abs(delta) <= reach[:, None], axis=1)
+        if not np.any(close):
+            return
+        left, right, a, b = left[close], right[close], a[close], b[close]
+        alignment = np.abs(np.einsum("ij,ij->i", data["normal"][a], data["normal"][b]))
+        accepted = alignment >= config.minimum_neighbor_normal_cosine
+        self.merge(left[accepted], right[accepted])
 
     def merge(self, left, right):
         if not len(left):
@@ -780,47 +943,184 @@ def _merger_neighbor_backend(data, config):
     return "fortran" if available and config.neighbor_backend != "scipy" else "scipy"
 
 
-class _MergerFortranComponents(_MergerComponents):
-    """Borrow canonical geometry and union pairs in the optional compiled kernel."""
-    def accept(self, left, right, rows, data, config, same_bucket):
-        _merger_neighbors.merger_neighbor_kernel.merge_neighbor_pairs(
-            data["pos"].T, data["dx"], data["normal"].T, rows, left, right, self.parent,
-            config.max_cell_gap_factor, config.minimum_neighbor_normal_cosine,
-            config.box_size_kpc or 0., int(same_bucket))
+@contextmanager
+def merger_neighbor_pool(workers=4):
+    """Reuse spawn workers across outputs; never serialize this pool in catalogs.
+
+    Set merger_shock_options['neighbor_workers'] separately. Keep the calling
+    loop inside this context and, in a script, inside an if __name__ guard.
+    Geometry is opened read-only from existing memory maps or shared once in
+    RAM. Local parents are private; global reconciliation runs in the caller.
+    """
+    if isinstance(workers, bool) or not isinstance(workers, (int, np.integer)) or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    global _MERGER_NEIGHBOR_POOL
+    previous = _MERGER_NEIGHBOR_POOL
+    with ProcessPoolExecutor(max_workers=int(workers), mp_context=get_context("spawn")) as pool:
+        _MERGER_NEIGHBOR_POOL = (pool, int(workers))
+        try:
+            yield pool
+        finally:
+            _MERGER_NEIGHBOR_POOL = previous
 
 
-def _merger_accept_edges(left, right, rows, data, dx, components, config, same_bucket):
-    if isinstance(components, _MergerFortranComponents):
-        components.accept(left, right, rows, data, config, same_bucket)
-        return
-    if same_bucket:
-        use = right > left
-        left, right = left[use], right[use]
-    if not len(left):
-        return
-    reach = .5*(dx[left]+dx[right])+config.max_cell_gap_factor*np.maximum(dx[left], dx[right])
-    a, b = rows[left], rows[right]
-    delta = _merger_minimum_image(data["pos"][a]-data["pos"][b], config.box_size_kpc)
-    close = np.all(np.abs(delta) <= reach[:, None], axis=1)
-    if not np.any(close):
-        return
-    left, right, a, b = left[close], right[close], a[close], b[close]
-    alignment = np.abs(np.einsum("ij,ij->i", data["normal"][a], data["normal"][b]))
-    accepted = alignment >= config.minimum_neighbor_normal_cosine
-    components.merge(left[accepted], right[accepted])
+def _merger_partition_rows(data, rows, workers, config):
+    """Balanced open slabs plus conservative AMR ghost coverage.
+
+    Any accepted i,j pair satisfies |x_i-x_j| <= .5*(dx_i+dx_j)
+    + gap*max(dx_i,dx_j) on the chosen axis. Expanding EACH core's measured
+    interval by the maximum possible reach therefore contains all its edges.
+    No artificial cut or exterior wrapping is applied to the local kernels.
+    """
+    lower, upper = np.full(3, np.inf), np.full(3, -np.inf)
+    for start in range(0, len(rows), config.cell_chunk_size):
+        block = data["pos"][rows[start:start+config.cell_chunk_size]]
+        lower, upper = np.minimum(lower, block.min(axis=0)), np.maximum(upper, block.max(axis=0))
+    axis = int(np.argmax(upper-lower))
+    coordinate = data["pos"][rows, axis]
+    order = np.argsort(coordinate, kind="stable")
+    ordered, coordinate = rows[order], coordinate[order]
+    maximum_dx = float(np.max(data["dx"][rows]))
+    regions = []
+    for core in np.array_split(ordered, workers):
+        lo, hi = data["pos"][core[[0, -1]], axis]
+        core_dx = float(np.max(data["dx"][core]))
+        reach = .5*(core_dx+maximum_dx)+config.max_cell_gap_factor*max(core_dx, maximum_dx)
+        begin = np.searchsorted(coordinate, np.nextafter(lo-reach, -np.inf), side="left")
+        end = np.searchsorted(coordinate, np.nextafter(hi+reach, np.inf), side="right")
+        regions.append(np.sort(ordered[begin:end]))
+    return regions, axis
 
 
-def _merger_group_cells(data, config):
-    """Exact AMR cube contact + normal cut, with bounded neighbor workspace."""
+@contextmanager
+def _merger_shared_geometry(data):
+    """Borrow mapped inputs, or copy each geometry field into shared RAM once."""
+    descriptions, owners = {}, []
+    try:
+        for name in ("pos", "dx", "normal"):
+            source = data[name]
+            if isinstance(source, np.memmap) and source.dtype == np.float64 and source.flags.c_contiguous:
+                base = source
+                while isinstance(base.base, np.memmap):
+                    base = base.base
+                offset = int(base.offset+source.ctypes.data-base.ctypes.data)
+                descriptions[name] = ("mmap", str(Path(source.filename).resolve()), source.shape,
+                                      source.dtype.str, offset)
+            else:
+                owner = shared_memory.SharedMemory(create=True, size=source.size*8)
+                owners.append(owner)
+                np.ndarray(source.shape, dtype=np.float64, buffer=owner.buf)[:] = source
+                descriptions[name] = ("shared", owner.name, source.shape, np.dtype(np.float64).str, 0)
+        yield descriptions
+    finally:
+        for owner in owners:
+            owner.close()
+            owner.unlink()
+
+
+def _merger_region_worker(descriptions, rows, configuration):
+    data, owners = {}, []
+    try:
+        for name, (kind, address, shape, dtype, offset) in descriptions.items():
+            if kind == "mmap":
+                data[name] = np.memmap(address, mode="r", shape=shape, dtype=np.dtype(dtype), offset=offset)
+            else:
+                owner = shared_memory.SharedMemory(name=address)
+                owners.append(owner)
+                data[name] = np.ndarray(shape, dtype=np.dtype(dtype), buffer=owner.buf)
+            data[name].flags.writeable = False
+        config = _MergerOptions(**configuration)
+        roots = _merger_connect_rows(data, rows, config, config.neighbor_backend)
+        # Include ALL ghost labels. Returning only core-to-root links can lose
+        # an edge when the two local components have different ghost roots.
+        return rows, rows[roots]
+    finally:
+        data.clear()
+        for owner in owners:
+            owner.close()
+
+
+def _merger_parallel_labels(data, rows, config, diagnostics):
+    workers = min(config.neighbor_workers, len(rows))
+    if _MERGER_NEIGHBOR_POOL is not None:
+        workers = min(workers, _MERGER_NEIGHBOR_POOL[1])
+    if workers < 2:
+        diagnostics["reason"] = "one_available_worker"
+        return None
+    regions, axis = _merger_partition_rows(data, rows, workers, config)
+    ratio = sum(map(len, regions))/len(rows)
+    diagnostics.update(partition_axis=axis, halo_ratio=ratio)
+    if ratio > config.neighbor_max_halo_ratio:
+        diagnostics["reason"] = "excessive_ghost_overlap"
+        return None
+    backend = _merger_neighbor_backend(data, config)
+    components = _MergerComponents(len(data["dx"]), backend)
+    configuration = dict(vars(config), neighbor_backend=backend)
+    reused_pool = _MERGER_NEIGHBOR_POOL is not None
+    with _merger_shared_geometry(data) as descriptions:
+        diagnostics["input_transport"] = ("memory_map" if all(v[0] == "mmap" for v in descriptions.values())
+                                          else "shared_memory")
+        pool_context = (nullcontext(_MERGER_NEIGHBOR_POOL[0]) if reused_pool else
+                        ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")))
+        with pool_context as pool:
+            pending = set()
+            try:
+                for region in regions:
+                    pending.add(pool.submit(_merger_region_worker, descriptions, region, configuration))
+                for future in as_completed(pending):
+                    members, labels = future.result()
+                    if components.kernel is not None and hasattr(components.kernel, "merge_component_labels"):
+                        components.kernel.merge_component_labels(members, labels, components.parent)
+                    else:
+                        for start in range(0, len(members), config.max_neighbor_pairs):
+                            part = slice(start, start+config.max_neighbor_pairs)
+                            components.merge(members[part], labels[part])
+                    pending.remove(future)
+                    del members, labels
+            finally:
+                # Drain workers before releasing shared inputs, including when
+                # an exception occurs in a borrowed pool that remains alive.
+                for future in pending:
+                    future.cancel()
+                wait(pending)
+    diagnostics.update(workers_used=workers, regions=len(regions), reason="parallel",
+                       reused_pool=reused_pool)
+    return components.roots(rows)
+
+
+def _merger_group_cells(data, config, *, diagnostics=None):
+    """Exact grouping; reconcile internal slabs before any outer-edge exclusion."""
+    diagnostics = {} if diagnostics is None else diagnostics
+    diagnostics.update(workers_requested=config.neighbor_workers, workers_used=1, reason="serial")
     valid = data["valid"]
     index_dtype = np.int32 if len(valid) <= np.iinfo(np.int32).max else np.int64
     all_valid = bool(np.all(valid))
     rows = np.arange(len(valid), dtype=index_dtype) if all_valid else np.flatnonzero(valid).astype(index_dtype)
     if len(rows) == 0:
         return []
-    dx = data["dx"] if all_valid else data["dx"][rows]
     backend = _merger_neighbor_backend(data, config)
-    components = (_MergerFortranComponents if backend == "fortran" else _MergerComponents)(len(rows))
+    roots = None
+    if config.neighbor_workers > 1:
+        if config.box_size_kpc is not None:
+            raise ValueError("multiprocessing partitions support open extracted cubes only")
+        if len(rows) < config.neighbor_min_parallel_cells:
+            diagnostics["reason"] = "below_parallel_size_threshold"
+        else:
+            roots = _merger_parallel_labels(data, rows, config, diagnostics)
+    if roots is None:
+        roots = _merger_connect_rows(data, rows, config, backend)
+    order = np.argsort(roots, kind="stable")
+    sorted_roots = roots[order]
+    cuts = np.flatnonzero(sorted_roots[1:] != sorted_roots[:-1])+1
+    return _MergerGroups(rows[order], np.r_[0, cuts, len(rows)].astype(index_dtype))
+
+
+def _merger_connect_rows(data, rows, config, backend):
+    """Private local parents; same AMR contact/normal kernel in every region."""
+    index_dtype = rows.dtype
+    all_valid = len(rows) == len(data["dx"])
+    dx = data["dx"] if all_valid else data["dx"][rows]
+    components = _MergerComponents(len(rows), backend)
     # AMR-scale trees keep fine-cell searches local even when a few coarse
     # cells are present in the same snapshot.
     levels = np.empty(len(rows), dtype=np.int32)
@@ -836,8 +1136,8 @@ def _merger_group_cells(data, config):
     for a, (source_indices, _, _) in enumerate(buckets):
         for b in range(a, len(buckets)):
             target_indices, tree, target_max_dx = buckets[b]
-            if backend == "fortran":
-                status = _merger_neighbors.merger_neighbor_kernel.connect_bucket(
+            if components.kernel is not None:
+                status = components.kernel.connect_bucket(
                     data["pos"].T, data["dx"], data["normal"].T, rows,
                     source_indices, target_indices, components.parent,
                     config.max_cell_gap_factor, config.minimum_neighbor_normal_cosine,
@@ -862,61 +1162,104 @@ def _merger_group_cells(data, config):
                 # the old sqrt(3) spherical search returned extra neighbors.
                 radii = (0.5 * (dx[chunk] + target_max_dx) +
                     config.max_cell_gap_factor * np.maximum(dx[chunk], target_max_dx))
-                counts = tree.query_ball_point(points, radii, p=np.inf, return_length=True)
-                cumulative = np.r_[0, np.cumsum(counts)]
-                lo = 0
-                while lo < len(chunk):
-                    if counts[lo] > config.max_neighbor_pairs:
-                        # Even ONE unusually dense neighborhood must not create
-                        # an unbounded Python list. Scan its target bucket in
-                        # bounded blocks with the exact same acceptance cuts.
-                        for k in range(0, len(target_indices), config.max_neighbor_pairs):
-                            right = target_indices[k:k+config.max_neighbor_pairs]
-                            left = np.full(len(right), chunk[lo], dtype=index_dtype)
-                            _merger_accept_edges(left, right, rows, data, dx, components, config, a == b)
-                        lo += 1
-                        continue
-                    hi = int(np.searchsorted(cumulative, cumulative[lo]+config.max_neighbor_pairs, side="right")-1)
-                    hi = min(max(lo+1, hi), len(chunk))
-                    neighborhoods = tree.query_ball_point(points[lo:hi], radii[lo:hi], p=np.inf)
-                    total = int(np.sum(counts[lo:hi]))
-                    if total:
-                        local = np.concatenate(neighborhoods).astype(index_dtype, copy=False)
-                        left = np.repeat(chunk[lo:hi], counts[lo:hi])
-                        right = target_indices[local]
-                        _merger_accept_edges(left, right, rows, data, dx, components, config, a == b)
-                    lo = hi
+                for left, right in _merger_tree_pairs(tree, target_indices, chunk, points, radii,
+                                                       config.max_neighbor_pairs):
+                    components.accept(left, right, rows, data, dx, config, a == b)
     del buckets
-    roots = components.roots(np.arange(len(rows), dtype=index_dtype))
-    order = np.argsort(roots, kind="stable")
-    cuts = np.flatnonzero(np.diff(roots[order])) + 1
-    return [rows[group] for group in np.split(order, cuts)]
+    return components.roots(np.arange(len(rows), dtype=index_dtype))
 
 
-def _merger_summarize_front(rows, data, geom, snapshot, time_gyr, redshift, config):
-    area = data["area"][rows]
-    weights = area / area.sum()
-    center, normal_sum = np.zeros(3), np.zeros(3)
-    lower, upper = np.full(3, np.inf), np.full(3, -np.inf)
-    reference = data["normal"][rows[np.argmax(area)]]
-    anchor = data["pos"][rows[0]]
-    unwrapped = False
-    for start in range(0, len(rows), config.cell_chunk_size):
-        chunk = slice(start, start+config.cell_chunk_size)
-        take = rows[chunk]
-        pos, dx = data["pos"][take], data["dx"][take]
-        if config.box_size_kpc is not None:
-            local = anchor+_merger_minimum_image(pos-anchor, config.box_size_kpc)
-            unwrapped |= bool(np.any(local != pos))
-            pos = local
-        center += np.sum(pos*weights[chunk, None], axis=0)
-        lower = np.minimum(lower, np.min(pos-dx[:, None]/2, axis=0))
-        upper = np.maximum(upper, np.max(pos+dx[:, None]/2, axis=0))
-        normals = data["normal"][take]
-        normals *= np.where(normals@reference < 0, -1., 1.)[:, None]
-        normal_sum += np.sum(normals*area[chunk, None], axis=0)
+def _merger_tree_pairs(tree, targets, sources, points, radii, budget):
+    """Yield bounded candidate pairs; even one dense query stays within budget."""
+    counts = tree.query_ball_point(points, radii, p=np.inf, return_length=True)
+    cumulative = np.r_[0, np.cumsum(counts)]
+    lo = 0
+    while lo < len(sources):
+        if counts[lo] > budget:
+            # Avoid an unbounded Python neighbor list for a dense single cell.
+            for start in range(0, len(targets), budget):
+                right = targets[start:start+budget]
+                yield np.full(len(right), sources[lo], dtype=sources.dtype), right
+            lo += 1
+            continue
+        hi = int(np.searchsorted(cumulative, cumulative[lo]+budget, side="right")-1)
+        hi = min(max(lo+1, hi), len(sources))
+        neighborhoods = tree.query_ball_point(points[lo:hi], radii[lo:hi], p=np.inf)
+        if np.sum(counts[lo:hi]):
+            local = np.concatenate(neighborhoods).astype(sources.dtype, copy=False)
+            yield np.repeat(sources[lo:hi], counts[lo:hi]), targets[local]
+        lo = hi
+
+
+# Front measurements and snapshot evidence.
+def _merger_geometry_kernel(data, config):
+    kernel = None if _merger_neighbors is None else _merger_neighbors.merger_neighbor_kernel
+    if (config.neighbor_backend != "scipy" and config.box_size_kpc is None
+            and len(data["dx"]) <= np.iinfo(np.int32).max
+            and kernel is not None and hasattr(kernel, "measure_geometry")):
+        return kernel
+    return None
+
+
+def _merger_measure_fronts(groups, data, geom, snapshot, metadata, config, extraction):
+    """Keep detailed cell IDs in membership and compact summaries per front."""
+    fronts, fingerprints = [], []
+    labels = np.full(len(data["retained_row"]), -1, dtype=np.int32)
+    timings = {"summarize": 0., "fingerprint": 0.}
+    for group_index, rows in enumerate(groups):
+        stage = time.perf_counter()
+        front = _merger_summarize_front(rows, data, geom, snapshot, metadata["time_gyr"],
+                                        metadata["redshift"], config, extraction=extraction)
+        front["representative_shock_id"] = int(np.min(data["retained_row"][rows]))
+        labels[rows] = group_index
+        timings["summarize"] += time.perf_counter()-stage
+        stage = time.perf_counter()
+        fingerprints.append(_merger_group_fingerprint(rows, data, config.cell_chunk_size))
+        timings["fingerprint"] += time.perf_counter()-stage
+        del front["rows"]
+        fronts.append(front)
+    fingerprints = tuple(fingerprints)
+    membership = {"shock_id": data["retained_row"], "input_cell_id": data["cell_id"],
+                  "front_index": labels, "source_fingerprint": fingerprints}
+    return fronts, membership, timings
+
+
+def _merger_summarize_front(rows, data, geom, snapshot, time_gyr, redshift, config, *, extraction=None):
+    kernel = _merger_geometry_kernel(data, config)
+    if kernel is not None:
+        area_sum, center, normal_sum, lower, upper, guarded_lower, guarded_upper = kernel.measure_geometry(
+            data["pos"].T, data["dx"], data["normal"].T, data["area"], rows, config.boundary_margin_cells)
+        unwrapped = False
+    else:
+        area = data["area"][rows]
+        area_sum = float(area.sum())
+        center, normal_sum = np.zeros(3), np.zeros(3)
+        lower, upper = np.full(3, np.inf), np.full(3, -np.inf)
+        guarded_lower, guarded_upper = np.full(3, np.inf), np.full(3, -np.inf)
+        reference = data["normal"][rows[np.argmax(area)]]
+        anchor = data["pos"][rows[0]]
+        unwrapped = False
+        for start in range(0, len(rows), config.cell_chunk_size):
+            chunk = slice(start, start+config.cell_chunk_size)
+            take = rows[chunk]
+            pos, dx = data["pos"][take], data["dx"][take]
+            if config.box_size_kpc is not None:
+                local = anchor+_merger_minimum_image(pos-anchor, config.box_size_kpc)
+                unwrapped |= bool(np.any(local != pos))
+                pos = local
+            center += np.sum(pos*(area[chunk, None]/area_sum), axis=0)
+            lower = np.minimum(lower, np.min(pos-dx[:, None]/2, axis=0))
+            upper = np.maximum(upper, np.max(pos+dx[:, None]/2, axis=0))
+            if extraction is not None:
+                reach = (.5+config.boundary_margin_cells)*dx[:, None]
+                guarded_lower = np.minimum(guarded_lower, np.min(pos-reach, axis=0))
+                guarded_upper = np.maximum(guarded_upper, np.max(pos+reach, axis=0))
+            normals = data["normal"][take]
+            normals *= np.where(normals@reference < 0, -1., 1.)[:, None]
+            normal_sum += np.sum(normals*area[chunk, None], axis=0)
+        del area
     extent = upper - lower
-    mean = normal_sum/area.sum()
+    mean = normal_sum/area_sum
     coherence = float(np.linalg.norm(mean))
     normal = mean/max(coherence, 1.e-300)
     origin_vector = _merger_minimum_image(center - geom["origin"], config.box_size_kpc)
@@ -929,9 +1272,17 @@ def _merger_summarize_front(rows, data, geom, snapshot, time_gyr, redshift, conf
     mach = data["mach"][rows]
     mach_min, mach_max = float(np.min(mach)), float(np.max(mach))
     mach_p10, mach_median, mach_p90 = np.quantile(mach, (.1, .5, .9), overwrite_input=True)
-    total = data["total"][rows]
-    flux = data["flux"][rows]
+    del mach
     flags = list(geom["quality_flags"])
+    boundary_faces = ()
+    if extraction is not None:
+        box_lower, box_upper = np.asarray(extraction["lower_kpc"]), np.asarray(extraction["upper_kpc"])
+        boundary_faces = tuple(name for a, axis in enumerate("xyz")
+                               for name, touch in ((axis+"min", guarded_lower[a] <= box_lower[a]),
+                                                   (axis+"max", guarded_upper[a] >= box_upper[a])) if touch)
+        if boundary_faces:
+            touches = np.any(lower <= box_lower) or np.any(upper >= box_upper)
+            flags.append("extraction_boundary_intersection" if touches else "extraction_boundary_guard")
     if len(rows) < config.minimum_front_cells:
         flags.append("few_cells")
     if data["validation_unknown"]:
@@ -945,19 +1296,23 @@ def _merger_summarize_front(rows, data, geom, snapshot, time_gyr, redshift, conf
         if np.any(np.sign(data["normal"][rows[start:start+config.cell_chunk_size]]@normal) != reference_sign):
             flags.append("normal_signs_mixed")
             break
+    total = data["total"][rows]
     total_sum = float(np.sum(total))
     total_median = float(np.median(total, overwrite_input=True))
+    del total
+    flux = data["flux"][rows]
     flux_median = float(np.median(flux, overwrite_input=True))
+    del flux
     return {
         "snapshot": snapshot, "time_gyr": time_gyr, "redshift": redshift,
-        "front_id": "", "track_id": "", "previous_front_id": "", "next_front_id": "",
         "cell_count": int(len(rows)), "rows": rows,
         "center_x_kpc": float(center[0]), "center_y_kpc": float(center[1]), "center_z_kpc": float(center[2]),
         "xmin_kpc": float(lower[0]), "xmax_kpc": float(upper[0]),
         "ymin_kpc": float(lower[1]), "ymax_kpc": float(upper[1]),
         "zmin_kpc": float(lower[2]), "zmax_kpc": float(upper[2]),
         "extent_x_kpc": float(extent[0]), "extent_y_kpc": float(extent[1]), "extent_z_kpc": float(extent[2]),
-        "max_extent_kpc": float(np.max(extent)), "area_kpc2": float(np.sum(area)),
+        "max_extent_kpc": float(np.max(extent)), "area_kpc2": float(area_sum),
+        "boundary_excluded": bool(boundary_faces), "boundary_faces": boundary_faces,
         "distance_center1_kpc": distances[0], "distance_center2_kpc": distances[1],
         "center1_x_kpc": float(geom["center1"][0]), "center1_y_kpc": float(geom["center1"][1]), "center1_z_kpc": float(geom["center1"][2]),
         "center2_x_kpc": float(second_center[0]), "center2_y_kpc": float(second_center[1]), "center2_z_kpc": float(second_center[2]),
@@ -966,7 +1321,7 @@ def _merger_summarize_front(rows, data, geom, snapshot, time_gyr, redshift, conf
         "axis_reference_snapshot": geom.get("axis_reference_snapshot"),
         "axis_reference_time_gyr": geom.get("axis_reference_time_gyr"),
         "axis_age_gyr": geom.get("axis_age_gyr", math.nan),
-        "propagation_origin_type": geom["propagation_origin_type"],
+        "origin_type": geom["origin_type"],
         "origin_x_kpc": float(geom["origin"][0]), "origin_y_kpc": float(geom["origin"][1]), "origin_z_kpc": float(geom["origin"][2]),
         "distance_origin_kpc": float(np.linalg.norm(origin_vector)),
         "distance_midpoint_kpc": float(np.linalg.norm(origin_vector)) if geom["midpoint"] is not None else math.nan,
@@ -982,326 +1337,62 @@ def _merger_summarize_front(rows, data, geom, snapshot, time_gyr, redshift, conf
         "dissipation_total_erg_s": total_sum,
         "dissipation_median_erg_s": total_median,
         "dissipation_flux_median_erg_s_kpc2": flux_median,
-        "propagation_x": math.nan, "propagation_y": math.nan, "propagation_z": math.nan,
-        "propagation_speed_kpc_gyr": math.nan, "propagation_speed_km_s": math.nan,
-        "outward_axis_speed_kpc_gyr": math.nan, "outward_radial_speed_kpc_gyr": math.nan,
         "merger_evidence_score": math.nan, "confidence": "", "classification": "",
         "uncertain": True, "quality_flags": flags,
     }
-
-
-def _merger_front_center(front):
-    return np.array([front[f"center_{a}_kpc"] for a in "xyz"])
 
 
 def _merger_front_normal(front):
     return np.array([front[f"normal_{a}"] for a in "xyz"])
 
 
-def _merger_front_origin(front):
-    return np.array([front[f"origin_{a}_kpc"] for a in "xyz"])
-
-
 def _merger_front_axis(front):
     return np.array([front[f"axis_{a}"] for a in "xyz"])
 
 
-def _merger_link_fronts(by_snapshot, entries, meta, config):
-    previous = []
-    previous_time = None
-    for entry in entries:
-        snap = entry["snapshot"]
-        current = by_snapshot[snap]
-        for front in current:
-            front["front_id"] = f"{snap}:{front['representative_shock_id']}"
-        dt = None if previous_time is None else meta[snap]["time_gyr"] - previous_time
-        matches = []
-        if previous and current and dt is not None and 0 < dt <= config.max_link_interval_gyr:
-            old_centers = np.array([_merger_front_center(front) for front in previous])
-            new_centers = np.array([_merger_front_center(front) for front in current])
-            if config.box_size_kpc is None:
-                tree = cKDTree(new_centers)
-                query_centers = old_centers
-            else:
-                tree = cKDTree(new_centers % config.box_size_kpc, boxsize=config.box_size_kpc)
-                query_centers = old_centers % config.box_size_kpc
-            radii = config.max_front_speed_kpc_gyr * dt + 0.5 * (
-                np.array([front["max_extent_kpc"] for front in previous]) +
-                max(front["max_extent_kpc"] for front in current))
-            neighborhoods = tree.query_ball_point(query_centers, radii)
-            edges = []
-            old_degree = np.zeros(len(previous), dtype=np.int32)
-            new_degree = np.zeros(len(current), dtype=np.int32)
-            for i, old in enumerate(previous):
-                for j in neighborhoods[i]:
-                    new = current[j]
-                    distance = np.linalg.norm(_merger_minimum_image(_merger_front_center(new) - _merger_front_center(old), config.box_size_kpc))
-                    allowance = config.max_front_speed_kpc_gyr * dt + 0.5 * (old["max_extent_kpc"] + new["max_extent_kpc"])
-                    normal_cos = abs(float(_merger_front_normal(old) @ _merger_front_normal(new)))
-                    same_origin_type = old["propagation_origin_type"] == new["propagation_origin_type"]
-                    axis = _merger_front_axis(new)
-                    branch_change = False
-                    if same_origin_type and np.all(np.isfinite(axis)):
-                        # Compare both fronts in one axis frame; rotation of
-                        # the instantaneous separation axis is not propagation.
-                        old_coordinate = _merger_minimum_image(_merger_front_center(old) - _merger_front_origin(old), config.box_size_kpc) @ axis
-                        new_coordinate = _merger_minimum_image(_merger_front_center(new) - _merger_front_origin(new), config.box_size_kpc) @ axis
-                        branch_change = old_coordinate * new_coordinate < 0
-                    if distance <= allowance and normal_cos >= config.minimum_neighbor_normal_cosine and not branch_change:
-                        cost = distance / allowance + 0.5 * (1 - normal_cos) + 0.1 * abs(math.log(new["mach_median"] / old["mach_median"]))
-                        edges.append((cost, i, j))
-                        old_degree[i] += 1
-                        new_degree[j] += 1
-            used_old, used_new = set(), set()
-            for _, i, j in sorted(edges):
-                if i not in used_old and j not in used_new:
-                    matches.append((i, j))
-                    used_old.add(i)
-                    used_new.add(j)
-            for i, j in matches:
-                if old_degree[i] > 1 or new_degree[j] > 1:
-                    previous[i]["quality_flags"].append("ambiguous_temporal_link")
-                    current[j]["quality_flags"].append("ambiguous_temporal_link")
-        linked_new = set()
-        for i, j in matches:
-            old, new = previous[i], current[j]
-            new["track_id"] = old["track_id"]
-            new["previous_front_id"] = old["front_id"]
-            old["next_front_id"] = new["front_id"]
-            displacement = _merger_minimum_image(_merger_front_center(new) - _merger_front_center(old), config.box_size_kpc)
-            speed = float(np.linalg.norm(displacement) / dt)
-            new["propagation_speed_kpc_gyr"] = speed
-            new["propagation_speed_km_s"] = speed * _MERGER_KPC_PER_GYR_TO_KMS
-            if speed > 0:
-                direction = displacement / np.linalg.norm(displacement)
-                for axis, value in zip("xyz", direction):
-                    new[f"propagation_{axis}"] = float(value)
-            if old["propagation_origin_type"] == new["propagation_origin_type"]:
-                origin_displacement = _merger_minimum_image(_merger_front_origin(new) - _merger_front_origin(old), config.box_size_kpc)
-                relative_displacement = displacement - origin_displacement
-                axis = _merger_front_axis(new)
-                if np.all(np.isfinite(axis)):
-                    old_coordinate = _merger_minimum_image(_merger_front_center(old) - _merger_front_origin(old), config.box_size_kpc) @ axis
-                    new_coordinate = _merger_minimum_image(_merger_front_center(new) - _merger_front_origin(new), config.box_size_kpc) @ axis
-                    branch = np.sign(new_coordinate) if new_coordinate != 0 else np.sign(old_coordinate)
-                    new["outward_axis_speed_kpc_gyr"] = float(branch * (relative_displacement @ axis) / dt)
-                new["outward_radial_speed_kpc_gyr"] = float((new["distance_origin_kpc"] - old["distance_origin_kpc"]) / dt)
-            else:
-                # Keep the link and absolute velocity, but the midpoint-to-
-                # remnant origin change cannot supply an outward velocity.
-                new["quality_flags"].append("propagation_origin_transition")
-            linked_new.add(j)
-        for j, front in enumerate(current):
-            if j not in linked_new:
-                front["track_id"] = front["front_id"]
-        previous, previous_time = current, meta[snap]["time_gyr"]
-
-
-def _merger_score_fronts(by_snapshot, epochs, config):
-    fronts = [front for group in by_snapshot.values() for front in group]
-    if not fronts:
-        return None
-    counts = {}
-    births = {}
-    motions = {}
+def _merger_score_fronts(fronts, epochs, config):
+    """Score measured snapshot evidence without temporal links or history state."""
     for front in fronts:
-        counts[front["track_id"]] = counts.get(front["track_id"], 0) + 1
-        if front["track_id"] not in births or front["time_gyr"] < births[front["track_id"]]["time_gyr"]:
-            births[front["track_id"]] = front
-        if math.isfinite(front["outward_axis_speed_kpc_gyr"]):
-            front["outward_motion_basis"] = "axis"
-            motions.setdefault(front["track_id"], []).append(front["outward_axis_speed_kpc_gyr"])
-        elif math.isfinite(front["outward_radial_speed_kpc_gyr"]):
-            front["outward_motion_basis"] = "radial"
-            motions.setdefault(front["track_id"], []).append(front["outward_radial_speed_kpc_gyr"])
-        else:
-            front["outward_motion_basis"] = "unmeasured"
-    positive_diss = [f["dissipation_total_erg_s"] for f in fronts if f["dissipation_total_erg_s"] > 0]
+        if front.get("boundary_excluded", False):
+            front.update({f"evidence_{name}": math.nan for name in _MERGER_EVIDENCE_NAMES})
+            front.update(merger_evidence_score=math.nan, confidence="low",
+                         classification="excluded_boundary", uncertain=True)
+    usable = [f for f in fronts if not f.get("boundary_excluded", False)]
+    positive_diss = [f["dissipation_total_erg_s"] for f in usable if f["dissipation_total_erg_s"] > 0]
     diss_scale = float(np.quantile(positive_diss, 0.75)) if positive_diss else math.nan
     passage = epochs["pericenter"].get("time_gyr")
-    epoch_verified = bool(epochs["pericenter"]["verified"])
-    for front in fronts:
-        temporal = 0.5 if passage is None else float(np.clip(0.5 + (front["time_gyr"] - passage) / (2 * config.passage_window_gyr), 0, 1))
-        spatial = min(1.0, front["max_extent_kpc"] / config.cluster_extent_kpc)
+    for front in usable:
+        epoch = 0.5 if passage is None else float(np.clip(
+            0.5 + (front["time_gyr"] - passage) / (2 * config.passage_window_gyr), 0, 1))
+        extent = min(1.0, front["max_extent_kpc"] / config.cluster_extent_kpc)
         coherence = front["normal_coherence"]
         if math.isfinite(front["axis_offset_kpc"]):
             orientation = abs(float(_merger_front_normal(front) @ _merger_front_axis(front)))
             axis = math.exp(-0.5 * (front["axis_offset_kpc"] / config.axis_offset_scale_kpc) ** 2) * orientation
         else:
-            axis = 0.5  # unavailable geometry supplies neutral evidence
-        continuity = min(1.0, counts[front["track_id"]] / config.minimum_track_length)
-        birth = births[front["track_id"]]
-        front["track_length_outputs"] = counts[front["track_id"]]
-        front["track_birth_time_gyr"] = birth["time_gyr"]
-        front["track_birth_distance_midpoint_kpc"] = birth["distance_midpoint_kpc"]
-        front["track_birth_origin_type"] = birth["propagation_origin_type"]
-        front["track_birth_distance_origin_kpc"] = birth["distance_origin_kpc"]
-        launch_unknown = birth["propagation_origin_type"] != "two_center_midpoint"
-        origin = 0.5 if launch_unknown else math.exp(-0.5 * (birth["distance_midpoint_kpc"] / config.origin_scale_kpc) ** 2)
-        if passage is not None and birth["time_gyr"] > passage + config.passage_window_gyr:
-            origin = 0.5  # coverage does not show the front's launch region
-            launch_unknown = True
-        track_motions = motions.get(front["track_id"], [])
-        outward_fraction = float(np.mean(np.asarray(track_motions) > 0)) if track_motions else math.nan
-        front["outward_step_fraction"] = outward_fraction
-        motion_score = 0.5 if len(track_motions) < 2 else outward_fraction
-        diss = 0.0 if not positive_diss else float(np.clip(math.log1p(front["dissipation_total_erg_s"]) / math.log1p(diss_scale), 0, 1))
-        front.update({"evidence_epoch": temporal, "evidence_extent": spatial,
-            "evidence_normal": coherence, "evidence_axis": axis,
-            "evidence_continuity": continuity, "evidence_outward_motion": motion_score,
-            "evidence_dissipation": diss, "evidence_origin": origin})
-        # Weak criteria can be offset by strong independent evidence.
-        score = 0.12 * temporal + 0.14 * spatial + 0.14 * coherence + 0.18 * axis + 0.14 * continuity + 0.10 * motion_score + 0.10 * diss + 0.08 * origin
+            axis = 0.5  # Unavailable geometry supplies neutral evidence.
+        diss = 0.0 if not positive_diss else float(np.clip(
+            math.log1p(front["dissipation_total_erg_s"]) / math.log1p(diss_scale), 0, 1))
+        front.update(evidence_epoch=epoch, evidence_extent=extent,
+                     evidence_normal=coherence, evidence_axis=axis, evidence_dissipation=diss)
+        score = (0.12 * epoch + 0.14 * extent + 0.14 * coherence + 0.18 * axis + 0.10 * diss) / 0.68
         front["merger_evidence_score"] = float(score)
         flags = front["quality_flags"]
-        if not epoch_verified:
-            flags.append("pericenter_reference_unverified")
-        if not epochs["overlap"]["verified"]:
-            flags.append("overlap_reference_unverified")
-        if not epochs["apocenter"]["verified"]:
-            flags.append("apocenter_reference_unverified")
-        if front["outward_motion_basis"] == "unmeasured":
-            flags.append("propagation_unmeasured")
-        if len(track_motions) < 2:
-            flags.append("outward_motion_short_baseline")
-        if counts[front["track_id"]] < config.minimum_track_length:
-            flags.append("short_track")
+        for name in ("pericenter", "overlap", "apocenter"):
+            if not epochs[name]["verified"]:
+                flags.append(f"{name}_reference_unverified")
+        flags.extend(("propagation_unmeasured", "snapshot_only"))
         if not positive_diss:
             flags.append("dissipation_reference_unavailable")
         if not config.thresholds_calibrated:
             flags.append("thresholds_not_calibrated")
-        if launch_unknown:
-            flags.append("launch_region_not_observed")
-        if score >= config.candidate_score:
-            label = "candidate"
-        elif score >= config.uncertain_score:
-            label = "uncertain"
-        else:
-            label = "unclassified"
+        label = ("candidate" if score >= config.candidate_score else
+                 "uncertain" if score >= config.uncertain_score else "unclassified")
         front["classification"] = label
-        confidence_flags = {"validation_unavailable", "few_cells", "low_normal_coherence",
-                            "ambiguous_temporal_link", "short_track", "outward_motion_short_baseline",
-                            "launch_region_not_observed", "dissipation_reference_unavailable",
-                            "thresholds_not_calibrated", "secondary_center_unavailable",
-                            "axis_carried_forward", "merger_axis_unavailable", "propagation_origin_transition"}
-        front["uncertain"] = bool(label != "candidate" or not epoch_verified or confidence_flags.intersection(flags))
-        front["confidence"] = ("high" if label == "candidate" and not front["uncertain"] and counts[front["track_id"]] >= config.minimum_track_length else
-                               "medium" if label == "candidate" else "low")
+        # Geometry/epoch agreement alone cannot establish merger causality.
+        front["uncertain"] = True
+        front["confidence"] = "medium" if label == "candidate" else "low"
     return diss_scale if math.isfinite(diss_scale) else None
-
-
-def _merger_config(info):
-    options = copy.deepcopy(dict(info.get("merger_shock_options", {})))
-    allowed = {f.name for f in fields(_MergerOptions)} - {
-        "center_position_unit", "center_coordinate_frame", "result_coordinate_frame"}
-    unknown = set(options) - allowed
-    if unknown:
-        raise ValueError(f"unknown merger_shock_options: {sorted(unknown)}")
-    return _MergerOptions(center_position_unit=info.get("position_unit", "kpc"),
-                  center_coordinate_frame=info.get("coordinate_frame", "physical"),
-                  result_coordinate_frame=info.get("result_coordinate_frame", "physical"), **options).validate()
-
-
-def _merger_same_scientific_options(left, right):
-    # Workspace/selection settings can change between outputs without changing
-    # front geometry or evidence. Fill defaults for saved version-2 states.
-    performance = {"spatial_query_chunk", "cell_chunk_size", "max_neighbor_pairs", "expand_candidate_cells", "neighbor_backend"}
-    normalize = lambda values: {k: v for k, v in vars(_MergerOptions(**values)).items() if k not in performance}
-    return normalize(left) == normalize(right)
-
-
-def _merger_column(info, names, n, *, required=True):
-    present = [name for name in names if name in info]
-    if not present:
-        if required:
-            raise ValueError(f"cluster_info requires {names[0]!r}")
-        return np.full(n, math.nan)
-    values = []
-    for name in present:
-        value = np.asarray(info[name], dtype=float)
-        if value.ndim == 0 and n == 1:
-            value = value.reshape(1)
-        if value.shape != (n,):
-            raise ValueError(f"cluster_info[{name!r}] must have shape ({n},)")
-        values.append(value)
-    if any(not np.array_equal(values[0], value, equal_nan=True) for value in values[1:]):
-        raise ValueError(f"conflicting cluster_info aliases {present}")
-    return values[0]
-
-
-def _merger_center_history(iout, info, config):
-    first = np.asarray(_merger_required(info, "ccen1"), dtype=float)
-    if first.shape == (3,):
-        first = first.reshape(1, 3)
-    if first.ndim != 2 or first.shape[1] != 3 or not len(first):
-        raise ValueError("cluster_info['ccen1'] must have shape (N, 3)")
-    n = len(first)
-    if n == 1 and "iout" not in info and "snapshot" not in info:
-        snapshots = np.array([iout])
-    else:
-        numbers = _merger_column(info, ("iout", "snapshot"), n)
-        if not np.all(np.isfinite(numbers)) or np.any(numbers != np.floor(numbers)):
-            raise ValueError("cluster_info snapshot numbers must be finite integers")
-        snapshots = numbers.astype(np.int64)
-    if len(np.unique(snapshots)) != n or iout not in snapshots:
-        raise ValueError("cluster_info snapshot numbers must be unique and include iout")
-    if "ccen2" not in info:
-        raise ValueError("cluster_info requires 'ccen2'; use NaN after secondary termination")
-    second = np.asarray(info["ccen2"], dtype=float) if info["ccen2"] is not None else np.full((n, 3), math.nan)
-    if second.shape == (3,) and n == 1:
-        second = second.reshape(1, 3)
-    if second.shape != first.shape:
-        raise ValueError("cluster_info['ccen2'] must match the shape of ccen1")
-    available = np.all(np.isfinite(second), axis=1)
-    absent = np.all(np.isnan(second), axis=1)
-    if not np.all(np.isfinite(first)) or not np.all(available | absent):
-        raise ValueError("centers must be finite 3-vectors; an absent secondary needs three NaNs")
-    if "secondary_center_available" in info:
-        declared = np.asarray(info["secondary_center_available"])
-        if declared.ndim == 0 and n == 1:
-            declared = declared.reshape(1)
-        if declared.shape != (n,) or declared.dtype.kind != "b" or not np.array_equal(declared, available):
-            raise ValueError("secondary_center_available must be a boolean array matching ccen2")
-    age = _merger_column(info, ("time_gyr", "t_BB"), n)
-    z = _merger_column(info, ("redshift",), n)
-    r1 = _merger_column(info, ("rvir1", "cluster_rvir"), n, required=False)
-    r2 = _merger_column(info, ("rvir2", "cluster_rvir2"), n, required=False)
-    if np.any(np.isinf(r1) | np.isinf(r2)) or np.any((np.isfinite(r1) & (r1 <= 0)) | (np.isfinite(r2) & (r2 <= 0))):
-        raise ValueError("virial radii must be positive or NaN when unavailable")
-    if np.any(absent & np.isfinite(r2)):
-        raise ValueError("rvir2 must be NaN after secondary termination")
-    order = np.argsort(age)
-    if (not np.all(np.isfinite(age)) or np.any(np.diff(age[order]) <= 0) or
-            np.any(np.diff(snapshots[order]) <= 0) or not np.all(np.isfinite(z)) or np.any(np.diff(z[order]) > 0)):
-        raise ValueError("snapshots and cosmic ages must strictly increase; redshift must not increase")
-    ordered_available = available[order]
-    if np.any(np.diff(ordered_available.astype(int)) > 0):
-        raise ValueError("secondary absence must be terminal; interior gaps cannot establish coalescence")
-    if not np.any(available) and np.min(snapshots) <= info.get("secondary_branch_last_snapshot", 875):
-        raise ValueError("an entirely primary-only history must start after secondary_branch_last_snapshot (default 875)")
-    factor = _MERGER_LENGTH_TO_KPC[config.center_position_unit]
-    centers, meta = {}, {}
-    for index in order:
-        snap = int(snapshots[index])
-        radii = tuple(float(r[index]) * factor if np.isfinite(r[index]) else None for r in (r1, r2))
-        centers[snap] = (first[index] * factor, second[index] * factor if available[index] else None,
-                         radii if any(r is not None for r in radii) else None)
-        meta[snap] = {"time_gyr": float(age[index]), "redshift": float(z[index])}
-    history = list(centers)
-    serial = [{"snapshot": s, **meta[s], "primary": centers[s][0].tolist(),
-               "secondary": centers[s][1].tolist() if centers[s][1] is not None else None,
-               "radii": centers[s][2]} for s in history]
-    signature = hashlib.sha256(json.dumps(serial, sort_keys=True, allow_nan=False).encode()).hexdigest()
-    return centers, meta, history, signature
-
-
-def _merger_reset_front(front):
-    front["quality_flags"] = list(front["base_quality_flags"])
-    for name in ("front_id", "track_id", "previous_front_id", "next_front_id"):
-        front[name] = ""
-    for name in ("propagation_x", "propagation_y", "propagation_z", "propagation_speed_kpc_gyr",
-                 "propagation_speed_km_s", "outward_axis_speed_kpc_gyr", "outward_radial_speed_kpc_gyr"):
-        front[name] = math.nan
 
 
 def _merger_fingerprint(*arrays):
@@ -1337,34 +1428,21 @@ def _merger_public_fronts(fronts):
              "evidence_components": {name: f[f"evidence_{name}"] for name in _MERGER_EVIDENCE_NAMES},
              "confidence": f["confidence"], "quality_flags": tuple(dict.fromkeys(f["quality_flags"])),
              "classification": f["classification"], "uncertain": f["uncertain"],
-             "track_origin": f["track_id"], "previous_front": f["previous_front_id"],
-             "next_front": f["next_front_id"],
-             "propagation_speed_km_s": f["propagation_speed_km_s"],
-             "outward_axis_speed_kpc_gyr": f["outward_axis_speed_kpc_gyr"],
-             "outward_radial_speed_kpc_gyr": f["outward_radial_speed_kpc_gyr"]} for f in fronts]
-
-
-def _merger_score_sequence(state):
-    # Stored base summaries are shared between successive states and never
-    # modified. Only this temporary scoring copy grows with the full sequence.
-    # Keeping a scored copy of every prefix in every output would use quadratic
-    # memory when callers retain their per-snapshot catalogs.
-    by_snapshot = {frame["snapshot"]: copy.deepcopy(frame["fronts"]) for frame in state["frames"]}
-    entries = [{"snapshot": frame["snapshot"]} for frame in state["frames"]]
-    for fronts in by_snapshot.values():
-        for front in fronts:
-            _merger_reset_front(front)
-    config = _MergerOptions(**state["configuration"])
-    _merger_link_fronts(by_snapshot, entries, state["metadata"], config)
-    scale = _merger_score_fronts(by_snapshot, state["epochs"], config)
-    return by_snapshot, scale
+             "boundary_excluded": f.get("boundary_excluded", False),
+             "boundary_faces": f.get("boundary_faces", ()),
+             "cell_count": f["cell_count"], "area_kpc2": f["area_kpc2"],
+             "center_kpc": tuple(f[f"center_{a}_kpc"] for a in "xyz"),
+             "normal": tuple(f[f"normal_{a}"] for a in "xyz"),
+             "max_extent_kpc": f["max_extent_kpc"], "mach_median": f["mach_median"],
+             "dissipation_total_erg_s": f["dissipation_total_erg_s"],
+             "front_id": f"{f['snapshot']}:{f['representative_shock_id']}"} for f in fronts]
 
 
 def _merger_selection(catalog):
     membership = catalog["membership"]
     assessments = catalog["fronts"]
     candidates = np.array([f["classification"] == "candidate" for f in assessments], dtype=bool)
-    expand = catalog["tracking_state"]["configuration"].get("expand_candidate_cells", True)
+    expand = catalog["configuration"].get("expand_candidate_cells", True)
     if not expand:
         groups = np.flatnonzero(candidates)
         catalog["shock_id"] = np.asarray([assessments[g]["shock_id"] for g in groups], dtype=membership["shock_id"].dtype)
@@ -1388,6 +1466,7 @@ def _merger_selection(catalog):
     return catalog
 
 
+# Original ShockFinder catalog example (separate from saved-output analysis).
 def make_shock_catalog(
     cell,
     output_dir,
@@ -1464,6 +1543,8 @@ def make_shock_catalog(
 
     paths = {"catalog": catalog_path, "csv": csv_path, "qa": None}
     if make_qa_plot:
+        import matplotlib.pyplot as plt
+
         figure, _ = shocktest.plot_catalog_quality(analysis.catalog)
         figure.savefig(qa_path, dpi=180)
         plt.close(figure)
@@ -1539,16 +1620,28 @@ def load_catalog_only(path):
 #     "t_BB": cosmic_age_gyr,
 #     "redshift": snapshot_redshifts,
 # }
-# catalogs = []
-# for iout, result, dissipation in saved_outputs_in_time_order:
-#     catalog = merger_shock_catalog(iout, result, dissipation, cluster_info)
-#     catalogs.append(catalog)
-#     cluster_info["previous_catalog"] = catalog  # explicit temporal context
-# catalogs = finalize_merger_shock_catalogs(catalogs)
+# import gc
+# from pathlib import Path
+# from rur import utool
 #
-# catalog = catalogs[-1]
-# candidate_pos = result.pos[catalog["shock_id"]]
-# candidate_mach = result.mach[catalog["shock_id"]]
-# if catalog["shock_id"].size:
-#     front = get_merger_shock_members(catalog, catalog["shock_id"][0], result, dissipation)
-#     input_cell_ids = front["input_cell_id"]
+# # In scripts put the loop under `if __name__ == "__main__":` for spawn.
+# output_dir = Path("/storage1/byunkh/NC_shock/shock_catalog")
+# output_dir.mkdir(parents=True, exist_ok=True)
+# with merger_neighbor_pool(workers=20):
+#     for iout in branch1["timestep"]:
+#         tag = f"{int(iout):05d}"
+#         result = utool.load(f"/storage1/byunkh/NC_shock/shock_output/result_{tag}.pkl")
+#         dissipation = utool.load(f"/storage1/byunkh/NC_shock/shock_output/dissipation_{tag}.pkl")
+#         inputs = prepare_merger_shock_inputs(iout, result, dissipation)
+#         del result, dissipation  # Release dense arrays BEFORE grouping.
+#         gc.collect()
+#         catalog = merger_shock_catalog(iout, inputs, None, cluster_info, thread=20)
+#         del inputs
+#         utool.dump(catalog, str(output_dir/f"merger_shocks_{tag}.pkl"))
+#         del catalog
+#         gc.collect()
+#
+# # Direct calls also work, but the caller still owns the dense inputs:
+# # catalog = merger_shock_catalog(iout, result, dissipation, cluster_info, thread=20)
+# # Disk-backed alternative: cache_merger_shock_inputs(..., include_endpoints=False).
+# # Each output is an independent final snapshot catalog.

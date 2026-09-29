@@ -4,7 +4,7 @@ import pickle
 import numpy as np
 import pytest
 
-from examples.galaxy import GAS_TRACERS, galaxy_stripping_catalog, save_galaxy_stripping_analysis
+from examples.galaxy import GAS_TRACERS, StrippingOptions, galaxy_stripping_catalog, save_galaxy_stripping_analysis
 
 
 def histories(*, orbit=False, onset=.35, invalid=False):
@@ -54,7 +54,7 @@ def run(h, c, products, **options):
     return galaxy_stripping_catalog({"branch-42": h}, products, c, options={"window_gyr": .18, **options})
 
 
-def test_independent_tracers_and_moving_shock_candidate_preserve_inputs():
+def test_default_tracer_and_moving_shock_candidate_preserve_inputs():
     h, c = histories()
     before = pickle.dumps((h, c))
     analysis = run(h, c, shocks(h))
@@ -63,10 +63,11 @@ def test_independent_tracers_and_moving_shock_candidate_preserve_inputs():
     assert row["exposure_status"] == "shock_exposed"
     assert row["merger_shock_stripping_score"] > row["ordinary_rps_score"]
     assert row["delta_t_shock_gyr"] == pytest.approx(.15)
-    assert row["P_ram_enhancement"] == pytest.approx(5.)
-    assert set(row["gas_loss_by_tracer"]) == set(GAS_TRACERS)
+    assert not any(k.startswith("P_ram") for k in row)
+    assert set(row["gas_loss_by_tracer"]) == {"m_gas_r90"}
+    assert analysis["configuration"]["tracers"] == ("m_gas_r90",)
     events = [e for e in analysis["gas_loss_events"] if e["significant"]]
-    assert len(events) == 6
+    assert len(events) == 1
     assert all(e["fractional_loss"] == pytest.approx(1.-np.exp(-1.2)) for e in events)
     assert all(e["timescale_gyr"] == pytest.approx(1./8.) for e in events)
     enc = next(e for e in analysis["shock_encounters"] if e["crossed"])
@@ -84,7 +85,6 @@ def test_ordinary_rps_needs_covered_absence_not_missing_shock_products():
     assert row["category"] == "ordinary_infall_rps_candidate"
     assert row["pericenter_time_gyr"] == pytest.approx(7.5)
     assert row["delta_t_peri_gyr"] == pytest.approx(-.05)
-    assert row["P_ram_smooth_evidence"] > row["P_ram_sudden_evidence"]
     unknown = run(h, c, {})["classifications"][0]
     assert unknown["category"] == "mixed_or_ambiguous"
     assert unknown["exposure_status"] == "unknown_or_uncertain_exposure"
@@ -115,7 +115,7 @@ def test_one_snapshot_proximity_and_untracked_ids_cannot_confirm_crossing():
 def test_invalid_values_never_logged_and_censored_losses_are_bounds():
     h, c = histories(invalid=True)
     with np.errstate(divide="raise", invalid="raise"):
-        analysis = run(h, c, shocks(h, empty=True))
+        analysis = run(h, c, shocks(h, empty=True), tracers="m_ism")
     md = analysis["diagnostic_series"]["branch-42"]["gas_tracers"]["m_ism"]
     assert list(md["status"][[6, 7, 8]]) == ["missing", "invalid_negative", "zero_unknown_limit"]
     assert np.isnan(md["loss_rate_gyr"][[5, 6, 7, 8]]).all()
@@ -123,7 +123,7 @@ def test_invalid_values_never_logged_and_censored_losses_are_bounds():
     for tracer in GAS_TRACERS:
         h[tracer][10:] = 0.
     h["mass_limits"] = {tr: 1.e8 for tr in GAS_TRACERS}
-    analysis = run(h, c, shocks(h))
+    analysis = run(h, c, shocks(h), tracers=GAS_TRACERS)
     bounds = [e for e in analysis["gas_loss_events"] if e["fraction_is_lower_bound"]]
     assert len(bounds) == 6
     assert all(e["timescale_is_upper_bound"] for e in bounds)
@@ -200,7 +200,7 @@ def test_units_required_and_streaming_outputs_round_trip(tmp_path):
 
 @pytest.mark.parametrize("cached_endpoints", [None, True, False])
 def test_adapter_reads_native_merger_catalog_and_saved_km_cells(monkeypatch, tmp_path, cached_endpoints):
-    from examples.shock_catalog import (merger_shock_catalog, finalize_merger_shock_catalogs,
+    from examples.shock_catalog import (merger_shock_catalog,
                                         cache_merger_shock_inputs)
     from shocktest.core import ShockResult
     from shocktest.pyShockFinder import DissipationResult
@@ -208,9 +208,9 @@ def test_adapter_reads_native_merger_catalog_and_saved_km_cells(monkeypatch, tmp
     monkeypatch.setattr(shocktest.ShockFinder, "find", lambda *a, **kw: pytest.fail("must not rerun ShockFinder"))
     h, c = histories()
     c["redshift"] = np.full(21, .67)
-    c["merger_shock_options"] = {"cluster_extent_kpc": 5., "minimum_track_length": 2,
+    c["merger_shock_options"] = {"cluster_extent_kpc": 5.,
                                  "candidate_score": .55, "thresholds_calibrated": True}
-    products, catalogs = {}, []
+    products = {}
     for s, t in zip(h["iout"], h["t_BB"]):
         x = 100.+500.*(t-7.)
         pos = np.array([[x-4., 0, 0], [x, -4., 0], [x, 0., 0], [x, 4., 0], [x+4., 0, 0]])*3.0856775814913673e16
@@ -222,18 +222,15 @@ def test_adapter_reads_native_merger_catalog_and_saved_km_cells(monkeypatch, tmp
                              normal=np.tile([1., 0, 0], (5, 1)), mach_consistent=mask, position_unit="km")
         diss = DissipationResult(np.full(5, 1.e39), np.full(5, 16.e39), np.full(5, 16.), np.zeros(5), np.zeros(5))
         catalog = merger_shock_catalog(int(s), result, diss, c)
-        catalogs.append(catalog)
-        c["previous_catalog"] = catalog
         if cached_endpoints is not None:
             result = cache_merger_shock_inputs(int(s), result, diss, tmp_path/str(s),
                                               include_endpoints=cached_endpoints, chunk_size=2)
             diss = None
         products[int(s)] = {"catalog": catalog, "result": result, "dissipation": diss, "complete": True}
-    for catalog in finalize_merger_shock_catalogs(catalogs):
-        products[catalog["iout"]]["catalog"] = catalog
     before = pickle.dumps(products)
     analysis = run(h, c, products)
-    assert any(e["crossed"] for e in analysis["shock_encounters"])
+    # Snapshot-local front IDs must not invent a temporally tracked crossing.
+    assert not any(e["crossed"] for e in analysis["shock_encounters"])
     data = analysis["diagnostic_series"]["branch-42"]
     assert data["shock_distance_kpc"][4] == pytest.approx(0., abs=1.e-10)
     assert data["shock_cell_size_kpc"][4] == pytest.approx(4.)
@@ -252,20 +249,172 @@ def test_no_derivatives_or_crossings_across_important_history_gap():
     assert not any(e["significant"] for e in analysis["gas_loss_events"])
     assert analysis["classifications"][0]["category"] == "mixed_or_ambiguous"
     data = analysis["diagnostic_series"]["branch-42"]
-    assert np.isnan(data["gas_tracers"]["m_ism"]["loss_rate_gyr"][8])
+    assert np.isnan(data["gas_tracers"]["m_gas_r90"]["loss_rate_gyr"][8])
     assert not data["shock_interval_covered"][8]
 
 
-def test_minimal_smoothing_removes_snapshot_dip_and_tracer_disagreement_flags():
+def test_minimal_smoothing_and_single_losing_tracer_need_no_consensus():
     h, c = histories()
     for tr in GAS_TRACERS:
         h[tr][:] = 1.e9
         h[tr][8] = 1.e8
-    analysis = run(h, c, shocks(h), smoothing_width_gyr=.15)
+    analysis = run(h, c, shocks(h), tracers="m_ism", smoothing_width_gyr=.15)
     np.testing.assert_allclose(analysis["diagnostic_series"]["branch-42"]["gas_tracers"]["m_ism"]["smoothed_mass"], 1.e9)
     h["m_ism"] = 1.e9*np.exp(-8.*np.clip(h["t_BB"]-7.35, 0, .15))
     for tr in GAS_TRACERS[1:]:
         h[tr][:] = 1.e9
-    analysis = run(h, c, shocks(h))
-    assert analysis["classifications"][0]["category"] == "mixed_or_ambiguous"
-    assert "gas_tracers_disagree_or_insufficient_independent_families" in analysis["classifications"][0]["ambiguity_reasons"]
+    alone = run(h, c, shocks(h), tracers="m_ism")
+    analysis = run(h, c, shocks(h), tracers=GAS_TRACERS)
+    row = analysis["classifications"][0]
+    assert row["category"] == "merger_shock_stripping_candidate"
+    assert row["category"] == alone["classifications"][0]["category"]
+    assert row["merger_shock_stripping_score"] == alone["classifications"][0]["merger_shock_stripping_score"]
+    assert row["ordinary_rps_score"] == alone["classifications"][0]["ordinary_rps_score"]
+    assert set(row["gas_loss_by_tracer"]) == set(GAS_TRACERS)
+    assert all(row["gas_loss_by_tracer"][tr]["category"] == "no_strong_stripping" for tr in GAS_TRACERS[1:])
+
+
+@pytest.mark.parametrize("selection", ["m_gas_r90", ["m_gas_r90"], ("m_gas_r90",)])
+def test_explicit_selection_ignores_unselected_fields(selection):
+    h, c = histories()
+    baseline = run(h, c, shocks(h))
+    for tracer in GAS_TRACERS:
+        if tracer != "m_gas_r90":
+            h[tracer] = "unselected data are not interpreted"
+            h["resolved"][tracer] = "unselected mask"
+    analysis = galaxy_stripping_catalog(
+        {"branch-42": h}, shocks(h), c,
+        options=StrippingOptions(tracers=selection, window_gyr=.18))
+    assert analysis["configuration"]["tracers"] == ("m_gas_r90",)
+    for key in ("classifications", "gas_loss_events", "sensitivity"):
+        np.testing.assert_equal(analysis[key], baseline[key])
+    assert analysis["input_histories"]["branch-42"]["m_ism"] is h["m_ism"]
+
+
+def test_every_custom_tracer_is_assessed_and_uncertain_episode_is_retained():
+    h, c = histories()
+    h["aperture_A_mass"] = h["m_gas_r90"].copy()
+    h["aperture_B_mass"] = 1.e9*np.exp(-8.*np.clip(h["t_BB"]-7.75, 0, .15))
+    for tracer in GAS_TRACERS:
+        del h[tracer]
+    h["resolved"] = {tr: np.ones(21, bool) for tr in ("aperture_A_mass", "aperture_B_mass")}
+    analysis = run(h, c, shocks(h), tracers=["aperture_A_mass", "aperture_B_mass"])
+    row = analysis["classifications"][0]
+    measured = row["gas_loss_by_tracer"]
+    assert set(measured) == {"aperture_A_mass", "aperture_B_mass"}
+    assert {e["tracer"] for e in analysis["gas_loss_events"]} == set(measured)
+    assert {a["tracer"] for a in analysis["episode_assessments"]} == set(measured)
+    assert all(len(m["episode_assessments"]) == 1 for m in measured.values())
+    assert measured["aperture_A_mass"]["category"] == "merger_shock_stripping_candidate"
+    assert measured["aperture_B_mass"]["category"] == "mixed_or_ambiguous"
+    assert row["category"] == "mixed_or_ambiguous"
+    assert "uncertain_gas_loss_episode" in row["ambiguity_reasons"]
+    # Input order cannot hide the second tracer's episode or change the decision.
+    reversed_result = run(h, c, shocks(h), tracers=["aperture_B_mass", "aperture_A_mass"])
+    reversed_row = reversed_result["classifications"][0]
+    for key in ("category", "confidence", "summary_gas_event_id", "merger_shock_stripping_score", "ordinary_rps_score"):
+        assert reversed_row[key] == row[key]
+
+
+def test_all_selected_tracers_can_reveal_different_stripping_mechanisms():
+    h, c = histories()
+    dt = h["t_BB"]-7.
+    h["gal_cen"][:, 0] = 100.+500.*(dt-.75)**2
+    h["m_ism"] = 1.e9*np.exp(-8.*np.clip(dt-.70, 0, .15))
+    analysis = run(h, c, shocks(h), tracers=["m_gas_r90", "m_ism"])
+    row = analysis["classifications"][0]
+    assert row["gas_loss_by_tracer"]["m_gas_r90"]["category"] == "merger_shock_stripping_candidate"
+    assert row["gas_loss_by_tracer"]["m_ism"]["category"] == "ordinary_infall_rps_candidate"
+    assert row["category"] == "mixed_or_ambiguous"
+    assert "different_episodes_favor_different_mechanisms" in row["ambiguity_reasons"]
+
+
+def test_coincident_tracer_count_and_timing_agreement_do_not_weight_scores():
+    h, c = histories()
+    single = run(h, c, shocks(h))
+    all_tracers = run(h, c, shocks(h), tracers=GAS_TRACERS)
+    assert all_tracers["classifications"][0]["tracer_episode_count"] == len(GAS_TRACERS)
+    assert all_tracers["classifications"][0]["episode_count"] == 1
+    for key in ("category", "confidence", "merger_shock_stripping_score", "ordinary_rps_score"):
+        assert all_tracers["classifications"][0][key] == single["classifications"][0][key]
+    h["m_ism"] = 1.e9*np.exp(-8.*np.clip(h["t_BB"]-7.45, 0, .15))
+    opts = dict(tracers=["m_gas_r90", "m_ism"], window_gyr=.3, sensitivity_fractions=(),
+                sensitivity_rates_gyr=(), sensitivity_smoothing_gyr=(), sensitivity_windows_gyr=())
+    separate = run(h, c, shocks(h), agreement_window_gyr=.01, **opts)
+    grouped = run(h, c, shocks(h), agreement_window_gyr=.2, **opts)
+    assert separate["classifications"][0]["episode_count"] == 2
+    assert grouped["classifications"][0]["episode_count"] == 1
+    assert grouped["classifications"][0]["tracer_temporal_agreement"] < 1.
+    for key in ("category", "confidence", "merger_shock_stripping_score", "ordinary_rps_score"):
+        assert separate["classifications"][0][key] == grouped["classifications"][0][key]
+
+
+@pytest.mark.parametrize("orbit", [False, True])
+def test_ram_pressure_never_changes_events_scores_or_decisions(orbit):
+    h, c = histories(orbit=orbit, onset=.45 if orbit else .35)
+    products = shocks(h, empty=orbit)
+    baseline = run(h, c, products)
+    for pressure in (None, np.ones(21), np.full(21, np.nan), np.full(21, -1.),
+                     np.geomspace(1.e-100, 1.e100, 21), np.zeros((21, 2))):
+        if pressure is None:
+            h.pop("P_ram", None)
+        else:
+            h["P_ram"] = pressure
+        with np.errstate(divide="raise", invalid="raise", over="raise"):
+            analysis = run(h, c, products)
+        for key in ("gas_loss_events", "classifications", "episode_assessments", "sensitivity", "population"):
+            np.testing.assert_equal(analysis[key], baseline[key])
+
+
+@pytest.mark.parametrize("selection", [[], (), "", [""], ["m_gas_r90", "m_gas_r90"], ["m_gas_r90", 1], None, 1])
+def test_invalid_tracer_selection_fails_explicitly(selection):
+    h, c = histories()
+    with pytest.raises(ValueError, match="tracers"):
+        run(h, c, {}, tracers=selection)
+
+
+def test_selected_columns_and_shapes_are_checked_before_loading_shocks():
+    h, c = histories()
+    def forbidden(iout):
+        pytest.fail("invalid tracer inputs must fail before loading shock products")
+    with pytest.raises(ValueError, match="branch-42.*columns missing.*custom_mass"):
+        run(h, c, forbidden, tracers=["m_gas_r90", "custom_mass"])
+    h["custom_mass"] = np.ones((21, 1))
+    with pytest.raises(ValueError, match="custom_mass must have shape"):
+        run(h, c, forbidden, tracers=["m_gas_r90", "custom_mass"])
+
+
+def test_inadequate_selected_history_cannot_establish_no_stripping():
+    h, c = histories()
+    h["m_gas_r90"][:] = 1.e9
+    h["custom_mass"] = np.full(21, np.nan)
+    analysis = run(h, c, shocks(h, empty=True), tracers=["m_gas_r90", "custom_mass"])
+    row = analysis["classifications"][0]
+    assert row["gas_loss_by_tracer"]["m_gas_r90"]["category"] == "no_strong_stripping"
+    assert row["gas_loss_by_tracer"]["custom_mass"]["category"] == "mixed_or_ambiguous"
+    assert row["category"] == "mixed_or_ambiguous"
+    assert "insufficient_gas_history" in row["ambiguity_reasons"]
+
+
+def test_custom_tracer_plots_with_optional_pressure_and_sorted_history():
+    import matplotlib.pyplot as plt
+    from examples.galaxy import plot_galaxy_stripping
+    h, c = histories()
+    h["custom_mass"] = h["m_gas_r90"].copy()
+    h["resolved"]["custom_mass"] = np.ones(21, bool)
+    h.pop("P_ram")
+    for key, value in list(h.items()):
+        if isinstance(value, np.ndarray):
+            h[key] = value[::-1].copy()
+    for key in ("resolved",):
+        h[key] = {tr: value[::-1].copy() for tr, value in h[key].items()}
+    products = {int(s): product(int(s), 100.+500.*(t-7.), row=j) for j, (s, t) in enumerate(zip(h["iout"], h["t_BB"]))}
+    analysis = run(h, c, products, tracers=["custom_mass", "m_gas_r90"])
+    figure, axes = plot_galaxy_stripping(analysis, "branch-42")
+    try:
+        assert {line.get_label() for line in axes[1].lines if not line.get_label().startswith("_")} == {"custom_mass", "m_gas_r90"}
+        assert np.isnan(axes[3].lines[0].get_ydata()).all()
+        assert analysis["classifications"][0]["category"] == "merger_shock_stripping_candidate"
+        figure.canvas.draw()
+    finally:
+        plt.close(figure)
