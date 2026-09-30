@@ -3,6 +3,8 @@
 import copy
 import json
 import pickle
+import subprocess
+import sys
 import tempfile
 import unittest
 import gc
@@ -495,6 +497,47 @@ class MergerInputCacheTests(unittest.TestCase):
 
 
 class MergerBackendFallbackTests(unittest.TestCase):
+    def test_linux_workers_do_not_spawn_the_calling_script(self):
+        with patch.object(merger_module.sys, "platform", "linux"):
+            self.assertEqual(merger_module._merger_process_context().get_start_method(), "fork")
+        with patch.object(merger_module.sys, "platform", "darwin"):
+            self.assertEqual(merger_module._merger_process_context().get_start_method(), "spawn")
+
+    def test_default_parallel_threshold_limits_worker_count(self):
+        n = 1_000_000
+        config = _MergerOptions(neighbor_workers=60)
+        # Inspect the worker cap before allocating million-cell geometry.
+        self.assertEqual(merger_module._merger_worker_count(n, config), 2)
+        self.assertEqual(merger_module._merger_worker_count(5_000_000, config), 10)
+        self.assertEqual(merger_module._merger_worker_count(30, _MergerOptions(
+            neighbor_workers=60, neighbor_min_parallel_cells=1)), 30)
+
+    def test_unguarded_script_runs_once_with_linux_process_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory)/"unguarded.py"
+            marker = Path(directory)/"executions.txt"
+            script.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n"
+                "from examples.shock_catalog import merger_shock_catalog\n"
+                "from tests.test_merger_shock_catalog import cluster_history, saved_output\n"
+                f"with Path({str(marker)!r}).open('a') as stream: stream.write('run\\n')\n"
+                "sys.platform = 'linux'\n"
+                "info = cluster_history()\n"
+                "info['merger_shock_options'].update(neighbor_backend='scipy',\n"
+                "    neighbor_min_parallel_cells=1, neighbor_max_halo_ratio=4.)\n"
+                "for snapshot in (710, 740):\n"
+                "    result, dissipation = saved_output(100.)\n"
+                "    catalog = merger_shock_catalog(snapshot, result, dissipation, info, thread=2)\n"
+                "    assert catalog['neighbor_execution']['reason'] == 'parallel'\n"
+                "    del result, dissipation, catalog\n"
+            )
+            completed = subprocess.run([sys.executable, str(script)], timeout=30,
+                                       cwd=Path(__file__).resolve().parents[1], capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            self.assertEqual(marker.read_text().splitlines(), ["run"])
+
     def test_missing_extension_auto_fallback_and_explicit_error(self):
         result, diss = saved_output(100.)
         info = cluster_history()

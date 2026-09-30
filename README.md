@@ -11,22 +11,24 @@ shock detector follows the methodology of Skillman et al. (2008, ApJ 689, 1063).
 Requirements: Python >= 3.10, NumPy >= 1.26, and a Fortran compiler such as
 GNU Fortran.
 
-For GNU Fortran with the Python 3.10/3.11 distutils f2py backend, an OpenMP build is:
+From the repository root, build all Fortran extensions with the active Python:
 
 ```bash
-cd shocktest
-python -m numpy.f2py -c fortran/shockfinder.f90 -m _shockfinder \
-  --f90flags="-O3 -fopenmp" -lgomp
-cd ..
+./f2py.sh
+# Or select a specific environment: PYTHON=/path/to/python ./f2py.sh
+
 export OMP_NUM_THREADS=8
 export OMP_PROC_BIND=spread
 export OMP_PLACES=cores
 ```
 
-OpenMP compiler/linker options depend on the compiler and f2py backend; the
-command above is not a universal Meson build command. The serial build remains
-supported. Set thread variables before starting Python and choose a thread count
-appropriate to the available cores and memory.
+`f2py.sh` compiles every `shocktest/fortran/*.f90` source into `shocktest/`,
+including `_shockfinder` and `_merger_neighbors`. It uses GNU Fortran OpenMP
+flags (`-O3 -fopenmp -lgomp`); the merger-neighbor module also disables floating
+point contraction at AMR contact thresholds. The script requires a compatible
+NumPy/f2py backend and is not a universal Meson build command. Set OpenMP
+variables before starting Python and choose a thread count appropriate to the
+available cores and memory.
 
 Run the validation suite after building:
 

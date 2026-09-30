@@ -21,6 +21,7 @@ import copy
 import hashlib
 import json
 import math
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 from contextlib import contextmanager, nullcontext
@@ -79,8 +80,12 @@ def merger_shock_catalog(iout, result, dissipation, cluster_info, thread=None):
         ghost cells preserve connections across INTERNAL partition boundaries;
         the extraction faces never wrap. ``neighbor_max_halo_ratio`` (2.)
         limits repeated work and falls back to serial when overlap is excessive.
+        On Linux, multiprocessing uses fork so a top-level calling script is
+        not executed again in each worker. Other platforms use spawn and
+        require the usual __main__ guard. Workers are also limited to roughly
+        one per 500000 valid cells at the default size threshold.
         Use ``with merger_neighbor_pool(workers=4):`` around consecutive calls
-        to amortize spawn startup. Scripts require the usual __main__ guard.
+        to amortize worker startup.
         ``neighbor_backend`` is 'auto' (compiled Fortran when available),
         'scipy', or 'fortran'. The separate optional post-processing extension
         is built from shocktest/fortran/merger_neighbors.f90; it never calls
@@ -943,12 +948,17 @@ def _merger_neighbor_backend(data, config):
     return "fortran" if available and config.neighbor_backend != "scipy" else "scipy"
 
 
+def _merger_process_context():
+    """Avoid re-importing an unguarded caller on the Linux compute host."""
+    return get_context("fork" if sys.platform.startswith("linux") else "spawn")
+
+
 @contextmanager
 def merger_neighbor_pool(workers=4):
-    """Reuse spawn workers across outputs; never serialize this pool in catalogs.
+    """Reuse workers across outputs; never serialize this pool in catalogs.
 
     Set merger_shock_options['neighbor_workers'] separately. Keep the calling
-    loop inside this context and, in a script, inside an if __name__ guard.
+    loop inside this context. Non-Linux scripts need an if __name__ guard.
     Geometry is opened read-only from existing memory maps or shared once in
     RAM. Local parents are private; global reconciliation runs in the caller.
     """
@@ -956,7 +966,7 @@ def merger_neighbor_pool(workers=4):
         raise ValueError("workers must be a positive integer")
     global _MERGER_NEIGHBOR_POOL
     previous = _MERGER_NEIGHBOR_POOL
-    with ProcessPoolExecutor(max_workers=int(workers), mp_context=get_context("spawn")) as pool:
+    with ProcessPoolExecutor(max_workers=int(workers), mp_context=_merger_process_context()) as pool:
         _MERGER_NEIGHBOR_POOL = (pool, int(workers))
         try:
             yield pool
@@ -1040,10 +1050,19 @@ def _merger_region_worker(descriptions, rows, configuration):
             owner.close()
 
 
-def _merger_parallel_labels(data, rows, config, diagnostics):
-    workers = min(config.neighbor_workers, len(rows))
+def _merger_worker_count(nrows, config):
+    cells_per_worker = max(1, config.neighbor_min_parallel_cells // 2)
+    workers = min(config.neighbor_workers, nrows, max(1, nrows // cells_per_worker))
     if _MERGER_NEIGHBOR_POOL is not None:
         workers = min(workers, _MERGER_NEIGHBOR_POOL[1])
+    return workers
+
+
+def _merger_parallel_labels(data, rows, config, diagnostics):
+    # Small regions should not launch dozens of processes with private graphs.
+    # Preserve explicit tiny test/workload thresholds while the default 1M-cell
+    # threshold admits two workers and scales up with the actual shock count.
+    workers = _merger_worker_count(len(rows), config)
     if workers < 2:
         diagnostics["reason"] = "one_available_worker"
         return None
@@ -1061,7 +1080,7 @@ def _merger_parallel_labels(data, rows, config, diagnostics):
         diagnostics["input_transport"] = ("memory_map" if all(v[0] == "mmap" for v in descriptions.values())
                                           else "shared_memory")
         pool_context = (nullcontext(_MERGER_NEIGHBOR_POOL[0]) if reused_pool else
-                        ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")))
+                        ProcessPoolExecutor(max_workers=workers, mp_context=_merger_process_context()))
         with pool_context as pool:
             pending = set()
             try:
@@ -1084,6 +1103,7 @@ def _merger_parallel_labels(data, rows, config, diagnostics):
                     future.cancel()
                 wait(pending)
     diagnostics.update(workers_used=workers, regions=len(regions), reason="parallel",
+                       start_method=_merger_process_context().get_start_method(),
                        reused_pool=reused_pool)
     return components.roots(rows)
 
@@ -1624,7 +1644,8 @@ def load_catalog_only(path):
 # from pathlib import Path
 # from rur import utool
 #
-# # In scripts put the loop under `if __name__ == "__main__":` for spawn.
+# # On Linux direct calls can run in a top-level loop; other platforms need a
+# # `if __name__ == "__main__":` guard when using multiprocessing.
 # output_dir = Path("/storage1/byunkh/NC_shock/shock_catalog")
 # output_dir.mkdir(parents=True, exist_ok=True)
 # with merger_neighbor_pool(workers=20):
