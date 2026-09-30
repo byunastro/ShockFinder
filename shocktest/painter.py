@@ -616,8 +616,9 @@ def _paint_cells_to_map(
     if use_fortran:
         if _FORTRAN_MAP_KERNEL is None:
             raise ImportError(
-                "Fortran map rasterizer is unavailable; rebuild shocktest._shockfinder "
-                "from shocktest/fortran/shockfinder.f90 or use backend='python'"
+                "Fortran map rasterizer is unavailable; rebuild with "
+                "PYTHON=/path/to/this/python ./f2py.sh from the repository root "
+                "or use backend='python'"
             )
         return _paint_cells_to_map_fortran(
             x,

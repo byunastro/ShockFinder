@@ -1,6 +1,6 @@
 ! Post-processing of SAVED ShockFinder cells only. No shock detection/physics.
-! Build from shocktest/ with:
-! python -m numpy.f2py -c fortran/merger_neighbors.f90 -m _merger_neighbors --f90flags="-O3 -ffp-contract=off"
+! Build both extensions for the running environment from the repository root:
+! PYTHON=/path/to/python ./f2py.sh
 !
 ! Spatial bins find neighbors without retaining edge lists. SciPy supplies
 ! bounded candidate pairs for geometries outside the packed-bin range.

@@ -1,3 +1,19 @@
+import sys as _sys
+
+from ._native import load_extension as _load_extension
+
+
+_NATIVE_IMPORT_ERRORS = {}
+for _name in ("_shockfinder", "_merger_neighbors"):
+    try:
+        globals()[_name] = _load_extension(_name)
+    except ImportError as _exc:
+        _NATIVE_IMPORT_ERRORS[_name] = _exc
+        globals()[_name] = None
+        # Prevent a direct submodule import from finding an old .so in this directory.
+        _sys.modules[f"{__name__}.{_name}"] = None
+
+
 from .exposure import (
     ShockFrame, MergerEvent, MergerAttribution, ExposureRecord, ExposureInterval,
     ExposureAccumulator, attribute_merger_shocks, integrate_galaxy_exposure,

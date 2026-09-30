@@ -9,32 +9,56 @@ shock detector follows the methodology of Skillman et al. (2008, ApJ 689, 1063).
 ## 1. Build
 
 Requirements: Python >= 3.10, NumPy >= 1.26, and a Fortran compiler such as
-GNU Fortran.
+GNU Fortran. NumPy releases that use the Meson F2PY backend also require Meson
+and Ninja in the selected environment.
 
-From the repository root, build all Fortran extensions with the active Python:
+From the repository root, build all Fortran extensions with **the same Python
+executable that runs the analysis**:
 
 ```bash
-./f2py.sh
-# Or select a specific environment: PYTHON=/path/to/python ./f2py.sh
+conda activate my-environment
+RUN_PYTHON="$CONDA_PREFIX/bin/python"
+PYTHON="$RUN_PYTHON" ./f2py.sh
+# Use "$RUN_PYTHON" for the analysis job too.
+
+"$RUN_PYTHON" -c 'import sys, numpy, shocktest; from shocktest.core import _shockfinder; from shocktest import _merger_neighbors; print(sys.executable, numpy.__version__, shocktest.__file__, _shockfinder.__file__, _merger_neighbors.__file__)'
 
 export OMP_NUM_THREADS=8
 export OMP_PROC_BIND=spread
 export OMP_PLACES=cores
 ```
 
-`f2py.sh` compiles every `shocktest/fortran/*.f90` source into `shocktest/`,
-including `_shockfinder` and `_merger_neighbors`. It uses GNU Fortran OpenMP
-flags (`-O3 -fopenmp -lgomp`); the merger-neighbor module also disables floating
-point contraction at AMR contact thresholds. The script requires a compatible
-NumPy/f2py backend and is not a universal Meson build command. Set OpenMP
-variables before starting Python and choose a thread count appropriate to the
-available cores and memory.
+`f2py.sh` compiles `_shockfinder` and `_merger_neighbors` into an ignored
+`shocktest/_f2py_builds/` subdirectory specific to the Python environment,
+extension ABI, and installed NumPy version. It verifies both imports and their
+resolved paths before reporting success. No `site-packages` copy is needed:
+Python must import this repository's `shocktest` package. For a script outside
+the repository, add the **repository root** to `sys.path` (or `PYTHONPATH`),
+then check `shocktest.__file__` and `_shockfinder.__file__` as above. Old `.so`
+files directly inside `shocktest/` are not selected by the package's normal
+imports.
+
+Outside conda, set `RUN_PYTHON` to the absolute path of the Python executable
+used by the analysis. Re-run the build command after changing the Python
+environment, Python version, or NumPy version, including an upgrade from NumPy
+1.x to 2.x. Use the same interpreter for the build, validation, and production
+run. If `python` and
+`python3` resolve to different executables, do not mix them.
+
+The default GNU Fortran flags remain `-O3 -fopenmp -lgomp`; the merger-neighbor
+module also uses `-ffp-contract=off` at AMR contact thresholds. Select a
+compiler with `FC` (and, if needed, `CC`). For a non-GNU compiler, set
+`SHOCKFINDER_F90FLAGS`, `SHOCKFINDER_OPENMP_LIB`, and
+`SHOCKFINDER_FP_CONTRACT_OFF_FLAG` to its equivalent optimization, OpenMP, and
+floating-point contraction settings. An empty `SHOCKFINDER_OPENMP_LIB` omits
+the explicit OpenMP library. Set OpenMP variables before starting Python and
+choose a thread count appropriate to the available cores and memory.
 
 Run the validation suite after building:
 
 ```bash
-python -m pytest -q
-python -m examples.time_resolved_exposure
+"$RUN_PYTHON" -m pytest -q
+"$RUN_PYTHON" -m examples.time_resolved_exposure
 ```
 
 ## 2. Use

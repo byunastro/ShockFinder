@@ -4,6 +4,7 @@ __pycache__/
 *.dylib
 *.o
 *.mod
+/shocktest/_f2py_builds/
 
 .pytest_cache/
 .mypy_cache/

@@ -943,8 +943,8 @@ def _merger_neighbor_backend(data, config):
     available = _merger_neighbors is not None and len(data["valid"]) <= np.iinfo(np.int32).max
     if config.neighbor_backend == "fortran" and not available:
         raise RuntimeError("Fortran merger neighbors require the separate _merger_neighbors extension and int32-sized compact inputs. "
-                           "Build it from shocktest/: python -m numpy.f2py -c fortran/merger_neighbors.f90 -m _merger_neighbors "
-                           "--f90flags='-O3 -ffp-contract=off'; or select neighbor_backend='scipy'.")
+                           "Build it for the running environment with PYTHON=/path/to/this/python ./f2py.sh "
+                           "from the repository root; or select neighbor_backend='scipy'.")
     return "fortran" if available and config.neighbor_backend != "scipy" else "scipy"
 
 

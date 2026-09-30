@@ -10,13 +10,9 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    from . import _shockfinder
-except ImportError as exc:  # pragma: no cover - exercised before extension build
-    _shockfinder = None
-    _IMPORT_ERROR = exc
-else:
-    _IMPORT_ERROR = None
+from . import _NATIVE_IMPORT_ERRORS, _shockfinder
+
+_IMPORT_ERROR = _NATIVE_IMPORT_ERRORS.get("_shockfinder")
 
 
 @dataclass(slots=True)
@@ -278,9 +274,9 @@ class ShockFinder:
             )
         if _shockfinder is None:
             raise ImportError(
-                "shocktest Fortran extension is not built. Run "
-                "`cd shocktest && python3 -m numpy.f2py -c fortran/shockfinder.f90 "
-                "-m _shockfinder` from the project root."
+                "shocktest Fortran extension is unavailable for this Python/NumPy "
+                "environment. Run PYTHON=/path/to/this/python ./f2py.sh from "
+                "the repository root."
             ) from _IMPORT_ERROR
 
         if not hasattr(_shockfinder.shockfinder_kernel, "shock_normals"):
