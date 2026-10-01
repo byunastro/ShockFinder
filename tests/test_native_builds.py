@@ -1,9 +1,11 @@
 """The native extensions must match the Python and NumPy doing the import."""
 
-from pathlib import Path
+import errno
 import importlib
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,6 +13,7 @@ import pytest
 from shocktest import _merger_neighbors
 from shocktest._native import extension_directory, load_extension
 from shocktest.core import _shockfinder
+from tools.build_extensions import install_extensions
 
 
 def test_native_modules_load_from_active_environment():
@@ -46,3 +49,31 @@ def test_direct_import_cannot_fall_back_to_old_so():
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode != 0
     assert "None in sys.modules" in result.stderr
+
+
+def test_install_extensions_handles_separate_build_filesystem(tmp_path, monkeypatch):
+    source_dir = tmp_path / "temporary-build"
+    destination = tmp_path / "repository-build"
+    source_dir.mkdir()
+    destination.mkdir()
+    built = []
+    for name in ("_shockfinder.so", "_merger_neighbors.so"):
+        artifact = source_dir / name
+        artifact.write_bytes(f"new {name}".encode())
+        target = destination / name
+        target.write_bytes(b"old")
+        built.append((artifact, target))
+
+    real_replace = os.replace
+
+    def replace_on_same_filesystem(source, target):
+        if not Path(source).is_relative_to(destination):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        real_replace(source, target)
+
+    monkeypatch.setattr("tools.build_extensions.os.replace", replace_on_same_filesystem)
+    install_extensions(built, destination)
+
+    for artifact, target in built:
+        assert target.read_bytes() == artifact.read_bytes()
+    assert not list(destination.glob(".f2py-install-*"))

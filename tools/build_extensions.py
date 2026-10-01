@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -14,6 +15,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "shocktest"
 SOURCES = ("shockfinder", "merger_neighbors")
+
+
+def install_extensions(built: list[tuple[Path, Path]], destination: Path) -> None:
+    """Stage on the destination filesystem before replacing existing modules."""
+    destination.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".f2py-install-", dir=destination) as staging:
+        staged = []
+        for artifact, target in built:
+            staged_artifact = Path(staging) / artifact.name
+            shutil.copy2(artifact, staged_artifact)
+            staged.append((staged_artifact, target))
+        for staged_artifact, target in staged:
+            os.replace(staged_artifact, target)
 
 
 def main() -> None:
@@ -62,9 +76,7 @@ def main() -> None:
                 raise RuntimeError(f"F2PY did not produce the expected extension: {artifact}")
             built.append((artifact, destination / artifact.name))
 
-        destination.mkdir(parents=True, exist_ok=True)
-        for artifact, target in built:
-            os.replace(artifact, target)
+        install_extensions(built, destination)
 
     # Verify both the package and native modules under the same interpreter.
     verify = (
