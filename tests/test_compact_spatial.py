@@ -14,8 +14,8 @@ def test_compact_survives_dense_clear_and_preserves_indices():
     expected = analysis.result.selected_indices[analysis.result.upstream_index[rows]]
     np.testing.assert_array_equal(compact['upstream_index'], expected)
     np.testing.assert_allclose(compact['dissipation_flux'], analysis.dissipation.flux[rows])
-    for group in compact.groups:
-        assert np.all(np.isin(group.center_indices, compact['input_row']))
+    np.testing.assert_array_equal(compact['group_id'], analysis.labels[rows])
+    assert compact.groups.dtype.itemsize == 78
     assert not np.shares_memory(compact['mach'], analysis.result.mach)
     analysis.clear()
     assert len(compact) == len(rows) and compact['mach'].max() > 1

@@ -1,5 +1,5 @@
 """Independent, shock-only products for retaining many snapshots in memory."""
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 import json
 from pathlib import Path
 import numpy as np
@@ -11,11 +11,11 @@ class ShockSamples:
 
     ``retained_row`` addresses the original dense result; ``input_row`` addresses
     the input cell table. Endpoint indices are input-table indices, not sample
-    indices. Group center_indices also address that input table. Arrays own
+    indices. group_id is the front ID; groups stores the numeric front catalog. Arrays own
     their storage, so the dense analysis may be cleared immediately.
     """
     columns: dict[str, np.ndarray]
-    groups: tuple
+    groups: np.ndarray
     metadata: dict
     timings: dict
 
@@ -35,17 +35,14 @@ class ShockSamples:
 
     def save(self, path, *, compressed=True):
         """Losslessly save columns, groups and metadata without pickle."""
-        from .catalog import ShockCatalog
-        from .catalog_io import _catalog_arrays
+        from .catalog_io import _validate_catalog
         if any(value.dtype.hasobject for value in self.columns.values()):
             raise ValueError('object columns cannot be saved without pickle')
-        manifest = dict(version=1, columns=list(self.columns), metadata=self.metadata,
+        _validate_catalog(self.groups, self.columns.get('group_id'))
+        manifest = dict(version=2, columns=list(self.columns), metadata=self.metadata,
                         timings=self.timings)
-        arrays = {'manifest': np.asarray(json.dumps(manifest))}
+        arrays = {'manifest': np.asarray(json.dumps(manifest)), 'catalog': self.groups}
         arrays.update({'column/' + name: value for name, value in self.columns.items()})
-        group_catalog = ShockCatalog(np.empty(0, np.int64), np.empty(0, np.int64),
-                                     list(self.groups), {})
-        arrays.update({'catalog/' + name: value for name, value in _catalog_arrays(group_catalog).items()})
         output = Path(path)
         writer = np.savez_compressed if compressed else np.savez
         with output.open('wb') as stream:
@@ -55,27 +52,24 @@ class ShockSamples:
     @classmethod
     def load(cls, path):
         """Restore the saved column values/dtypes and complete group summaries."""
-        from .catalog_io import _catalog_from_arrays, _required_fields, CATALOG_SCHEMA_VERSION
+        from .catalog_io import _validate_catalog
         with np.load(path, allow_pickle=False) as archive:
             manifest = json.loads(str(archive['manifest'].item()))
-            if manifest.get('version') != 1:
-                raise ValueError('unsupported compact archive version')
+            if manifest.get('version') != 2:
+                raise ValueError('unsupported compact archive version; regenerate from saved detections')
             columns = {name: archive['column/' + name] for name in manifest['columns']}
             if 'input_row' not in columns:
                 raise ValueError('compact archive is missing input_row')
             n = len(columns['input_row'])
             if any(a.ndim == 0 or len(a) != n or a.dtype.hasobject for a in columns.values()):
                 raise ValueError('invalid compact column shape or dtype')
-            version = int(archive['catalog/schema_version'].item())
-            if version not in (1, CATALOG_SCHEMA_VERSION):
-                raise ValueError('unsupported embedded catalog version')
-            group_arrays = {name: archive['catalog/' + name] for name in _required_fields(version)}
-        catalog = _catalog_from_arrays(group_arrays, version)
-        return cls(columns, tuple(catalog.groups), manifest['metadata'], manifest['timings'])
+            catalog = archive['catalog']
+        _validate_catalog(catalog, columns.get('group_id'))
+        return cls(columns, catalog, manifest['metadata'], manifest['timings'])
 
     def clear(self):
         self.columns.clear()
-        self.groups = ()
+        self.groups = self.groups[:0].copy()
         self.metadata.clear()
         self.timings.clear()
 
@@ -88,7 +82,7 @@ _SCIENCE_COLUMNS = frozenset({
 })
 
 
-def compact_shocks(result, dissipation=None, catalog=None, *, timings=None,
+def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timings=None,
                    profile='full', index_dtype='int64', _validation=None,
                    _compact_dissipation=False):
     """Compact without changing float precision or scientific selection.
@@ -129,22 +123,23 @@ def compact_shocks(result, dissipation=None, catalog=None, *, timings=None,
             columns[name.replace('_index', '_pos')] = pos
     if dissipation is not None:
         for field in fields(dissipation):
+            if field.name == 'selected_indices':
+                continue  # Already represented once by input_row.
             name = 'dissipation_' + field.name
             if keep(name):
                 value = getattr(dissipation, field.name)
                 columns[name] = value.copy() if _compact_dissipation else value[rows]
-    groups = ()
+    from .fronts import front_dtype
+    groups = np.empty(0, dtype=front_dtype)
     representatives = len(rows)
     if catalog is not None:
-        columns['group_id'] = catalog.group_id[rows].copy()
-        rep = catalog.center_representative[rows]
-        valid = rep >= 0
-        mapped = np.full(len(rows), -1, dtype=np.int64)
-        mapped[valid] = result.selected_indices[rep[valid]]
-        columns['representative_input_row'] = mapped
-        representatives = int(np.count_nonzero(rep == rows))
-        groups = tuple(replace(group, center_indices=result.selected_indices[group.center_indices].copy())
-                       for group in catalog.groups)
+        from .catalog_io import _validate_catalog
+        if labels is None or np.shape(labels) != (result.mach.size,):
+            raise ValueError('compact catalog requires labels aligned with result')
+        _validate_catalog(catalog, labels)
+        columns['group_id'] = labels[rows].copy()
+        groups = catalog.copy()
+        representatives = int(catalog['ncell'].sum(dtype=np.int64))
     if index_dtype == 'auto':
         for name, value in columns.items():
             if value.dtype == np.int64 and (not value.size or
@@ -154,10 +149,10 @@ def compact_shocks(result, dissipation=None, catalog=None, *, timings=None,
         'profile': profile, 'index_dtype': index_dtype,
         'gamma': result.gamma, 'temperature_floor': result.temperature_floor,
         'position_unit': result.position_unit, 'endpoint_index_space': 'input_table',
-        'group_index_space': 'input_table',
+        'group_index_space': 'snapshot_front_id',
         'counts': {'retained': result.mach.size, 'shock': len(rows),
                    'representative': representatives, 'groups': len(groups)},
         'diagnostics': dict(result.diagnostics or {}),
-        'catalog': dict(catalog.metadata) if catalog is not None else None,
+        'catalog': {'schema': 'front_dtype', 'bytes_per_row': 78} if catalog is not None else None,
     }
     return ShockSamples(columns, groups, metadata, dict(timings or {}))

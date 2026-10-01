@@ -17,6 +17,7 @@ class ShockAnalysis:
     dissipation: Any | None
     catalog: Any | None
     timings: dict[str, float]
+    labels: np.ndarray | None = None
 
     @property
     def counts(self) -> dict[str, int]:
@@ -27,8 +28,8 @@ class ShockAnalysis:
         representative_count = shock_count
         group_count = 0
         if self.catalog is not None:
-            representative_count = sum(group.n_centers for group in self.catalog.groups)
-            group_count = len(self.catalog.groups)
+            representative_count = int(self.catalog['ncell'].sum(dtype=np.int64))
+            group_count = len(self.catalog)
         return {
             "retained": int(result.mach.size),
             "shock": shock_count,
@@ -40,7 +41,7 @@ class ShockAnalysis:
         from .compact import compact_shocks
         if self.result is None:
             raise ValueError("analysis has been cleared")
-        return compact_shocks(self.result, self.dissipation, self.catalog, timings=self.timings, **options)
+        return compact_shocks(self.result, self.dissipation, self.catalog, labels=self.labels, timings=self.timings, **options)
 
     def clear(self) -> None:
         if self.result is not None:
@@ -50,5 +51,6 @@ class ShockAnalysis:
             self.dissipation.clear()
             self.dissipation = None
         self.catalog = None
+        self.labels = None
         self.timings.clear()
         gc.collect()

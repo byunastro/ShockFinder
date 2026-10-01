@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from shocktest import ShockFinder, ShockSamples, ShockResult
-from shocktest.catalog import _region_bounds
 from test_maps import grid_cell
 
 
@@ -15,9 +14,8 @@ def assert_samples_equal(left, right):
         np.testing.assert_array_equal(left[name], right[name], err_msg=name)
     assert left.counts == right.counts
     assert len(left.groups) == len(right.groups)
-    for a, b in zip(left.groups, right.groups):
-        for field in fields(a):
-            np.testing.assert_equal(getattr(a, field.name), getattr(b, field.name))
+    for name in left.groups.dtype.names:
+        np.testing.assert_array_equal(left.groups[name], right.groups[name])
 
 
 @pytest.mark.parametrize('dtype', ['float32', 'float64'])
@@ -109,14 +107,6 @@ def test_compact_archive_round_trip_preserves_all_products(tmp_path, profile, co
     for name in expected.columns:
         if expected[name].dtype == np.float64:
             np.testing.assert_array_equal(expected[name].view(np.uint64), actual[name].view(np.uint64))
-
-
-def test_chunked_bounds_are_exact():
-    rng = np.random.default_rng(12)
-    pos, dx = rng.normal(size=(47, 3))*1.e20, rng.uniform(1.e15, 1.e17, 47)
-    lo, hi = _region_bounds(pos, dx, chunk_size=7)
-    np.testing.assert_array_equal(lo, np.min(pos-.5*dx[:, None], axis=0))
-    np.testing.assert_array_equal(hi, np.max(pos+.5*dx[:, None], axis=0))
 
 
 def test_dense_index_narrowing_is_opt_in_and_lossless():

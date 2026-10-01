@@ -4,12 +4,12 @@ import shocktest
 from examples.galaxy import (
     classify_galaxy_shock_crossing,
     compact_classification_results,
-    shock_front_catalog,
+    shock_front_samples,
 )
 from shocktest import pyShockFinder
 
 
-def test_shock_front_catalog_carries_zone_width():
+def test_shock_front_samples_carries_zone_width():
     result = shocktest.ShockResult(
         mach=np.array([6.0]),
         shock=np.array([True]),
@@ -31,7 +31,7 @@ def test_shock_front_catalog_carries_zone_width():
         sound_speed=np.array([0.0]),
     )
 
-    catalog = shock_front_catalog(result, dissipation, min_mach=5.0)
+    catalog = shock_front_samples(result, dissipation, min_mach=5.0)
 
     np.testing.assert_allclose(catalog["zone_width"], [12.0])
 

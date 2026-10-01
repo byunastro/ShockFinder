@@ -16,13 +16,18 @@ KPC = 3.0856775814913673e21  # cm
 
 @dataclass(slots=True)
 class DissipationResult:
-    """Shock dissipation quantities, one row per retained AMR cell."""
+    """Saved flux (erg/s/kpc²), power (erg/s), and effective area (kpc²).
+
+    selected_indices identifies original input cells. Older pickles may lack
+    this field; consumers must explicitly confirm their retained-row alignment.
+    """
 
     flux: np.ndarray
     total: np.ndarray
     area: np.ndarray
     efficiency: np.ndarray
     sound_speed: np.ndarray
+    selected_indices: np.ndarray | None = None
 
     def clear(self) -> None:
         """Release arrays held by this dissipation result."""
@@ -33,6 +38,7 @@ class DissipationResult:
         self.area = empty.copy()
         self.efficiency = empty.copy()
         self.sound_speed = empty.copy()
+        self.selected_indices = None
         gc.collect()
 
 
@@ -126,10 +132,12 @@ def compute_dissipation(
     area = np.zeros(n, dtype=np.float64)
     efficiency = np.zeros(n, dtype=np.float64)
     sound_speed = np.zeros(n, dtype=np.float64)
+    cell_ids = result.selected_indices if center_selection is None else result.selected_indices[center_selection]
 
     valid = result.shock & (result.mach > 1.0) & (result.upstream_index >= 0)
     if not np.any(valid):
-        return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency, sound_speed=sound_speed)
+        return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency,
+                                 sound_speed=sound_speed, selected_indices=cell_ids)
 
     retained_rows = result.selected_indices
     upstream_rows = retained_rows[result.upstream_index[valid]]
@@ -157,7 +165,8 @@ def compute_dissipation(
     total[target] = flux_valid * area_valid
     efficiency[target] = delta
     sound_speed[target] = cs_cgs / 1.0e5
-    return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency, sound_speed=sound_speed)
+    return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency,
+                             sound_speed=sound_speed, selected_indices=cell_ids)
 
 
 def shock_surface_area(result, valid, dx_kpc, *, mode: str = "normal"):

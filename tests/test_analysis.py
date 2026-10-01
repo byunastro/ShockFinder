@@ -6,35 +6,24 @@ from shocktest import pyShockFinder
 from test_maps import grid_cell
 
 
-def group_signature(catalog):
-    return sorted(
-        (group.n_centers, group.mach_peak, group.mach_mean, group.area)
-        for group in catalog.groups
-    )
-
-
 def test_single_pass_analysis_matches_separate_workflow():
-    cell = grid_cell()
     finder = shocktest.ShockFinder()
     finder.minlevel = 0
-
+    cell = grid_cell()
     separate_result = finder.find(cell)
     separate_dissipation = pyShockFinder.compute_dissipation(cell, separate_result)
-    separate_catalog = shocktest.build_shock_catalog(
-        separate_result,
-        dissipation=separate_dissipation,
-        deduplicate=True,
-        min_mach=finder.min_mach,
-    )
-    analysis = finder.analyze(cell)
-
-    np.testing.assert_allclose(analysis.result.mach, separate_result.mach)
+    separate_catalog, labels = shocktest.shock_front_catalog(
+        separate_result, separate_dissipation, return_labels=True)
+    analysis = finder.analyze(cell, compute_dissipation=True, build_catalog=True)
     np.testing.assert_array_equal(analysis.result.shock, separate_result.shock)
-    np.testing.assert_array_equal(
-        analysis.result.upstream_index, separate_result.upstream_index
-    )
-    np.testing.assert_allclose(analysis.dissipation.total, separate_dissipation.total)
-    assert group_signature(analysis.catalog) == group_signature(separate_catalog)
+    for name in shocktest.front_dtype.names:
+        np.testing.assert_array_equal(analysis.catalog[name], separate_catalog[name])
+    np.testing.assert_array_equal(analysis.labels, labels)
+    assert analysis.catalog.dtype.itemsize == 78
+    for front in analysis.catalog:
+        rows = np.flatnonzero(analysis.labels == front['front_id'])
+        assert len(rows) == front['ncell']
+        assert analysis.result.shock[rows].all()
 
 
 def test_single_pass_builds_neighbor_tables_once(monkeypatch):
@@ -69,7 +58,7 @@ def test_analysis_reports_timings_and_counts():
     assert analysis.timings["total"] >= analysis.timings["detection_total"]
     assert analysis.counts["retained"] == analysis.result.mach.size
     assert analysis.counts["shock"] == np.count_nonzero(analysis.result.shock)
-    assert analysis.counts["groups"] == len(analysis.catalog.groups)
+    assert analysis.counts["groups"] == len(analysis.catalog)
 
 
 def test_analysis_optional_products_and_clear():
@@ -105,7 +94,7 @@ def test_analysis_handles_empty_extracted_region():
 
     assert analysis.result.mach.size == 0
     assert analysis.dissipation.total.size == 0
-    assert analysis.catalog.groups == []
+    assert len(analysis.catalog) == 0
     assert analysis.counts["retained"] == 0
 
 
@@ -133,14 +122,24 @@ def test_analysis_rejects_inconsistent_dissipation_gamma():
         finder.analyze(grid_cell(), dissipation_options={"gamma": 5.0 / 3.0})
 
 
-def test_analysis_builds_physical_catalog_from_input_cell():
+def test_analysis_forwards_grouping_options_and_uses_single_builder():
     finder = shocktest.ShockFinder()
-    finder.minlevel = 0
+    options = dict(min_group_size=1, mach_tolerance=0.1, connectivity='face', gap_factor=0.25)
+    analysis = finder.analyze(grid_cell(), catalog_options=options)
+    expected, labels = shocktest.shock_front_catalog(analysis.result, analysis.dissipation,
+                                                   return_labels=True, **options)
+    for name in expected.dtype.names:
+        np.testing.assert_array_equal(analysis.catalog[name], expected[name])
+    np.testing.assert_array_equal(analysis.labels, labels)
+    analysis.clear()
+    assert analysis.labels is None
 
-    analysis = finder.analyze(grid_cell(), external_temperature=2.0e7)
 
-    assert analysis.catalog.groups
-    assert all(
-        group.classification == "external" for group in analysis.catalog.groups
-    )
-    assert all(np.isfinite(group.upstream_temperature) for group in analysis.catalog.groups)
+def test_compact_grouping_uses_saved_consistency_diagnostics():
+    finder = shocktest.ShockFinder()
+    options = dict(require_mach_consistent=True, min_group_size=1)
+    expected = finder.analyze(grid_cell(), catalog_options=options).to_compact()
+    actual = finder.analyze(grid_cell(), compact=True, catalog_options=options)
+    np.testing.assert_array_equal(actual['group_id'], expected['group_id'])
+    for name in actual.groups.dtype.names:
+        np.testing.assert_array_equal(actual.groups[name], expected.groups[name])

@@ -198,45 +198,12 @@ def test_units_required_and_streaming_outputs_round_trip(tmp_path):
     assert not (tmp_path/"README.md").exists()
 
 
-@pytest.mark.parametrize("cached_endpoints", [None, True, False])
-def test_adapter_reads_native_merger_catalog_and_saved_km_cells(monkeypatch, tmp_path, cached_endpoints):
-    from examples.shock_catalog import (merger_shock_catalog,
-                                        cache_merger_shock_inputs)
-    from shocktest.core import ShockResult
-    from shocktest.pyShockFinder import DissipationResult
-    import shocktest
-    monkeypatch.setattr(shocktest.ShockFinder, "find", lambda *a, **kw: pytest.fail("must not rerun ShockFinder"))
+def test_generic_front_catalog_does_not_imply_merger_attribution():
+    from shocktest import front_dtype
     h, c = histories()
-    c["redshift"] = np.full(21, .67)
-    c["merger_shock_options"] = {"cluster_extent_kpc": 5.,
-                                 "candidate_score": .55, "thresholds_calibrated": True}
-    products = {}
-    for s, t in zip(h["iout"], h["t_BB"]):
-        x = 100.+500.*(t-7.)
-        pos = np.array([[x-4., 0, 0], [x, -4., 0], [x, 0., 0], [x, 4., 0], [x+4., 0, 0]])*3.0856775814913673e16
-        mask = np.array([False, True, True, True, False])
-        dense = np.array([-1, 1, 2, 3, -1], np.int32)
-        result = ShockResult(np.where(mask, 3., 0.), mask, dense, np.where(mask, 0, -1).astype(np.int32),
-                             np.where(mask, 4, -1).astype(np.int32), np.arange(5)+1000,
-                             pos=pos, dx=np.full(5, 4.*3.0856775814913673e16),
-                             normal=np.tile([1., 0, 0], (5, 1)), mach_consistent=mask, position_unit="km")
-        diss = DissipationResult(np.full(5, 1.e39), np.full(5, 16.e39), np.full(5, 16.), np.zeros(5), np.zeros(5))
-        catalog = merger_shock_catalog(int(s), result, diss, c)
-        if cached_endpoints is not None:
-            result = cache_merger_shock_inputs(int(s), result, diss, tmp_path/str(s),
-                                              include_endpoints=cached_endpoints, chunk_size=2)
-            diss = None
-        products[int(s)] = {"catalog": catalog, "result": result, "dissipation": diss, "complete": True}
-    before = pickle.dumps(products)
-    analysis = run(h, c, products)
-    # Snapshot-local front IDs must not invent a temporally tracked crossing.
-    assert not any(e["crossed"] for e in analysis["shock_encounters"])
-    data = analysis["diagnostic_series"]["branch-42"]
-    assert data["shock_distance_kpc"][4] == pytest.approx(0., abs=1.e-10)
-    assert data["shock_cell_size_kpc"][4] == pytest.approx(4.)
-    assert data["shock_id"][4] in (1, 2, 3)
-    assert data["shock_side"][4] == ("unknown" if cached_endpoints is False else "straddling")
-    assert pickle.dumps(products) == before
+    products = {int(s): {"catalog": np.empty(0, dtype=front_dtype)} for s in h["iout"]}
+    with pytest.raises(ValueError, match="independently assessed merger members"):
+        run(h, c, products)
 
 
 def test_no_derivatives_or_crossings_across_important_history_gap():

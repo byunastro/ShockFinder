@@ -153,9 +153,9 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         orbital turning-point detection.
     merger_shocks : mapping or callable
         Snapshot -> product, or callable(iout) -> product/None for streaming.
-        A product is either ``{'catalog': snapshot_merger_catalog,
-        'result': saved_result, 'dissipation': saved_dissipation, ...}`` or
-        ``{'members': [get_merger_shock_members(...) outputs], ...}``.
+        A product is ``{'members': [independently_assessed_front_members], ...}``.
+        Generic shock_front_catalog arrays contain no merger attribution and
+        are not accepted as independently assessed merger shocks.
         Front assessments MUST carry independently established classification,
         evidence and a snapshot-local front_id, or an independently supplied
         track_origin for crossing measurements across outputs. Snapshot-local
@@ -166,13 +166,12 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         positions/trajectories in this output. Optional ``covered_galaxy_ids``
         restricts that assertion. Missing products/unspecified coverage are
         unknown exposure, never non-exposure. Empty covered products are valid.
-        Raw catalogs are compacted one output at a time. Products are not
+        Supplied members are compacted one output at a time. Products are not
         retained in the return value. Cell/patch IDs are not assumed persistent.
         Optional ``provenance`` records source paths/checksums verbatim in the
-        output. Native catalog fingerprints are retained automatically;
-        rerunning geometry with different options requires the saved cell data.
+        output; rerunning geometry requires the saved cell data.
     cluster_info : mapping, optional
-        Same full history as merger_shock_catalog: iout, t_BB, ccen1/ccen2,
+        Independently supplied cluster history: iout, t_BB, ccen1/ccen2,
         optional rvir1/rvir2 and redshift. position_unit defaults to physical
         kpc following the supplied NewCluster conversion. NaN secondary
         centers after branch termination are allowed. Optional box_size is a
@@ -869,16 +868,7 @@ def _stripping_frame(product, snapshot, box, cfg):
     result = product.get("result")
     time_gyr, epoch = product.get("time_gyr"), None
     if members is None:
-        from examples.shock_catalog import get_merger_shock_members
-        catalog = product["catalog"]
-        if int(catalog["iout"]) != snapshot:
-            raise ValueError("shock catalog snapshot does not match its product key")
-        metadata = catalog.get("metadata", {})
-        time_gyr = metadata.get("time_gyr", time_gyr)
-        epoch = catalog.get("epoch_verification", {}).get("pericenter")
-        members = [get_merger_shock_members(catalog, f["shock_id"], result, product["dissipation"])
-                   for f in catalog["fronts"] if f["classification"] in ("candidate", "uncertain")
-                   and f["evidence"] >= cfg.min_front_evidence]
+        raise ValueError("supply independently assessed merger members; generic shock_front_catalog outputs have no merger evidence")
     fronts = {}
     for member in members:
         if int(member["iout"]) != snapshot:
@@ -1226,11 +1216,8 @@ def _stripping_associate_shocks(series, merger_shocks, cfg):
     for snapshot in sorted(schedule, key=lambda s: schedule[s][0]):
         product = merger_shocks(snapshot) if callable(merger_shocks) else merger_shocks.get(snapshot)
         if product is not None:
-            catalog = product.get("catalog", {})
-            provenance[snapshot] = {"supplied": product.get("provenance"), "catalog_source": catalog.get("source"),
-                                    "source_fingerprints": catalog.get("membership", {}).get("source_fingerprint"),
+            provenance[snapshot] = {"supplied": product.get("provenance"),
                                     "complete": bool(product.get("complete", False))}
-            catalog = None
         frame = _stripping_frame(product, snapshot, schedule[snapshot][1], cfg)
         if frame is not None and frame["time_gyr"] is not None and not np.isclose(frame["time_gyr"], schedule[snapshot][0], atol=1.e-6, rtol=0.):
             raise ValueError("merger catalog and galaxy cosmic times disagree for the same snapshot")
@@ -1514,7 +1501,7 @@ def run_shockfinder(cell, *, minlevel=15, maxlevel=20, min_mach=1.5, show_progre
     return result, dissipation
 
 
-def shock_front_catalog(result, dissipation, *, min_mach=1.5, min_flux=0.0):
+def shock_front_samples(result, dissipation, *, min_mach=1.5, min_flux=0.0):
     """Build positions, normals, and strengths for selected shock cells."""
 
     shock_mask = result.shock & (result.mach >= min_mach) & (dissipation.flux > min_flux)
@@ -1626,7 +1613,7 @@ def classify_galaxy_shock_crossing(
     galaxy_pos_prev, galaxy_pos_now:
         Galaxy positions at two snapshots, in km, with matching row order.
     shock_catalog:
-        Output from ``shock_front_catalog``.
+        Output from ``shock_front_samples``.
     search_radius_km:
         Maximum distance from the galaxy trajectory samples to a shock cell.
     width_factor:
@@ -1926,7 +1913,7 @@ if __name__ == "__main__":
     galaxy_pos_now = ...    # The galaxy positions at the current snapshot, shape (ngal, 3) in km.
 
     result, dissipation = run_shockfinder(cell)
-    catalog = shock_front_catalog(result, dissipation, min_mach=1.5)
+    catalog = shock_front_samples(result, dissipation, min_mach=1.5)
     catalog = filter_large_shock_fronts(
         catalog,
         link_length_km=50.0 * KPC_IN_KM,

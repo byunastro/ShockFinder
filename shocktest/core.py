@@ -147,42 +147,35 @@ class ShockFinder:
         *,
         compute_dissipation: bool = True,
         build_catalog: bool = True,
-        deduplicate: bool = True,
-        mach_tolerance: float = 0.3,
-        normal_cosine: float = 0.7,
-        duplicate_normal_cosine: float = 0.8,
-        min_mach: float | None = None,
-        external_temperature: float = 1.0e4,
-        classification_fraction: float = 0.8,
-        boundary_margin_cells: float = 0.0,
-        minimum_group_centers: int = 2,
-        maximum_normal_dispersion: float = 0.3,
-        provenance: dict[str, object] | None = None,
+        catalog_options: dict[str, Any] | None = None,
         dissipation_options: dict[str, Any] | None = None,
         compact: bool = False,
         compact_options: dict[str, Any] | None = None,
     ):
         """Run shock detection and optional post-processing in one pass.
 
-        The AMR neighbor tables are retained only until catalog construction is
-        complete, avoiding the second geometry build required by the separate
-        ``find`` then ``build_shock_catalog`` workflow.
+        ``build_catalog=True`` calls ``shock_front_catalog`` with catalog_options
+        and returns its 78-byte structured rows in analysis.catalog. Membership
+        is always retained in analysis.labels, aligned with analysis.result.
+        Defaults and grouping are identical to a separate call on those products.
         """
 
         from .analysis import ShockAnalysis
-        from .catalog import build_shock_catalog as make_catalog
+        from .fronts import shock_front_catalog
         from .pyShockFinder import compute_dissipation as make_dissipation
 
+        if catalog_options is not None and not build_catalog:
+            raise ValueError('catalog_options requires build_catalog=True')
         analysis_start = time.perf_counter()
         if compact_options is not None and not compact:
             raise ValueError("compact_options requires compact=True")
         validation_sink = {} if compact else None
         result, neighbor_tables, timings = self._find_internal(cell, validation_sink=validation_sink)
-        # Neighbor arrays are only needed by the optional catalog after detection.
-        if not build_catalog:
-            neighbor_tables = None
+        # Catalogs use the same saved-geometry path, with or without analyze.
+        del neighbor_tables
         dissipation = None
         catalog = None
+        labels = None
         if compute_dissipation:
             stage_start = time.perf_counter()
             options = {} if dissipation_options is None else dict(dissipation_options)
@@ -201,48 +194,43 @@ class ShockFinder:
                 cell, result, _compact=compact, **options
             )
             timings["dissipation"] = time.perf_counter() - stage_start
-        if build_catalog:
-            stage_start = time.perf_counter()
-            catalog = make_catalog(
-                result,
-                cell=cell,
-                dissipation=dissipation,
-                mach_tolerance=mach_tolerance,
-                normal_cosine=normal_cosine,
-                deduplicate=deduplicate,
-                duplicate_normal_cosine=duplicate_normal_cosine,
-                min_mach=self.min_mach if min_mach is None else min_mach,
-                boundary=self.boundary,
-                external_temperature=external_temperature,
-                classification_fraction=classification_fraction,
-                boundary_margin_cells=boundary_margin_cells,
-                minimum_group_centers=minimum_group_centers,
-                maximum_normal_dispersion=maximum_normal_dispersion,
-                provenance=provenance,
-                _neighbor_tables=neighbor_tables,
-                _dissipation_rows=np.flatnonzero(result.shock) if compact and dissipation is not None else None,
-            )
-            timings["catalog"] = time.perf_counter() - stage_start
-        timings["total"] = time.perf_counter() - analysis_start
-        analysis = ShockAnalysis(
-            result=result,
-            dissipation=dissipation,
-            catalog=catalog,
-            timings=timings,
-        )
+        options = {} if catalog_options is None else dict(catalog_options)
+        if 'return_labels' in options:
+            raise ValueError('analyze always stores membership; omit return_labels')
         if compact:
-            compact_start = time.perf_counter()
+            # Group the independent compact product so saved validation flags
+            # are available without expanding diagnostics or labels to the mesh.
             from .compact import compact_shocks
+            compact_start = time.perf_counter()
             samples = compact_shocks(
-                result, dissipation, catalog, timings=timings,
+                result, dissipation, timings=timings,
                 _validation=validation_sink.get("result"),
                 _compact_dissipation=True, **(compact_options or {}),
             )
-            analysis.clear()
-            samples.timings["compact"] = time.perf_counter() - compact_start
-            samples.timings["total"] = time.perf_counter() - analysis_start
+            timings['compact'] = time.perf_counter() - compact_start
+            result.clear()
+            if dissipation is not None:
+                dissipation.clear()
+            if build_catalog:
+                stage_start = time.perf_counter()
+                samples.groups, samples.columns['group_id'] = shock_front_catalog(
+                    samples, return_labels=True, **options)
+                timings['catalog'] = time.perf_counter() - stage_start
+                samples.metadata['counts']['groups'] = len(samples.groups)
+                samples.metadata['counts']['representative'] = int(samples.groups['ncell'].sum(dtype=np.int64))
+                samples.metadata['catalog'] = {'schema': 'front_dtype', 'bytes_per_row': 78}
+            timings['total'] = time.perf_counter() - analysis_start
+            samples.timings = timings
             return samples
-        return analysis
+        if build_catalog:
+            stage_start = time.perf_counter()
+            catalog, labels = shock_front_catalog(
+                result, dissipation, return_labels=True, **options
+            )
+            timings["catalog"] = time.perf_counter() - stage_start
+        timings["total"] = time.perf_counter() - analysis_start
+        return ShockAnalysis(result=result, dissipation=dissipation, catalog=catalog,
+                             timings=timings, labels=labels)
 
     def clear(self) -> None:
         """Compatibility cleanup hook.

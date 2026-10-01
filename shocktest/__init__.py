@@ -20,6 +20,11 @@ from .exposure import (
 )
 from .compact import ShockSamples, compact_shocks
 from .core import ShockFinder, ShockResult
+from .fronts import (
+    shock_front_catalog, front_dtype, QUALITY_OK, QUALITY_NO_AREA,
+    QUALITY_NO_DISS_RATE, QUALITY_UNDEFINED_NORMAL, QUALITY_APPROX_CONNECTIVITY,
+    QUALITY_GAP_BRIDGED, QUALITY_PARTIAL_SUMMARY,
+)
 from .mach_validation import (
     MachValidationFlag,
     mach_from_density_jump,
@@ -37,29 +42,20 @@ from .catalog_io import (
     save_shock_catalog_csv,
 )
 from .catalog_qa import plot_catalog_quality, summarize_catalog_quality
-from .catalog import (
-    CatalogSensitivity,
-    ShockCatalog,
-    ShockGroup,
-    analyze_catalog_sensitivity,
-    build_shock_catalog,
-)
 
 __all__ = [
+    "shock_front_catalog", "front_dtype", "QUALITY_OK", "QUALITY_NO_AREA",
+    "QUALITY_NO_DISS_RATE", "QUALITY_UNDEFINED_NORMAL", "QUALITY_APPROX_CONNECTIVITY",
+    "QUALITY_GAP_BRIDGED", "QUALITY_PARTIAL_SUMMARY",
     "ShockFrame", "MergerEvent", "MergerAttribution", "ExposureRecord", "ExposureInterval",
     "ExposureAccumulator", "attribute_merger_shocks", "integrate_galaxy_exposure",
     "ShockSamples",
     "compact_shocks",
-    "ShockCatalog",
     "ShockAnalysis",
-    "CatalogSensitivity",
     "CATALOG_SCHEMA_VERSION",
     "ShockFinder",
-    "ShockGroup",
     "ShockResult",
     "MachValidationFlag",
-    "analyze_catalog_sensitivity",
-    "build_shock_catalog",
     "load_shock_catalog",
     "plot_catalog_quality",
     "save_shock_catalog",
