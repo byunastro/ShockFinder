@@ -13,7 +13,7 @@ import pytest
 from shocktest import _merger_neighbors
 from shocktest._native import extension_directory, load_extension
 from shocktest.core import _shockfinder
-from tools.build_extensions import install_extensions
+from tools.build_extensions import fortran_build_environment, install_extensions
 
 
 def test_native_modules_load_from_active_environment():
@@ -77,3 +77,13 @@ def test_install_extensions_handles_separate_build_filesystem(tmp_path, monkeypa
     for artifact, target in built:
         assert target.read_bytes() == artifact.read_bytes()
     assert not list(destination.glob(".f2py-install-*"))
+
+
+def test_fortran_flags_reach_mesons_environment_without_leaking_between_modules(monkeypatch):
+    monkeypatch.setenv("FFLAGS", "-march=native")
+    shock = fortran_build_environment("-O3 -fopenmp")
+    neighbors = fortran_build_environment("-O3 -fopenmp -ffp-contract=off")
+
+    assert shock["FFLAGS"] == "-march=native -O3 -fopenmp"
+    assert neighbors["FFLAGS"] == "-march=native -O3 -fopenmp -ffp-contract=off"
+    assert os.environ["FFLAGS"] == "-march=native"

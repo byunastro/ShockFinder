@@ -54,6 +54,9 @@ floating-point contraction settings. An empty `SHOCKFINDER_OPENMP_LIB` omits
 the explicit OpenMP library. Set OpenMP variables before starting Python and
 choose a thread count appropriate to the available cores and memory.
 
+The build also passes the Fortran flags through `FFLAGS`, because NumPy 1.26's
+Meson F2PY backend does not apply `--f90flags`. Existing `FFLAGS` are retained.
+
 ## 2. Use
 
 The following example explicitly sets

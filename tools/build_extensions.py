@@ -17,6 +17,15 @@ PACKAGE = ROOT / "shocktest"
 SOURCES = ("shockfinder", "merger_neighbors")
 
 
+def fortran_build_environment(flags: str) -> dict[str, str]:
+    """Pass Fortran flags through Meson as well as F2PY's CLI option."""
+    env = os.environ.copy()
+    # NumPy 1.26's Meson template ignores --f90flags. Meson reads FFLAGS
+    # during its fresh setup, so keep any existing flags and append ours.
+    env["FFLAGS"] = " ".join(part for part in (env.get("FFLAGS", ""), flags.strip()) if part)
+    return env
+
+
 def install_extensions(built: list[tuple[Path, Path]], destination: Path) -> None:
     """Stage on the destination filesystem before replacing existing modules."""
     destination.mkdir(parents=True, exist_ok=True)
@@ -69,8 +78,10 @@ def main() -> None:
             ]
             if openmp_library:
                 command.append(f"-l{openmp_library}")
+            build_env = fortran_build_environment(flags)
             print(f"Building {name} with {os.environ.get('FC', 'default Fortran compiler')}", flush=True)
-            subprocess.run(command, cwd=work, check=True)
+            print(f"Fortran flags: {build_env['FFLAGS']}", flush=True)
+            subprocess.run(command, cwd=work, check=True, env=build_env)
             artifact = work / f"{name}{suffix}"
             if not artifact.is_file():
                 raise RuntimeError(f"F2PY did not produce the expected extension: {artifact}")
