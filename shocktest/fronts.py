@@ -60,7 +60,7 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
                         min_group_size=3, mach_tolerance=0.3, normal_cosine=0.5,
                         surface_offset_factor=0.25, surface_angle_cosine=0.5,
                         connectivity='touch', gap_factor=0., min_mach=1.,
-                        require_mach_consistent=False, assume_aligned=False,
+                        require_mach_consistent=False,
                         atol=1.e-9, rtol=1.e-7, normal_tolerance=1.e-6,
                         chunk_size=131072, query_chunk_size=4096,
                         max_neighbor_pairs=200000, thread=1):
@@ -75,11 +75,14 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
     No cluster metadata, periodic wrapping, detector runs or file I/O is used.
 
     dissipation.area is effective center area in kpc2; dissipation.total is
-    integrated power in erg/s. Flux is NEVER substituted for total. IDs in
-    dissipation.selected_indices join to result.selected_indices independently
-    of row order. Old ID-less files require assume_aligned=True only after
-    verifying retained-row alignment. None uses ShockSamples embedded values,
-    otherwise unavailable totals are NaN. Inputs are never modified.
+    integrated power in erg/s. Flux is NEVER substituted for total. The official
+    output contract is identical row count/order to result, including non-shock
+    rows: ID-less arrays are indexed directly with no join or extra ID storage.
+    Do not independently reorder/filter dissipation or pair different runs.
+    Length checks cannot detect same-length mismatched files. Historical files
+    carrying selected_indices still use ID joining, including reordered records.
+    None uses ShockSamples embedded values, otherwise totals are NaN.
+    Inputs are never modified.
 
     Options
     -------
@@ -98,7 +101,6 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
         still subject to Mach/normal/tangential checks; accepted gaps flag 16.
     min_mach=1: lower Mach threshold (exclusive for finite values).
     require_mach_consistent=False: opt in to saved consistency diagnostics.
-    assume_aligned=False: explicit legacy dissipation alignment assertion.
     atol=1e-9 (kpc), rtol=1e-7: absolute/relative contact tolerances.
     normal_tolerance=1e-6: weighted normal resultant threshold; cancellation
         returns NaN normal, retaining the front.
@@ -136,7 +138,7 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
         _positive_int(val, name)
     if min_group_size > _I32_MAX:
         raise OverflowError('min_group_size exceeds int32 ncell')
-    for name, val in [('return_labels', return_labels), ('assume_aligned', assume_aligned),
+    for name, val in [('return_labels', return_labels),
                       ('require_mach_consistent', require_mach_consistent)]:
         if not isinstance(val, (bool, np.bool_)):
             raise ValueError(f'{name} must be boolean')
@@ -153,7 +155,7 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
         raise ValueError('normal_tolerance must be in [0, 1)')
     if connectivity not in ('touch', 'face'):
         raise ValueError("connectivity must be 'touch' or 'face'")
-    data, nrecords = _prepare(result, dissipation, assume_aligned, min_mach,
+    data, nrecords = _prepare(result, dissipation, min_mach,
                               require_mach_consistent, chunk_size)
     n = len(data['rows'])
     labels = np.full(nrecords, -1, np.int32) if return_labels else None
@@ -184,7 +186,7 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
     return (catalog, labels) if return_labels else catalog
 
 
-def _prepare(result, dissipation, assume_aligned, min_mach, consistent, chunk):
+def _prepare(result, dissipation, min_mach, consistent, chunk):
     compact = isinstance(result, ShockSamples)
     source = result.columns if compact else result
     pos = np.asarray(_value(source, 'pos'))
@@ -266,14 +268,14 @@ def _prepare(result, dissipation, assume_aligned, min_mach, consistent, chunk):
     positions = np.asarray(pos[rows], dtype=np.float64)*factor
     if not np.all(np.isfinite(positions)):
         raise ValueError('converted positions must be finite')
-    area, total = _dissipation(source, ids, rows, dissipation, compact, assume_aligned, chunk)
+    area, total = _dissipation(source, ids, rows, dissipation, compact, chunk)
     return dict(rows=rows, pos=positions, dx=widths,
                 normal=normals, normal_valid=normal_valid,
                 mach=np.full(count, np.nan) if mach is None else np.asarray(mach[rows], dtype=float),
                 area=area, total=total), n
 
 
-def _dissipation(source, ids, rows, diss, compact, aligned, chunk):
+def _dissipation(source, ids, rows, diss, compact, chunk):
     if diss is None:
         if compact:
             return tuple(np.full(len(rows), np.nan) if _value(source, 'dissipation_'+key) is None
@@ -285,11 +287,15 @@ def _dissipation(source, ids, rows, diss, compact, aligned, chunk):
             raise ValueError(f'{key} must be {expected}; convert saved values explicitly')
     diss_ids = _value(diss, 'selected_indices')
     if diss_ids is None:
-        if not aligned:
-            raise ValueError('dissipation has no selected_indices: provide IDs or explicitly set assume_aligned=True for legacy row order')
         n = len(ids)
-        index = rows
-        found = np.ones(len(rows), bool)
+        for key in ('flux', 'efficiency', 'sound_speed'):
+            _array(diss, key, (n,), optional=True)
+        output = []
+        for key in ('area', 'total'):
+            values = _array(diss, key, (n,), optional=True)
+            output.append(np.full(len(rows), np.nan) if values is None
+                          else np.asarray(values[rows], dtype=float))
+        return tuple(output)
     else:
         diss_ids = _ids(diss_ids, 'dissipation.selected_indices')
         n = len(diss_ids)
@@ -311,6 +317,9 @@ def _dissipation(source, ids, rows, diss, compact, aligned, chunk):
             found[found] &= sorted_ids[loc[found]] == ids[rows[found]]
             index = np.zeros(len(rows), np.int64)
             index[found] = loc[found] if order is None else order[loc[found]]
+    # Validate any additional supplied columns, without copying them.
+    for key in ('flux', 'efficiency', 'sound_speed'):
+        _array(diss, key, (n,), optional=True)
     out = []
     for key in ('area', 'total'):
         values = _array(diss, key, (n,), optional=True)

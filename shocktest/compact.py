@@ -123,8 +123,6 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
             columns[name.replace('_index', '_pos')] = pos
     if dissipation is not None:
         for field in fields(dissipation):
-            if field.name == 'selected_indices':
-                continue  # Already represented once by input_row.
             name = 'dissipation_' + field.name
             if keep(name):
                 value = getattr(dissipation, field.name)

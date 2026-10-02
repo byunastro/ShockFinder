@@ -14,12 +14,25 @@ MSUN = 1.98847e33  # g
 KPC = 3.0856775814913673e21  # cm
 
 
+class _LegacyDissipationIDs:
+    # Loading old slotted pickles may populate this slot. New products never do.
+    # Preserve old IDs when resaving: discarding them could lose reordered data's
+    # only alignment information. This is not a field in the new output schema.
+    __slots__ = ('selected_indices',)
+
+
 @dataclass(slots=True)
-class DissipationResult:
+class DissipationResult(_LegacyDissipationIDs):
     """Saved flux (erg/s/kpc²), power (erg/s), and effective area (kpc²).
 
-    selected_indices identifies original input cells. Older pickles may lack
-    this field; consumers must explicitly confirm their retained-row alignment.
+    Official dense contract: field[i] corresponds to result row i, including
+    zero entries for uncomputed/non-shock rows. Never independently reorder or
+    filter these arrays. Original input IDs live only in result.selected_indices.
+    The internal _compact path uses result.shock's ascending retained-row order;
+    these fields are embedded into the matching ShockSamples columns.
+    Pickle omits total when it is exactly flux * area, and reconstructs it on
+    load. Independently edited totals are preserved. No duplicate IDs are saved
+    for new products. The in-memory interface still contains all five arrays.
     """
 
     flux: np.ndarray
@@ -27,7 +40,32 @@ class DissipationResult:
     area: np.ndarray
     efficiency: np.ndarray
     sound_speed: np.ndarray
-    selected_indices: np.ndarray | None = None
+
+    def __getstate__(self):
+        state = {name: getattr(self, name) for name in
+                 ('flux', 'total', 'area', 'efficiency', 'sound_speed', 'selected_indices')
+                 if hasattr(self, name)}
+        flux, area, total = self.flux, self.area, self.total
+        if (all(isinstance(a, np.ndarray) and a.ndim == 1 for a in (flux, area, total))
+                and flux.shape == area.shape == total.shape
+                and total.dtype == np.result_type(flux.dtype, area.dtype)):
+            # Byte comparison also preserves signed zeros and custom NaN payloads.
+            # Only chunk-sized temporaries are allocated, even for large snapshots.
+            with np.errstate(over='ignore', invalid='ignore', under='ignore'):
+                identical = all(total[start:start+131072].tobytes() ==
+                    (flux[start:start+131072] * area[start:start+131072]).tobytes()
+                    for start in range(0, total.size, 131072))
+            if identical:
+                del state['total']
+        return None, state
+
+    def __setstate__(self, state):
+        values = state[1] if isinstance(state, tuple) else state
+        for name, value in values.items():
+            setattr(self, name, value)
+        if 'total' not in values:
+            with np.errstate(over='ignore', invalid='ignore', under='ignore'):
+                self.total = self.flux * self.area
 
     def clear(self) -> None:
         """Release arrays held by this dissipation result."""
@@ -38,7 +76,8 @@ class DissipationResult:
         self.area = empty.copy()
         self.efficiency = empty.copy()
         self.sound_speed = empty.copy()
-        self.selected_indices = None
+        if hasattr(self, 'selected_indices'):
+            del self.selected_indices  # Loaded legacy payload, if any.
         gc.collect()
 
 
@@ -117,6 +156,10 @@ def compute_dissipation(
     ``area_mode="normal"`` estimates the shock surface area from the local
     upstream-to-downstream normal. ``area_mode="cell"`` keeps the older ``dx^2``
     area approximation.
+
+    Dense outputs retain exactly result's row count and order; valid values are
+    scattered into their original rows, and other rows stay zero. _compact is
+    internal: its order is flatnonzero(result.shock), not the dense result.
     """
 
     gamma = result.gamma if gamma is None else float(gamma)
@@ -132,12 +175,11 @@ def compute_dissipation(
     area = np.zeros(n, dtype=np.float64)
     efficiency = np.zeros(n, dtype=np.float64)
     sound_speed = np.zeros(n, dtype=np.float64)
-    cell_ids = result.selected_indices if center_selection is None else result.selected_indices[center_selection]
 
     valid = result.shock & (result.mach > 1.0) & (result.upstream_index >= 0)
     if not np.any(valid):
         return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency,
-                                 sound_speed=sound_speed, selected_indices=cell_ids)
+                                 sound_speed=sound_speed)
 
     retained_rows = result.selected_indices
     upstream_rows = retained_rows[result.upstream_index[valid]]
@@ -166,7 +208,7 @@ def compute_dissipation(
     efficiency[target] = delta
     sound_speed[target] = cs_cgs / 1.0e5
     return DissipationResult(flux=flux, total=total, area=area, efficiency=efficiency,
-                             sound_speed=sound_speed, selected_indices=cell_ids)
+                             sound_speed=sound_speed)
 
 
 def shock_surface_area(result, valid, dx_kpc, *, mode: str = "normal"):

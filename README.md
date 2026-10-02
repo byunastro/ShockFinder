@@ -1,9 +1,8 @@
 # ShockFinder
 
-ShockFinder is a Fortran-backed Python framework for studying how cluster
-merger shocks affect galaxies. It detects shocks in the intracluster medium
-(ICM), measures Mach numbers and thermal dissipation, groups shock structures,
-and supports galaxy matching and time-resolved exposure measurements. The AMR
+ShockFinder is a Fortran-backed Python framework for detecting shocks in the intracluster medium
+(ICM), measuring Mach numbers and thermal dissipation, groups shock structures,
+and supporting galaxy matching and time-resolved exposure measurements. The AMR
 shock detector follows the methodology of Skillman et al. (2008, ApJ 689, 1063).
 
 ## 1. Build
@@ -21,46 +20,16 @@ RUN_PYTHON="$CONDA_PREFIX/bin/python"
 PYTHON="$RUN_PYTHON" ./f2py.sh
 # Use "$RUN_PYTHON" for the analysis job too.
 
-"$RUN_PYTHON" -c 'import sys, numpy, shocktest; from shocktest.core import _shockfinder; from shocktest import _merger_neighbors; print(sys.executable, numpy.__version__, shocktest.__file__, _shockfinder.__file__, _merger_neighbors.__file__)'
-
+# OMP settings
 export OMP_NUM_THREADS=8
 export OMP_PROC_BIND=spread
 export OMP_PLACES=cores
 ```
 
-`f2py.sh` compiles fortran files into an ignored
-`shocktest/_f2py_builds/` subdirectory specific to the Python environment,
-extension ABI, and installed NumPy version. It verifies both imports and their
-resolved paths before reporting success. No `site-packages` copy is needed:
-Python must import this repository's `shocktest` package. For a script outside
-the repository, add the **repository root** to `sys.path` (or `PYTHONPATH`),
-then check `shocktest.__file__` and `_shockfinder.__file__` as above. Old `.so`
-files directly inside `shocktest/` are not selected by the package's normal
-imports.
-
-Outside conda, set `RUN_PYTHON` to the absolute path of the Python executable
-used by the analysis. Re-run the build command after changing the Python
-environment, Python version, or NumPy version, including an upgrade from NumPy
-1.x to 2.x. Use the same interpreter for the build, validation, and production
-run. If `python` and
-`python3` resolve to different executables, do not mix them.
-
-The default GNU Fortran flags remain `-O3 -fopenmp -lgomp`; the merger-neighbor
-module also uses `-ffp-contract=off` at AMR contact thresholds. Select a
-compiler with `FC` (and, if needed, `CC`). For a non-GNU compiler, set
-`SHOCKFINDER_F90FLAGS`, `SHOCKFINDER_OPENMP_LIB`, and
-`SHOCKFINDER_FP_CONTRACT_OFF_FLAG` to its equivalent optimization, OpenMP, and
-floating-point contraction settings. An empty `SHOCKFINDER_OPENMP_LIB` omits
-the explicit OpenMP library. Set OpenMP variables before starting Python and
-choose a thread count appropriate to the available cores and memory.
-
-The build also passes the Fortran flags through `FFLAGS`, because NumPy 1.26's
-Meson F2PY backend does not apply `--f90flags`. Existing `FFLAGS` are retained.
-
 ## 2. Use
 
 The following example explicitly sets
-**every finder parameter to its default**, with the purpose of each setting
+**commonly used finder parameters to their defaults**, with the purpose of each setting
 beside the assignment:
 
 ```python
@@ -71,22 +40,13 @@ finder = shocktest.ShockFinder()
 # Geometry: retain only cells within this inclusive AMR-level range.
 finder.minlevel = 0                  # Lowest retained AMR level.
 finder.maxlevel = 20                 # Highest retained AMR level.
-finder.neighbor_backend = "fortran"  # Fast implementation; "numpy" is a reference alternative.
-finder.neighbor_cache_dir = None     # Optional directory for reusable geometry/neighbor caches.
 
 # Thermodynamics and candidate selection.
-finder.gamma = 5.0 / 3.0             # Ideal-gas adiabatic index (> 1), shared with dissipation.
 finder.temperature_floor = 1.0e4     # Preshock temperature floor [K] for Mach/sound speed.
 finder.min_temperature = None        # Optional seed-cell lower T cut [K]; None disables it.
 finder.min_density = None            # Optional seed-cell lower density cut [Msol/kpc3].
 finder.max_density = None            # Optional seed-cell upper density cut [Msol/kpc3].
 finder.min_mach = 1.0                # Minimum accepted temperature-jump Mach number (>= 1).
-
-# Shock-zone and center searches.
-finder.max_steps = 50                # Maximum upstream/downstream walk steps; > 50 warns.
-finder.max_center_steps = 50         # Maximum center-search steps (>= 1).
-finder.center_normal_cosine = 0.7    # Minimum normal alignment during center walks [0, 1].
-finder.center_plateau_tolerance = 1.e-12  # Relative convergence tolerance; ties use position.
 
 # Unit keys used to access the input table; use these units for the full pipeline.
 finder.position_unit = "km"          # Positions and cell widths.
@@ -96,15 +56,11 @@ finder.density_unit = "Msol/kpc3"     # Gas mass density.
 
 # Independent pressure/density-jump Mach checks.
 finder.validate_mach = True          # Attach secondary Mach estimates and consistency flags.
-finder.filter_inconsistent = False  # True removes failed checks from result.shock only.
+finder.filter_inconsistent = False   # True removes failed checks from result.shock only.
 finder.consistency_factor = 1.5      # Accept secondary Mach within [M_T/f, f*M_T], f >= 1.
 finder.density_check_max_mach = 3.0   # Restrict density consistency checks to weak shocks.
-finder.density_saturation_rtol = 1.e-6  # Tolerance near the strong-shock density-ratio limit.
-finder.mach_validation_dtype = "float64"  # "float32" saves memory but changes secondary arithmetic.
-finder.thermal_pressure_field = None # Exact thermal-pressure key, or automatic thermal-only lookup.
 
 # Memory and progress controls.
-finder.index_dtype = "int64"         # "auto" uses int32 indices when their range safely fits.
 finder.show_progress = False         # Print input, neighbor, and shock-scan progress.
 finder.progress_interval = 0         # 0: automatic (~5%); otherwise a retained-cell count.
 
@@ -112,34 +68,84 @@ result = finder.find(cell)
 print("Detected centers:", result.shock.sum())
 ```
 
-`finder(cell)` and `finder.ShockFinder(cell)` are compatibility aliases for
-`finder.find(cell)`. The adopted Mach number always comes from the temperature
-jump. Pressure must pass its consistency check; density contributes where its
-check is applicable and is excluded near saturation. With
-`filter_inconsistent=False`, validation is diagnostic and does not alter the
+The adopted Mach number always comes from the temperature
+jump. With `filter_inconsistent=False`, validation is diagnostic and does not alter the
 shock mask. With filtering enabled, Mach values and endpoint indices remain
 available for auditing rejected centers: always select using `result.shock`.
 
 Level cuts change the retained mesh, so overly restrictive cuts can remove
 needed neighbors. Temperature/density cuts affect only detection seeds: other
-retained cells remain available as neighbors and endpoints. Missing boundary
-neighbors are not extrapolated. Center search uses local gradient normals,
+retained cells remain available as neighbors and endpoints. Center search uses local gradient normals,
 relative plateau tolerances, and physical-position tie breaking. AMR sampling
 uses the geometry of the contributing cells, including refinement interfaces.
 
 `finder.analyze` combines detection, optional dissipation, and optional catalog
 construction. Set `compute_dissipation` and `build_catalog` independently.
-With `build_catalog=True`, it calls the same `shock_front_catalog` used for saved
-results; pass grouping settings through `catalog_options`. It always stores
-original-result-order membership in `analysis.labels`. No main guard is needed
-for catalog query threads. Detector neighbor tables are released before the
-catalog's bounded spatial search; grouping never rebuilds the detector mesh.
-`dissipation_options` configures dissipation. `compact=True` returns ShockSamples;
-`compact_options` controls that product's storage profile.
 
-Dissipation inherits `gamma` and `temperature_floor` from detection; conflicting
-explicit settings are rejected. `timings` separates input loading, neighbor
-construction, scanning, dissipation, catalog construction, and total time.
+Use the following instead of `finder.find(cell)` when you also need dissipation
+and a catalog. This example uses Mach tolerance 0.2 and 20 query threads; the
+other catalog defaults are listed below.
+
+```python
+catalog_options = {
+    "connectivity": "touch",   # Allow face, edge, and corner contact.
+    "gap_factor": 0.0,         # Do not bridge gaps between cells.
+    "mach_tolerance": 0.2,     # Maximum relative Mach difference between neighbors.
+    "min_group_size": 3,       # Keep fronts with at least three shock centers.
+    "thread": 20,              # Maximum threads for catalog spatial queries.
+}
+analysis = finder.analyze(
+    cell,
+    compute_dissipation=True,  # Compute thermalization flux, area, and power.
+    build_catalog=True,        # Build fronts and retain their membership labels.
+    catalog_options=catalog_options,
+    dissipation_options={
+        "mu": 0.59,            # Mean molecular weight for the sound speed.
+        "area_mode": "normal", # Normal-corrected area; "cell" uses dx**2.
+    },
+    compact=False,             # Return dense ShockAnalysis; True returns ShockSamples.
+    compact_options=None,      # Only set when compact=True (see below).
+)
+result, dissipation = analysis.result, analysis.dissipation
+catalog, labels = analysis.catalog, analysis.labels
+```
+
+`catalog_options=None` and `dissipation_options=None` use their defaults.
+Only supply `catalog_options` when `build_catalog=True`. With
+`compute_dissipation=False`, the catalog's unavailable area and power are NaN.
+Dissipation inherits `gamma` and `temperature_floor` from the finder; explicit
+values must match. The defaults for `mu` and `area_mode` are shown above.
+
+For `compact=True`, `compact_options` may specify `profile="full"` (default;
+all compact fields) or `"science"` (essential scientific fields), and
+`index_dtype="int64"` (default) or `"auto"` (narrow integer indices when safe).
+The return then has `groups` and `columns["group_id"]`, rather than
+`analysis.catalog` and `analysis.labels`.
+
+Catalog options apply both to `catalog_options` and direct
+`shock_front_catalog` calls, except `return_labels`: `analyze` always retains
+membership when building a catalog, so omit that option from `catalog_options`.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `min_group_size` | 3 | Minimum center count; smaller components are excluded |
+| `mach_tolerance` | 0.3 | Maximum `abs(Mi-Mj)/max(Mi,Mj)` on each neighbor pair, range [0,1] |
+| `normal_cosine` | 0.5 | Minimum signed unit-normal dot product on each pair |
+| `surface_offset_factor` | 0.25 | Normal displacement limited to this times smaller cell width |
+| `surface_angle_cosine` | 0.5 | Normal displacement also limited to this times pair distance |
+| `connectivity` | `'touch'` | Faces/edges/corners; `'face'` requires positive face overlap |
+| `gap_factor` | 0 | Optional extra reach in units of larger cell width; disabled by default |
+| `min_mach` | 1 | Finite Mach must be strictly greater than this threshold |
+| `require_mach_consistent` | False | Require saved Mach-consistency diagnostics |
+| `return_labels` | False | Return `(catalog, labels)` instead of only the catalog |
+| `atol`, `rtol` | 1e-9 kpc, 1e-7 | Absolute/relative spatial contact tolerances |
+| `normal_tolerance` | 1e-6 | Minimum mean-normal resultant before normalization |
+| `thread` | 1 | Maximum spatial query threads; never child processes |
+| `chunk_size` | 131072 | Selection/summary batch size |
+| `query_chunk_size` | 4096 | Spatial query batch size |
+| `max_neighbor_pairs` | 200000 | Candidate-pair batch limit |
+
+
 Call `analysis.clear()` or `result.clear()` once finished with those arrays;
 do not clear a result that is still needed for plotting or galaxy matching.
 
@@ -157,29 +163,11 @@ arrays with the same length, using these keys and physical units:
 | `("rho", "Msol/kpc3")` | Gas mass density | solar masses / kpc³ |
 | `"level"` | Integer AMR refinement level | dimensionless |
 
-
-The framework does not include a simulation-specific snapshot reader. Convert
-comoving coordinates, scale factors, and code units before constructing this
-mapping. All gas and galaxy positions must use the same coordinate frame; unwrap periodic
-regions before passing them to the open-boundary detector.
-
-An optional thermal-pressure array may be selected with
-`finder.thermal_pressure_field`, including a tuple key if appropriate. Its
-units must be consistent between cells; only pressure ratios enter the Mach
-check. Automatic lookup recognizes explicitly thermal names (`thermal_pressure`,
-`pressure_thermal`, `p_thermal`, `pth`). Otherwise pressure ratios use `rho*T`,
-assuming a common mean molecular weight. Total pressure containing magnetic,
-cosmic-ray, or turbulent contributions should not substitute for thermal pressure.
-
-Galaxy examples additionally require stable galaxy IDs and `(N_galaxy, 3)`
-position arrays in km. Match galaxy IDs between snapshots before constructing
-these arrays; row order alone does not establish identity.
-
 ## 4. Output
 
 ### Dense detection and dissipation
 
-`find()` returns `ShockResult`, with one row per cell retained by the level cut.
+`find()` returns `ShockResult`, with one row per cell.
 `analyze(compact=False)` returns `ShockAnalysis`, containing `result`, optional
 `dissipation`, `catalog`, and `labels`, plus `counts` and `timings`.
 
@@ -203,8 +191,10 @@ of `mach`), `mach_pressure`, `mach_density`, the three jump ratios,
 `pressure_check_valid`, `pressure_consistent`, `density_check_valid`,
 `density_consistent`, `density_check_applicable`, `mach_consistent`, and
 `mach_validation_status`. The latter is a bit mask described by
-`shocktest.MachValidationFlag`. Unavailable secondary estimates are NaN;
-validation fields are `None` when validation is disabled.
+`shocktest.MachValidationFlag`. Loading reconstructs
+`pressure_check_valid`, `pressure_consistent`, `density_check_valid`,
+`density_check_applicable`, `density_consistent`, and `mach_consistent` from bits
+0, 1, 3, 4, 5, and 7 respectively.
 
 | `DissipationResult` field | Meaning | Unit |
 | --- | --- | --- |
@@ -213,29 +203,12 @@ validation fields are `None` when validation is disabled.
 | `area` | Estimated shock area | kpc² |
 | `efficiency` | Thermalization efficiency | dimensionless |
 | `sound_speed` | Preshock sound speed | km s⁻¹ |
-| `selected_indices` | Original input-cell IDs for alignment (absent in legacy files) | index |
 
-The quantity plotted as `dissEmap` below is a **flux map**, not time-integrated
-energy. Integrating flux over time gives a fluence in erg kpc⁻².
 
 ### Generic fronts from saved detections
 
 `shock_front_catalog(result, dissipation=None, **options)` groups precomputed
-shock-center detections independently for one snapshot. It does not run
-ShockFinder, infer physical origin, filter by cluster geometry, or track fronts
-between snapshots. It replaces the former `merger_shock_catalog` API; there is
-no compatibility wrapper or merger classification in this path.
-
-New `DissipationResult` objects carry `selected_indices`, identifying original
-input cells. The function joins these IDs to the result, even when dissipation
-rows are reordered or some IDs are absent. Duplicate IDs are rejected.
-**Legacy files without dissipation IDs require `assume_aligned=True`**, after
-verifying they came from the same detection output in the same retained-row
-order. Matching array lengths alone does not verify alignment. `None` gives
-missing area/rate summaries, or uses embedded dissipation columns when `result`
-is a `ShockSamples` object. Position units must be explicitly km, kpc, or Mpc.
-Saved `area` is in kpc² and `total` in erg/s; `flux` never substitutes for total.
-Only unique accepted center records contribute, not all shock-zone cells.
+shock-center detections.
 
 The return is a NumPy structured array:
 
@@ -251,7 +224,7 @@ front_dtype = np.dtype([
 | Field | Definition and units |
 | --- | --- |
 | `front_id` | Snapshot-local ID, ordered by minimum original input-cell ID; no temporal identity |
-| `ncell` | Number of contributing shock centers; int32 overflow is checked |
+| `ncell` | Number of contributing shock centers |
 | `center` | Area-weighted centroid in kpc; unweighted over all members if any area is unreliable |
 | `normal` | Normalized mean upstream-to-downstream normal; dimensionless; no sign flipping |
 | `extent` | Axis-aligned extent in kpc, including half-cell widths on each side |
@@ -284,25 +257,6 @@ connect through gradual local changes. Sheets unresolved by these tolerances
 cannot be distinguished. No cluster metadata or physical-origin classification
 is read. Crop boundaries are always open: no periodic links or box metadata.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `min_group_size` | 3 | Minimum center count; smaller components are excluded |
-| `mach_tolerance` | 0.3 | Maximum `abs(Mi-Mj)/max(Mi,Mj)` on each neighbor pair, range [0,1] |
-| `normal_cosine` | 0.5 | Minimum signed unit-normal dot product on each pair |
-| `surface_offset_factor` | 0.25 | Normal displacement limited to this times smaller cell width |
-| `surface_angle_cosine` | 0.5 | Normal displacement also limited to this times pair distance |
-| `connectivity` | `'touch'` | Faces/edges/corners; `'face'` requires positive face overlap |
-| `gap_factor` | 0 | Optional extra reach in units of larger cell width; disabled by default |
-| `min_mach` | 1 | Finite Mach must be strictly greater than this threshold |
-| `require_mach_consistent` | False | Require saved Mach-consistency diagnostics |
-| `assume_aligned` | False | Explicit legacy ID-less dissipation row-alignment assertion |
-| `return_labels` | False | Return `(catalog, labels)` instead of only the catalog |
-| `atol`, `rtol` | 1e-9 kpc, 1e-7 | Absolute/relative spatial contact tolerances |
-| `normal_tolerance` | 1e-6 | Minimum mean-normal resultant before normalization |
-| `thread` | 1 | Maximum spatial query threads; never child processes |
-| `chunk_size` | 131072 | Selection/summary batch size |
-| `query_chunk_size` | 4096 | Spatial query batch size |
-| `max_neighbor_pairs` | 200000 | Candidate-pair batch limit |
 
 `result.dx` and declared position units are required. `base_cell_size`,
 `linking_length`, `neighbor_tables`, and `box_size` options have been removed.
@@ -312,15 +266,14 @@ unavailable normal tests and flag partial summaries. Numeric quality flags do
 not establish completeness beyond the crop or physical identity of a front.
 The default thresholds are initial settings, not a dataset-calibrated optimum.
 
-`analyze(build_catalog=True)` and standalone grouping use exactly the same
-implementation, defaults, and geometry. `catalog_options` accepts the options
-above except `return_labels`: analysis always retains labels. Detection settings
-still govern which shocks exist in result. The only catalog builder is
-`shocktest.shock_front_catalog`, implemented in `shocktest/fronts.py`.
-`build_shock_catalog`, `shocktest/catalog.py`, and `examples/shock_catalog.py`
-have been removed, along with the old object catalog, duplicate grouping,
-thermal classification, and sensitivity builder. Old `analyze` catalog keyword arguments now belong in
-`catalog_options` when applicable; retired classification arguments are rejected.
+`analyze(build_catalog=True)` and standalone grouping use the same implementation.
+With identical result, dissipation, and catalog options, their catalogs and
+membership labels match. Catalog options are described in Section 2.
+
+`return_labels=False` (default) returns only the catalog.
+`return_labels=True` returns `(catalog, labels)`. Membership means which shock
+front each original result record belongs to; it does not contain copies of
+positions or other cell measurements.
 
 Membership remains outside the 78-byte rows. `analysis.labels` is int32 with one
 entry per row of `analysis.result`, and `return_labels=True` provides the same
@@ -337,8 +290,7 @@ archive schemas are explicitly rejected; regenerate from saved detections.
 CSV exports contain only summary fields, never membership.
 
 The per-cell helper for galaxy matching is named
-`examples.galaxy.shock_front_samples`; it does not build connected catalogs. No executable
-usage examples are maintained for the new catalog API.
+`examples.galaxy.shock_front_samples`; it does not build connected catalogs. Catalog usage examples appear in Section 5-2.
 
 ### Compact results and storage
 
@@ -444,6 +396,46 @@ plane. AMR `mean` uses overlap-area weighting; `sum` is an overlap-weighted
 projected quantity divided by pixel area, not total dissipated energy.
 An empty selection produces empty/NaN map pixels. To include all detected
 centers regardless of consistency, pass `valid_mach=result.shock` explicitly.
+
+### 5-2. Build a shock catalog and retrieve its members
+
+For existing `result` and `dissipation` from the same detection run, build a
+catalog without rerunning ShockFinder. Keep their original matching row order.
+
+```python
+import numpy as np
+from shocktest import shock_front_catalog, save_shock_catalog, load_shock_catalog
+
+catalog, labels = shock_front_catalog(
+    result,
+    dissipation,
+    return_labels=True,
+    connectivity="touch",
+    gap_factor=0.0,
+    mach_tolerance=0.2,
+    min_group_size=3,
+    thread=20,
+)
+
+# Select the members of one front, safely handling an empty catalog.
+if len(catalog):
+    front_id = int(catalog["front_id"][0])
+    member_rows = np.flatnonzero(labels == front_id)
+    member_positions = result.pos[member_rows]  # In result.position_unit.
+    member_mach = result.mach[member_rows]
+    member_flux = dissipation.flux[member_rows]
+    input_rows = result.selected_indices[member_rows]  # Rows in the original cell table.
+    print("Front:", front_id, "member centers:", len(member_rows))
+
+# Save both summaries and membership; retain the corresponding result separately.
+save_shock_catalog("shock_catalog.npz", catalog, labels=labels)
+catalog, labels = load_shock_catalog("shock_catalog.npz", return_labels=True)
+```
+
+If you already called `finder.analyze(..., build_catalog=True)` in Section 2,
+use `catalog, labels = analysis.catalog, analysis.labels` directly and start
+with the member-selection block. A label of `-1` means that the record belongs
+to no retained front. Membership must stay paired with the same result row order.
 
 ### 5-3. Find shock-crossing or shock-nearby galaxies
 

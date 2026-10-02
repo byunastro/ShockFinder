@@ -27,7 +27,7 @@ def saved(pos=None, *, dx=1., normal=None, ids=None):
         dx=np.broadcast_to(dx, (n,)).copy(), normal=np.tile([1., 0., 0.], (n, 1)) if normal is None else np.asarray(normal, dtype=float),
         position_unit='kpc')
     diss = DissipationResult(np.full(n, 10.), np.arange(n, dtype=float)+10.,
-        np.arange(n, dtype=float)+1., np.zeros(n), np.zeros(n), result.selected_indices.copy())
+        np.arange(n, dtype=float)+1., np.zeros(n), np.zeros(n))
     return result, diss
 
 
@@ -70,11 +70,12 @@ def test_geometry_converts_km_to_kpc_without_changing_dissipation_units():
         np.testing.assert_allclose(actual[name], expected[name])
 
 
-def test_id_join_permutations_missing_ids_duplicates_and_legacy_opt_in():
+def test_legacy_id_join_permutations_missing_ids_and_aligned_outputs():
     r, d = saved()
     expected = shock_front_catalog(r, d)
     permutation = [3, 0, 2, 1]
     shuffled = {key: value[permutation] for key, value in as_dict(d).items()}
+    shuffled['selected_indices'] = r.selected_indices[permutation].copy()
     np.testing.assert_array_equal(shock_front_catalog(r, shuffled), expected)
     shuffled['selected_indices'][1] = 987654
     actual = shock_front_catalog(r, shuffled)[0]
@@ -83,13 +84,11 @@ def test_id_join_permutations_missing_ids_duplicates_and_legacy_opt_in():
     shuffled['selected_indices'][:] = 100
     with pytest.raises(ValueError, match='duplicate dissipation'):
         shock_front_catalog(r, shuffled)
-    d.selected_indices = None
-    with pytest.raises(ValueError, match='assume_aligned'):
-        shock_front_catalog(r, d)
-    np.testing.assert_array_equal(shock_front_catalog(r, d, assume_aligned=True), expected)
+    assert not hasattr(d, 'selected_indices')
+    np.testing.assert_array_equal(shock_front_catalog(r, d), expected)
     d.total = d.total[:2]
     with pytest.raises(ValueError, match='total must have shape'):
-        shock_front_catalog(r, d, assume_aligned=True)
+        shock_front_catalog(r, d)
 
 
 def test_dissipation_missing_values_never_become_incomplete_totals():
@@ -202,7 +201,8 @@ def test_determinism_reordering_threads_and_irrelevant_cluster_metadata(monkeypa
     reordered = {key: val[permutation] if isinstance(val, np.ndarray) else val for key, val in mapping.items()}
     for key in ('center_index', 'upstream_index', 'downstream_index'):
         reordered[key] = np.arange(6)
-    out, lab = shock_front_catalog(reordered, d, return_labels=True)
+    reordered_diss = {key: value[permutation] for key, value in as_dict(d).items()}
+    out, lab = shock_front_catalog(reordered, reordered_diss, return_labels=True)
     assert out.tobytes() == cat.tobytes()
     np.testing.assert_array_equal(lab, labels[permutation])
 
@@ -287,7 +287,7 @@ def test_mixed_signed_unsigned_large_ids_are_never_rounded():
     r, d = saved(ids=ids)
     expected = shock_front_catalog(r, d)
     shuffled = {key: value[::-1].copy() for key, value in as_dict(d).items()}
-    shuffled['selected_indices'] = shuffled['selected_indices'].astype(np.uint64)
+    shuffled['selected_indices'] = r.selected_indices[::-1].astype(np.uint64)
     np.testing.assert_array_equal(shock_front_catalog(r, shuffled), expected)
 
 
@@ -308,14 +308,13 @@ def test_summary_chunking_and_legacy_pickle_slot_absence():
     small = shock_front_catalog(r, d, chunk_size=1)
     for name in front_dtype.names:
         np.testing.assert_allclose(small[name], baseline[name])
-    del d.selected_indices  # Mimic an old slotted pickle without this field.
     d = pickle.loads(pickle.dumps(d))
-    with pytest.raises(ValueError, match='no selected_indices'):
-        shock_front_catalog(r, d)
-    np.testing.assert_array_equal(shock_front_catalog(r, d, assume_aligned=True), baseline)
+    assert not hasattr(d, 'selected_indices')
+    np.testing.assert_array_equal(shock_front_catalog(r, d), baseline)
+    np.testing.assert_array_equal(shock_front_catalog(r, d), baseline)
 
 
-def test_dissipation_producer_preserves_dense_and_compact_input_cell_ids():
+def test_dissipation_producer_preserves_dense_and_compact_row_order_without_ids():
     from shocktest.pyShockFinder import compute_dissipation
     r, _ = saved(ids=[4, 7, 8, 9])
     # Supply existing results, never rerun the detector even in this check.
@@ -324,12 +323,12 @@ def test_dissipation_producer_preserves_dense_and_compact_input_cell_ids():
             ('dx', 'km'): np.full(10, 3.0856775814913673e16)}
     dense = compute_dissipation(cell, r)
     compact = compute_dissipation(cell, r, _compact=True)
-    np.testing.assert_array_equal(dense.selected_indices, r.selected_indices)
-    np.testing.assert_array_equal(compact.selected_indices, r.selected_indices[r.shock])
+    assert not hasattr(dense, 'selected_indices')
+    assert not hasattr(compact, 'selected_indices')
     np.testing.assert_array_equal(compact.total, dense.total[r.shock])
-    # Compact dissipation rows can join directly back to a dense result.
-    np.testing.assert_array_equal(shock_front_catalog(r, compact, min_group_size=1),
-                                  shock_front_catalog(r, dense, min_group_size=1))
+    # Compact outputs must not masquerade as dense row-aligned products.
+    with pytest.raises(ValueError, match='must have shape'):
+        shock_front_catalog(r, compact, min_group_size=1)
 
 
 def test_missing_mach_column_keeps_accepted_centers_and_flags_summary():
@@ -374,7 +373,7 @@ def test_invalid_mach_tolerance_rejected(value):
         shock_front_catalog(r, d, mach_tolerance=value)
 
 
-@pytest.mark.parametrize('option', ['box_size', 'base_cell_size', 'linking_length', 'neighbor_tables'])
+@pytest.mark.parametrize('option', ['box_size', 'base_cell_size', 'linking_length', 'neighbor_tables', 'assume_aligned'])
 def test_removed_geometry_options_rejected(option):
     r, d = saved()
     with pytest.raises(TypeError):

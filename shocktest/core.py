@@ -4,7 +4,7 @@ import gc
 import hashlib
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Mapping
 from pathlib import Path
 
@@ -13,6 +13,13 @@ import numpy as np
 from . import _NATIVE_IMPORT_ERRORS, _shockfinder
 
 _IMPORT_ERROR = _NATIVE_IMPORT_ERRORS.get("_shockfinder")
+
+# These boolean diagnostics are losslessly reconstructed from the saved bitmask.
+_VALIDATION_BITS = {
+    'pressure_check_valid': 0, 'pressure_consistent': 1,
+    'density_check_valid': 3, 'density_check_applicable': 4,
+    'density_consistent': 5, 'mach_consistent': 7,
+}
 
 
 @dataclass(slots=True)
@@ -53,6 +60,41 @@ class ShockResult:
     gamma: float = 5.0 / 3.0
     temperature_floor: float = 1.0e4
     position_unit: str = "km"
+
+    def __getstate__(self):
+        """Omit redundant flags from pickle, preserving independently edited flags.
+
+        Check in bounded chunks to avoid full-length temporary arrays at save time.
+        Explicit None values (disabled diagnostics) remain explicit.
+        """
+        state = {f.name: getattr(self, f.name) for f in fields(self)
+                 if hasattr(self, f.name)}
+        status = state.get('mach_validation_status')
+        if isinstance(status, np.ndarray) and status.ndim == 1:
+            for name, bit in _VALIDATION_BITS.items():
+                values = state.get(name)
+                if (isinstance(values, np.ndarray) and values.dtype == np.dtype(bool)
+                        and values.shape == status.shape
+                        and all(np.array_equal(values[start:start+131072],
+                            (status[start:start+131072] & (1 << bit)) != 0)
+                            for start in range(0, status.size, 131072))):
+                    del state[name]
+        return None, state
+
+    def __setstate__(self, state):
+        # Accept the original slotted pickle state as well as the reduced state.
+        values = state[1] if isinstance(state, tuple) else state
+        for name, value in values.items():
+            setattr(self, name, value)
+        status = values.get('mach_validation_status')
+        for name, bit in _VALIDATION_BITS.items():
+            if name not in values:
+                restored = None
+                if status is not None:
+                    restored = np.empty(status.shape, dtype=bool)
+                    for start in range(0, status.size, 131072):
+                        restored[start:start+131072] = (status[start:start+131072] & (1 << bit)) != 0
+                setattr(self, name, restored)
 
     def to_compact(self, **options):
         from .compact import compact_shocks
