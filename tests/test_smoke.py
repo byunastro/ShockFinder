@@ -184,6 +184,7 @@ def test_shock_center_considers_finer_face_candidates():
             [4.0, 0.0, 0.0],
             [1.0, 1.0, 0.0],
             [1.0, 2.0, 0.0],
+            [5.0, 0.0, 0.0],
         ],
         dtype=float,
     )
@@ -197,18 +198,19 @@ def test_shock_center_considers_finer_face_candidates():
             [-20.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
             [0.0, -100.0, 0.0],
+            [-20.0, 0.0, 0.0],
         ],
         dtype=float,
     )
-    dx = np.asfortranarray(np.ones(8, dtype=float))
+    dx = np.asfortranarray(np.ones(9, dtype=float))
     temp = np.asfortranarray(
-        [1.0e4, 1.0e4, 2.0e4, 4.0e4, 8.0e4, 16.0e4, 4.0e4, 8.0e4], dtype=float
+        [1.0e4, 1.0e4, 2.0e4, 4.0e4, 8.0e4, 16.0e4, 4.0e4, 8.0e4, 16.0e4], dtype=float
     )
-    rho = np.asfortranarray([1.0, 1.0, 1.5, 2.0, 3.0, 4.0, 2.0, 3.0], dtype=float)
-    level = np.asfortranarray([0, 0, 0, 1, 1, 1, 0, 0], dtype=np.int32)
-    detection_mask = np.ones(8, dtype=np.int32, order="F")
-    neighbors = np.zeros((8, 6), dtype=np.int32, order="F")
-    fine_face_index = np.zeros((8, 6), dtype=np.int32, order="F")
+    rho = np.asfortranarray([1.0, 1.0, 1.5, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0], dtype=float)
+    level = np.asfortranarray([0, 0, 0, 1, 1, 1, 0, 0, 1], dtype=np.int32)
+    detection_mask = np.ones(9, dtype=np.int32, order="F")
+    neighbors = np.zeros((9, 6), dtype=np.int32, order="F")
+    fine_face_index = np.zeros((9, 6), dtype=np.int32, order="F")
     fine_neighbors = np.zeros((1, 4), dtype=np.int32, order="F")
 
     # Cell 3 is a coarse candidate with a finer +x face candidate at cell 4.
@@ -221,6 +223,7 @@ def test_shock_center_considers_finer_face_candidates():
     neighbors[3, 1] = 5
     neighbors[4, 0] = 4
     neighbors[4, 1] = 6
+    neighbors[5, 1] = 9  # Complete the two-cell downstream measurement.
     # Cell 7 is a much more convergent candidate in the tangential +y
     # direction. It must not pull the center away from the x-directed normal.
     neighbors[2, 3] = 7
@@ -248,7 +251,7 @@ def test_shock_center_considers_finer_face_candidates():
         1.0e-12,
         0,
         0,
-        8,
+        9,
         1,
         )
     )
@@ -257,8 +260,8 @@ def test_shock_center_considers_finer_face_candidates():
     assert shock[3] == 0
     assert shock[4] == 1
     assert center[4] == 5
-    assert upstream[4] == 2
-    assert downstream[4] == 6
+    assert upstream[4] == 3
+    assert downstream[4] == 9
     assert mach[4] > 1.0
     assert diagnostics.shape == (10,)
 
@@ -285,7 +288,7 @@ def test_shock_center_considers_finer_face_candidates():
             1.0e-12,
             0,
             0,
-            8,
+            9,
             1,
         )
     )
@@ -313,15 +316,13 @@ def test_shock_center_considers_finer_face_candidates():
             1.0e-12,
             0,
             0,
-            8,
+            9,
             1,
         )
     )
     assert center_capped_diagnostics[0] > 0
 
-    # With only two steps, the upstream walk is still inside the candidate
-    # zone. Reaching the cap must reject the detection instead of using that
-    # candidate cell as a pre-shock endpoint.
+    # A one-step safety cap cannot complete the two-cell measurement.
     _, capped_shock, _, _, _, capped_diagnostics = (
         _shockfinder.shockfinder_kernel.find_shocks(
         pos,
@@ -337,13 +338,13 @@ def test_shock_center_considers_finer_face_candidates():
         5.0 / 3.0,
         1.0e4,
         1.0,
-        2,
+        1,
         50,
         0.7,
         1.0e-12,
         0,
         0,
-        8,
+        9,
         1,
         )
     )

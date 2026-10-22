@@ -5,6 +5,10 @@ ShockFinder is a Fortran-backed Python framework for detecting shocks in the int
 and supporting galaxy matching and time-resolved exposure measurements. The AMR
 shock detector follows the methodology of Skillman et al. (2008, ApJ 689, 1063).
 
+For galaxy gas-loss classification with saved shock fronts, start with the
+[notebook workflow](examples/galaxy_stripping_workflow.ipynb) or its
+[function reference](docs/galaxy_stripping.md).
+
 ## 1. Build
 
 Requirements: Python >= 3.10, NumPy >= 1.26, and a Fortran compiler such as
@@ -73,6 +77,29 @@ jump. With `filter_inconsistent=False`, validation is diagnostic and does not al
 shock mask. With filtering enabled, Mach values and endpoint indices remain
 available for auditing rejected centers: always select using `result.shock`.
 
+Mach measurement samples the cell **two cells away from the shock center on
+each side**, along the center's temperature-gradient normal. If this preliminary
+temperature-jump Mach number is **10 or greater**, both rays continue to
+**four cells away** and the Mach number is recomputed from those endpoints.
+These are individual endpoint temperatures, not averages over two or four cells.
+The upstream temperature floor applies to both estimates; `min_mach` is applied
+only to the final estimate. Saved endpoint indices, validation ratios, and
+dissipation all use the final selected endpoints.
+
+Distances count cells crossed by the AMR ray, excluding the center; across a
+refinement boundary they need not equal two/four center-cell widths. Sampling
+continues past the old shock-zone stopping conditions. If a required endpoint
+is missing, or `max_steps` prevents reaching it, the center is rejected rather
+than accepting a shorter measurement. `max_steps` remains a safety cap (default
+50); values above four do not increase the measurement distance. The legacy
+`candidate_exit`, `thermodynamic_exit`, and `nonconverging_exit` diagnostic
+counters remain present and are zero under this sampling rule.
+
+The switch depends on the **measured two-cell Mach**, not an independently known
+true Mach: a strong shock underestimated below 10 at this stage will still use
+two cells. Four-cell sampling also cannot guarantee recovery if the numerical
+transition extends beyond those endpoints.
+
 Level cuts change the retained mesh, so overly restrictive cuts can remove
 needed neighbors. Temperature/density cuts affect only detection seeds: other
 retained cells remain available as neighbors and endpoints. Center search uses local gradient normals,
@@ -110,22 +137,15 @@ result, dissipation = analysis.result, analysis.dissipation
 catalog, labels = analysis.catalog, analysis.labels
 ```
 
-`catalog_options=None` and `dissipation_options=None` use their defaults.
-Only supply `catalog_options` when `build_catalog=True`. With
-`compute_dissipation=False`, the catalog's unavailable area and power are NaN.
-Dissipation inherits `gamma` and `temperature_floor` from the finder; explicit
-values must match. The defaults for `mu` and `area_mode` are shown above.
+`catalog_options=None` and `dissipation_options=None` use their defaults. Only supply `catalog_options` when `build_catalog=True`.
+`return_labels=False` returns only the catalog.
+`return_labels=True` returns `(catalog, labels)`. Membership means which shock
+front each original result record belongs to; it does not contain copies of
+positions or other cell measurements.
 
-For `compact=True`, `compact_options` may specify `profile="full"` (default;
-all compact fields) or `"science"` (essential scientific fields), and
-`index_dtype="int64"` (default) or `"auto"` (narrow integer indices when safe).
-The return then has `groups` and `columns["group_id"]`, rather than
-`analysis.catalog` and `analysis.labels`.
+With `compute_dissipation=False`, the catalog's unavailable area and power are NaN.
 
-Catalog options apply both to `catalog_options` and direct
-`shock_front_catalog` calls, except `return_labels`: `analyze` always retains
-membership when building a catalog, so omit that option from `catalog_options`.
-
+Catalog options
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `min_group_size` | 3 | Minimum center count; smaller components are excluded |
@@ -179,12 +199,13 @@ arrays with the same length, using these keys and physical units:
 | `pos`, `dx`, `level` | Retained geometry; positions have shape `(N, 3)` |
 | `normal` | Unit temperature-gradient normal from upstream toward downstream |
 | `zone_width` | Endpoint separation projected on the normal, in position units |
-| `diagnostics` | Counters for missing neighbors, search limits, exits, and rejected jumps |
+| `diagnostics` | Counters for missing neighbors, search limits, and rejected jumps; legacy exit counters are zero |
 | `gamma`, `temperature_floor`, `position_unit` | Measurement settings and geometry unit |
 
 Mach and normals are zero outside detected centers. Filtering inconsistent
 centers changes the mask, not their stored measurements. `zone_width` measures
-numerical shock broadening; it is not automatically a physical interaction width.
+the selected two/four-cell sampling span projected on the normal; it is not
+automatically a physical interaction width or the full numerical shock thickness.
 
 With validation enabled, additional fields include `mach_temperature` (an alias
 of `mach`), `mach_pressure`, `mach_density`, the three jump ratios,
@@ -245,103 +266,8 @@ Quality constants are exported from `shocktest` and `shocktest.fronts`:
 | 16 / `QUALITY_GAP_BRIDGED` | At least one accepted connection spans a non-contact gap |
 | 32 / `QUALITY_PARTIAL_SUMMARY` | Missing aggregate members or numerical overflow |
 
-Incomplete area/rate totals are **NaN, never partial sums**. Mach and normal
-means use their valid members, with complete area weights when available and
-otherwise equal weights; missing members set `QUALITY_PARTIAL_SUMMARY`.
-A cancelling mean normal remains NaN and flagged without rejecting the front.
-
-Grouping uses AMR-width spatial queries and bounded candidate-pair batches.
-Every accepted pair must pass cell contact, local signed normal compatibility,
-tangential surface geometry, and relative Mach compatibility. Curved fronts can
-connect through gradual local changes. Sheets unresolved by these tolerances
-cannot be distinguished. No cluster metadata or physical-origin classification
-is read. Crop boundaries are always open: no periodic links or box metadata.
-
-
-`result.dx` and declared position units are required. `base_cell_size`,
-`linking_length`, `neighbor_tables`, and `box_size` options have been removed.
-Missing Mach cannot provide a compatible edge; such records can only form
-singleton fronts when permitted by minimum size. Missing normals skip the
-unavailable normal tests and flag partial summaries. Numeric quality flags do
-not establish completeness beyond the crop or physical identity of a front.
-The default thresholds are initial settings, not a dataset-calibrated optimum.
-
-`analyze(build_catalog=True)` and standalone grouping use the same implementation.
-With identical result, dissipation, and catalog options, their catalogs and
-membership labels match. Catalog options are described in Section 2.
-
-`return_labels=False` (default) returns only the catalog.
-`return_labels=True` returns `(catalog, labels)`. Membership means which shock
-front each original result record belongs to; it does not contain copies of
-positions or other cell measurements.
-
-Membership remains outside the 78-byte rows. `analysis.labels` is int32 with one
-entry per row of `analysis.result`, and `return_labels=True` provides the same
-mapping for standalone calls. Entries equal to a catalog row's `front_id` select
-that front's detections from result; -1 means excluded or below minimum size.
-Use result.selected_indices to translate selected result rows back to the
-original input cell table. Summary rows alone cannot reconstruct membership.
-
-`save_shock_catalog` accepts `labels` separately and stores rows plus membership
-in numeric NPZ schema 3. `load_shock_catalog(return_labels=True)` returns both,
-raising if labels were not saved. Keep the original result paired with the
-archive: labels do not identify a different or reordered result. Old object
-archive schemas are explicitly rejected; regenerate from saved detections.
-CSV exports contain only summary fields, never membership.
-
-The per-cell helper for galaxy matching is named
-`examples.galaxy.shock_front_samples`; it does not build connected catalogs. Catalog usage examples appear in Section 5-2.
-
-### Compact results and storage
-
-For shock-only products, set `compact=True` on analyze. `compact_options` accepts
-`profile='full'` or `'science'` and `index_dtype='int64'` or `'auto'`.
-
-`ShockSamples` contains `columns`, `metadata`, `groups`, `counts`, and `timings`.
-Its `groups` is the same 78-byte structured catalog, with membership in
-`columns["group_id"]`. Compact archives use schema 2; legacy archives require
-regeneration. Its index conventions differ from dense results:
-
-| Compact column | Index space |
-| --- | --- |
-| `retained_row` | Row in the dense retained-cell result |
-| `input_row` | Original input row of this shock center |
-| `center_index`, `upstream_index`, `downstream_index` | Original **input** rows, not compact rows |
-| `group_id` | Snapshot-local front ID, or -1; aligned with compact records |
-
-The `science` profile retains Mach, geometry, endpoint indices, consistency
-summary/status, dissipation flux/area/power, and available group mappings. It
-omits detailed jump diagnostics, endpoint positions, redundant center/mask
-columns, sound speed, and efficiency. Omitted columns require a full product or
-recomputation to recover. Physical floating-point columns remain float64;
-`index_dtype="auto"` changes only exactly representable integer storage.
-
-Use `analysis.to_compact(...)` to compact an existing analysis, or
-`result.to_compact(...)` for detection-only data. These create independent
-copies; release the original after conversion if no longer needed. Direct
-`compact=True` avoids dense secondary-diagnostic and dissipation outputs, but
-AMR geometry and neighbor construction still require full retained-cell arrays:
-this is not an out-of-core detector. Current map and static galaxy helpers use
-dense results, as shown in Section 5.
-
-NPZ is already a binary array container. `compressed=True` applies lossless
-compression; `compressed=False` avoids compression work. A custom header/main
-binary format is **not currently implemented**. Removing a container header
-alone generally saves little compared with retaining only shock rows and
-omitting unused columns. Precision reduction is a separate, potentially lossy
-choice; it is not required for compact storage.
-
-For reference, one 1,500,820-cell region with 81,686 detected centers produced
-compact column sizes of 20.67 MB (`full`/int64), 19.03 MB (`full`/auto), and
-9.72 MB (`science`/auto), without a catalog; the last compressed NPZ was 5.94 MB.
-These are dataset-specific measurements, not expected compression ratios for
-all snapshots. Exact comparisons confirmed preserved retained measurements
-for the memory optimizations.
 
 ## 5. Usage Python examples
-
-Each example below assumes `cell` has already been loaded. A threshold of
-Mach 1.5 is illustrative; choose cuts appropriate to the scientific analysis.
 
 ### 5-1. Draw a Mach map and dissipation map
 
@@ -436,118 +362,3 @@ If you already called `finder.analyze(..., build_catalog=True)` in Section 2,
 use `catalog, labels = analysis.catalog, analysis.labels` directly and start
 with the member-selection block. A label of `-1` means that the record belongs
 to no retained front. Membership must stay paired with the same result row order.
-
-### 5-3. Find shock-crossing or shock-nearby galaxies
-
-#### A. Match galaxy trajectories to a fixed shock snapshot
-
-This example uses helpers in [examples/galaxy.py](examples/galaxy.py).
-Prepare `galaxy_ids`, `galaxy_pos_prev`, and `galaxy_pos_now`: the two position
-arrays must have shape `(N_galaxy, 3)`, be in physical km, and have identical
-ID ordering. The helper compares each trajectory segment with a **fixed** shock
-front. It uses bounded blocks rather than a full galaxy-by-shock distance array.
-
-```python
-import numpy as np
-import shocktest
-from examples.galaxy import (
-    shock_front_samples,
-    classify_galaxy_shock_crossing,
-    compact_classification_results,
-)
-
-KPC_KM = 3.0856775814913673e16
-finder = shocktest.ShockFinder()
-finder.min_mach = 1.5
-finder.filter_inconsistent = True    # Consistent selection for detection and galaxy matching.
-analysis = finder.analyze(cell, build_catalog=False)
-
-# A front-sample dictionary, distinct from the numeric connected-front catalog.
-fronts = shock_front_samples(
-    analysis.result, analysis.dissipation, min_mach=1.5, min_flux=0.0,
-)
-classification = classify_galaxy_shock_crossing(
-    galaxy_pos_prev, galaxy_pos_now, fronts,
-    search_radius_km=100.0 * KPC_KM,  # Neighborhood search around the trajectory.
-    width_factor=2.0,                # Zone half-width includes 2 * local cell width.
-    zone_width_factor=0.5,           # Plus 0.5 * measured numerical shock width.
-    memory_budget_bytes=32 * 1024**2,# Budget for matching work blocks, not total process memory.
-)
-galaxy_ids = np.asarray(galaxy_ids)
-print("Crossing candidates:", galaxy_ids[classification["crossed"]])
-print("Nearby along trajectory:", galaxy_ids[classification["near_shock"]])
-print("Intersect numerical zone:", galaxy_ids[classification["affected_zone"]])
-
-# Current-position proximity only: use a zero-length trajectory.
-current_only = classify_galaxy_shock_crossing(
-    galaxy_pos_now, galaxy_pos_now, fronts,
-    search_radius_km=100.0 * KPC_KM,
-    memory_budget_bytes=32 * 1024**2,
-)
-print("Nearby now:", galaxy_ids[current_only["near_shock"]])
-
-# Save only selected galaxy rows, preserving their original row and stable IDs.
-small = compact_classification_results(classification, keep="near_or_crossed")
-small["galaxy_id"] = galaxy_ids[small["galaxy_index"]]
-np.savez_compressed("galaxy_shock_matches.npz", **small)
-```
-
-`crossed` indicates a signed-plane crossing/contact with a tangential geometry
-gate. `affected_zone` tests intersection with the estimated numerical zone.
-`near_shock` includes either proximity within the search radius or proximity
-within the estimated zone half-width, so it is not strictly a fixed-radius cut.
-`distance_to_shock` is the segment-to-selected-center distance, not simply the
-normal distance to an infinite plane. Outputs also include `nearest_mach`,
-`nearest_flux`, and `nearest_shock_row` (a dense retained-row index; `-1` if none).
-The selection favors a zone-intersecting patch when available. Check missing
-indices before using them to index arrays.
-
-The fixed-front approximation does not detect a translating shock crossing a
-stationary galaxy. Nor does geometric proximity alone establish a merger origin
-or quantify energy actually absorbed by the galaxy. Use temporal tracking for
-cumulative exposure.
-
-#### B. Track moving shocks and integrate galaxy exposure
-
-A complete executable example is provided in
-[examples/time_resolved_exposure.py](examples/time_resolved_exposure.py):
-
-```python
-from examples.time_resolved_exposure import run_example
-
-attributions, interval, history = run_example()
-print(attributions[1].status)
-print(interval.records[0].crossing_times_s)
-print(history.summaries[42])
-```
-
-It moves a shock from 100 to 400 kpc over 100 Myr past a stationary galaxy at
-250 kpc, giving a crossing at 50 Myr. To apply this workflow to snapshots:
-
-1. Construct a `ShockFrame` for each snapshot, directly or with
-   `ShockFrame.from_samples()`. Supply time in seconds, positions/radii/half-widths
-   in km, normals, Mach numbers, fluxes, and a documented `tracking_source`.
-   Supply persistent `patch_id` and `surface_id` values from a tracking method;
-   snapshot group IDs and AMR row indices are not persistent IDs.
-2. Define `MergerEvent` objects from independent merger-tree or orbital evidence,
-   with event times, center, axis, radial range, and an evidence `source`.
-   `attribute_merger_shocks(previous, current, events)` applies geometry and
-   propagation constraints and returns candidate, ambiguous, excluded, or
-   unattributed statuses. Candidate association does not confirm causality.
-3. Call `integrate_galaxy_exposure(galaxy_ids, galaxy_pos_prev, galaxy_pos_now,
-   previous, current, attributions=attributions)` for each adjacent snapshot pair.
-   Add each returned interval to an `ExposureAccumulator`.
-
-Temporal integration assumes linear patch/galaxy motion and flux interpolation
-between matched frames; strongly changing normals are rejected. Inspect interval
-diagnostics for unmatched patches and rejected pairs. Missing tracks are not
-proof of zero physical exposure. Choose patch radii and interaction half-widths
-explicitly; numerical shock width alone is not a calibrated galaxy interaction
-scale.
-
-Accumulated summaries include crossing counts, exposure duration, peak Mach,
-fluence (`fluence_erg_kpc2`), and candidate-merger fluence. Overlapping patches of
-one surface use the maximum flux rather than double counting; separate surfaces
-contribute additively. Fluence is incident shock exposure per area, not the
-energy deposited inside a galaxy. Converting it to galaxy heating requires a
-separate interaction/coupling model.

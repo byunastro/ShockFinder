@@ -146,6 +146,8 @@ class ShockFinder:
         self.min_density = None
         self.max_density = None
         self.min_mach = 1.0
+        # Safety cap; Mach sampling uses two cells per side, or four when the
+        # preliminary two-cell Mach is >= 10. Raising this cap adds no samples.
         self.max_steps = 50
         self.max_center_steps = 50
         self.center_normal_cosine = 0.7
@@ -427,6 +429,8 @@ class ShockFinder:
                         "upstream_step_limit",
                         "downstream_missing_neighbor",
                         "downstream_step_limit",
+                        # Legacy zone-exit slots are retained for compatibility
+                        # and are zero with fixed-distance Mach sampling.
                         "candidate_exit",
                         "thermodynamic_exit",
                         "nonconverging_exit",

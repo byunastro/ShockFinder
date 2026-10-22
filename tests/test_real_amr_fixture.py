@@ -52,11 +52,21 @@ def test_real_amr_center_subbox_regression():
     result = finder.find(cell)
 
     assert rows.size == 1_500_820
-    # Updated after unit-consistent convergence selection, corrected AMR face
-    # distances and corner ray traversal. The former 107,578 count encoded bugs.
-    assert np.count_nonzero(result.shock) == 81_686
+    # Two/four-cell endpoint sampling changes which centers have valid jumps
+    # and complete measurements; the former zone-exit estimator yielded 81,686.
+    assert np.count_nonzero(result.shock) == 87_834
     assert np.all(np.isfinite(result.mach[result.shock]))
     assert result.diagnostics["center_step_limit"] == 0
+    up = result.selected_indices[result.upstream_index[result.shock]]
+    down = result.selected_indices[result.downstream_index[result.shock]]
+    np.testing.assert_allclose(
+        result.mach[result.shock],
+        shocktest.mach_from_temperature_jump(
+            np.maximum(cell["T", "K"][up], finder.temperature_floor),
+            cell["T", "K"][down], gamma=finder.gamma,
+        ),
+        rtol=1.e-12,
+    )
 
     order = np.random.default_rng(17).permutation(rows.size)
     shuffled = finder.find({key: values[order] for key, values in cell.items()})

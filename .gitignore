@@ -21,4 +21,10 @@ tests/output/
 /local_work/
 /artifacts/merger_shock_performance/
 
+# Generated analysis products and shock-tree diagnostics.
+/artifacts/galaxy_stripping_620_900/
+/artifacts/galaxy_stripping_700_900_strong_large/
+/shockTree/demo_output/
+/shockTree/local_check/
+
 .DS_Store

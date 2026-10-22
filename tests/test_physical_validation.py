@@ -64,15 +64,16 @@ def test_oblique_shock_recovers_mach(normal):
     assert np.median(normals @ direction) > .85
 
 
-def test_refinement_interface_mach_and_ordering():
+@pytest.mark.parametrize('mach', [3., 100.])
+def test_refinement_interface_mach_and_ordering(mach):
     coarse = np.stack(np.meshgrid(np.arange(-7, 0, 2), np.arange(-7, 8, 2), np.arange(-7, 8, 2), indexing='ij'), axis=-1).reshape(-1, 3)
     fine = np.stack(np.meshgrid(np.arange(.5, 8), np.arange(-7.5, 8), np.arange(-7.5, 8), indexing='ij'), axis=-1).reshape(-1, 3)
     pos = np.concatenate((coarse, fine))
-    cell = shock_mesh(pos, np.r_[np.full(len(coarse), 2.), np.ones(len(fine))], np.r_[np.full(len(coarse), 18), np.full(len(fine), 19)])
+    cell = shock_mesh(pos, np.r_[np.full(len(coarse), 2.), np.ones(len(fine))], np.r_[np.full(len(coarse), 18), np.full(len(fine), 19)], mach=mach)
     finder = ShockFinder()
     result = finder.find(cell)
     assert result.shock.any()
-    np.testing.assert_allclose(result.mach[result.shock], 3., rtol=.01)
+    np.testing.assert_allclose(result.mach[result.shock], mach, rtol=.01)
     order = np.random.default_rng(12).permutation(len(pos))
     shuffled = finder.find({k: v[order] for k, v in cell.items()})
     for left, right in zip(signature(result), signature(shuffled)):

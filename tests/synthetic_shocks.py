@@ -96,17 +96,19 @@ def multi_shock_line_cell(
 
     for spec in specs:
         idx = spec.index
-        temp[idx - 2 : idx] = spec.upstream_temperature
-        rho[idx - 2 : idx] = spec.upstream_density
+        # Leave constant states for either adaptive sampling distance. The
+        # convergence center may be the cell immediately before the jump.
+        temp[idx - 5 : idx] = spec.upstream_temperature
+        rho[idx - 5 : idx] = spec.upstream_density
         temp[idx:] = max(temp[idx], spec.upstream_temperature * temperature_jump_from_mach(spec.mach))
         rho[idx:] = max(rho[idx], spec.upstream_density * density_jump_from_mach(spec.mach))
-        vx[idx - 2 : idx] = 80.0
+        vx[idx - 5 : idx] = 80.0
         vx[idx:] = -80.0
 
-        if idx + 3 < n:
-            vx[idx + 3 :] = 80.0
-            temp[idx + 3 :] = max(temp[idx + 3], spec.upstream_temperature * 1.15)
-            rho[idx + 3 :] = max(rho[idx + 3], spec.upstream_density * 1.15)
+        if idx + 5 < n:
+            vx[idx + 5 :] = 80.0
+            temp[idx + 5 :] = max(temp[idx + 5], spec.upstream_temperature * 1.15)
+            rho[idx + 5 :] = max(rho[idx + 5], spec.upstream_density * 1.15)
 
     return cell_from_1d_profiles(x, temp, rho, vx)
 

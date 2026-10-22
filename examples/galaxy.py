@@ -4,14 +4,11 @@
 it never runs ShockFinder. The older snapshot geometry examples below remain
 available separately.
 
-This example assumes:
-- ``cell`` is the AMR gas cell table used by ``shocktest.ShockFinder``.
-- ``galaxy_pos_prev`` and ``galaxy_pos_now`` are ``(ngal, 3)`` arrays in km.
-- The same galaxy order is used at the previous and current snapshots.
-
-The classification is geometric: a galaxy is marked as crossed when its segment
-between two snapshots changes sign across the nearest shock plane and passes
-close enough to that shock cell.
+The time-series catalog uses saved front member cells and makes no assignment
+of merger origin to otherwise unattributed shocks. The older snapshot
+geometry helpers below assume ``cell`` is the AMR gas cell table,
+``galaxy_pos_prev`` and ``galaxy_pos_now`` are (ngal, 3) arrays in km, and the
+same galaxy order is used at both snapshots.
 """
 
 from __future__ import annotations
@@ -47,8 +44,9 @@ class StrippingOptions:
 
     ``tracers`` selects exact history column names; a string or a nonempty
     list/tuple is accepted. Every selected tracer is analyzed independently.
-    One significant tracer episode can support stripping; neither tracer
-    counts/families nor P_ram enter detection, scores, or confidence.
+    One significant tracer episode can support stripping. Independently
+    agreeing tracer families and measured pressure behavior increase evidence;
+    neither is allowed to create a gas-loss event on its own.
 
     Times/widths are Gyr, rates are inverse Gyr, distances are physical kpc.
     Smoothing is a centered log-mass median within a TOTAL width, restricted
@@ -63,8 +61,8 @@ class StrippingOptions:
     Evidence scores use fixed weights in _stripping_assess_episode; score_cut and
     score_margin control decisions. Uncertain encounters block an ordinary
     RPS attribution. The sensitivity sweep varies one option at a time.
-    agreement_window_gyr groups coincident events for diagnostics only; their
-    timing agreement never changes a score. All significant episodes enter
+    agreement_window_gyr groups coincident events and quantifies their
+    support. All significant episodes enter
     the galaxy classification. Conflicting mechanisms or uncertain episodes
     remain mixed. A no-strong-stripping assessment requires adequate sampling
     and min_mass_history_coverage for each selected tracer.
@@ -75,20 +73,25 @@ class StrippingOptions:
 
     Cell patches are circumscribed disks of radius sqrt(3)/2 * dx. Their
     normal half-width is the projected cube half-width plus
-    zone_width_factor * zone_width * dx. Gas apertures dilate these patches.
+    zone_width_factor * zone_width. The saved zone_width is a physical length
+    in the same unit as pos/dx. Gas apertures dilate these patches.
     ``gas_radius`` is preferred; r90 is explicitly flagged as an aperture
     proxy if no gas_radius is provided. No AMR length is inferred from a level
     without the saved dx. Cell correspondence uses measured front translation
     and a residual <= patch_match_cells * mean dx, never equality of row IDs.
+    ``shock_search_mode='events'`` queries shocks only around gas-loss events
+    found under the baseline and sensitivity cuts. ``extra_shock_snapshots``
+    probes specified outputs for every branch. Use ``'all'`` for a full survey.
     """
 
     tracers: str | tuple[str, ...] | list[str] = ("m_gas_r90",)
-    smoothing_width_gyr: float = .03
+    smoothing_width_gyr: float = .10
     min_fractional_loss: float = .30
     min_loss_rate_gyr: float = 2.
     onset_rate_fraction: float = .25
     max_episode_duration_gyr: float = .60
     rebound_fraction: float = .50
+    rebound_window_gyr: float = .15
     min_valid_samples: int = 4
     max_gap_gyr: float = .25
     gap_factor: float = 3.
@@ -108,11 +111,20 @@ class StrippingOptions:
     min_mass_history_coverage: float = .80
     pericenter_confidence_cut: float = .40
     pericenter_depth_fraction: float = .05
+    min_pressure_jump_factor: float = 3.
+    min_pressure_rise_factor: float = 1.5
+    min_pressure_samples: int = 3
+    pressure_scale: str = "linear"
+    merger_phase_window_gyr: float = .60
     sensitivity_fractions: tuple = (.20, .30, .40)
     sensitivity_rates_gyr: tuple = (1., 2., 4.)
-    sensitivity_smoothing_gyr: tuple = (0., .03, .06)
+    sensitivity_smoothing_gyr: tuple = (0., .10, .15)
     sensitivity_windows_gyr: tuple = (.10, .15, .25)
+    sensitivity_pressure_jump_factors: tuple = (2., 3., 5.)
+    sensitivity_pressure_rise_factors: tuple = (1.25, 1.5, 2.)
     sensitivity_min_stability: float = .60
+    shock_search_mode: str = "events"
+    extra_shock_snapshots: tuple[int, ...] = ()
 
 
 def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
@@ -131,16 +143,20 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         Each history MUST declare ``units`` with ``time='Gyr'``,
         ``position`` and ``radius`` in km/kpc/Mpc, and
         ``coordinate_frame='physical'``. vx/vy/vz require
-        ``velocity='km/s'`` (common Cartesian simulation frame). Their angle
+        ``velocity='km/s'``. Their angle
         is reported as a stored-velocity angle; crossing geometry uses the
         measured galaxy motion relative to the moving front instead.
         Gas masses may use any consistent unit PER tracer. Each column named
         in options.tracers must exist and have shape (N,). The default is only
         m_gas_r90. Other gas fields are preserved without being analyzed.
-        P_ram is optional and used only in diagnostic plots, never in episode
-        detection, mechanism scores, confidence, or sensitivity decisions.
+        P_ram is optional. Set options.pressure_scale to ``linear`` for positive
+        values or ``log10`` for a stored logarithm. Optional pressure_resolved
+        or icm_flag>=1 excludes unresolved estimates. Absent or invalid
+        pressure is flagged and limits confidence. It never
+        creates a gas-loss event.
 
         Optional ``resolved`` and ``valid`` map tracer -> boolean (N,) masks.
+        If resolved[m_ism] is absent, ism_flag>=1 supplies that mask.
         Optional ``mass_limits`` maps tracer -> nonnegative scalar/(N,) upper
         limits in that tracer's mass unit. Zeros or positive masses <= a
         supplied limit are censored. Only supplied POSITIVE upper limits may
@@ -153,20 +169,21 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         orbital turning-point detection.
     merger_shocks : mapping or callable
         Snapshot -> product, or callable(iout) -> product/None for streaming.
-        A product is ``{'members': [independently_assessed_front_members], ...}``.
-        Generic shock_front_catalog arrays contain no merger attribution and
-        are not accepted as independently assessed merger shocks.
-        Front assessments MUST carry independently established classification,
-        evidence and a snapshot-local front_id, or an independently supplied
-        track_origin for crossing measurements across outputs. Snapshot-local
-        IDs support proximity only; they do not establish temporal crossings.
-        No gas history is used to change merger-shock attribution.
+        A product is ``{'members': [saved_front_members], ...}``. Members may
+        have no merger-origin label; then their origin remains unverified.
+        Use ``shock_product_from_catalog`` to extract members from a catalog,
+        labels, and aligned saved result/dissipation arrays. Cross-output
+        ``track_origin`` must be supplied to confirm a moving-front encounter.
+        Snapshot-local IDs support proximity only. Merger timing comes from the
+        independent two-cluster center history, not a front classification.
 
         Set ``complete=True`` ONLY if the saved search covers the galaxies'
         positions/trajectories in this output. Optional ``covered_galaxy_ids``
         restricts that assertion. Missing products/unspecified coverage are
         unknown exposure, never non-exposure. Empty covered products are valid.
-        Supplied members are compacted one output at a time. Products are not
+        Supplied members are compacted one output at a time. By default only
+        outputs near gas loss or explicit probes are requested; unsearched
+        outputs remain unknown exposure. Products are not
         retained in the return value. Cell/patch IDs are not assumed persistent.
         Optional ``provenance`` records source paths/checksums verbatim in the
         output; rerunning geometry requires the saved cell data.
@@ -192,8 +209,8 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
         configuration and input_histories. Tables are lists of row dictionaries
         (pandas.DataFrame(...) is optional). Every selected tracer has its own
         status, events, and episode assessments in gas_loss_by_tracer.
-        Galaxy decisions consider ALL significant selected-tracer episodes,
-        without voting or requiring multiple tracers to lose gas. Different
+        Galaxy decisions consider ALL significant selected-tracer episodes.
+        Agreement across independent gas families increases confidence. Different
         mechanisms or an unresolved episode produce mixed_or_ambiguous.
         The top-level loss/timing measurements describe the largest-loss
         episode, identified by summary_gas_event_id; all episodes are retained.
@@ -218,8 +235,9 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
     for galaxy_id, history in galaxy_histories.items():
         series[galaxy_id] = _stripping_history(
             galaxy_id, history, cluster_info, cfg, shared_clusters=shared_clusters)
+        series[galaxy_id]["shock_search_mask"] = _stripping_search_mask(series[galaxy_id], cfg)
     encounters, provenance = _stripping_associate_shocks(series, merger_shocks, cfg)
-    result = {"schema_version": 2, "configuration": asdict(cfg),
+    result = {"schema_version": 3, "configuration": asdict(cfg),
               "input_histories": galaxy_histories, "diagnostic_series": series,
               "shock_encounters": encounters, "shock_provenance": provenance, "gas_loss_events": [],
               "classifications": [], "episode_assessments": [],
@@ -249,6 +267,462 @@ def galaxy_stripping_catalog(galaxy_histories, merger_shocks, cluster_info=None,
     return result
 
 
+def _stripping_table_columns(table):
+    if isinstance(table, dict):
+        return list(table)
+    if getattr(getattr(table, "dtype", None), "names", None):
+        return list(table.dtype.names)
+    if hasattr(table, "columns"):
+        return list(table.columns)
+    raise TypeError("history table must be a structured array, DataFrame, or column mapping")
+
+
+def classify_galaxy(sample_galaxies_history, merger_shocks, cluster_info, *, units,
+                    options=None, output_dir=None, make_plots=True):
+    """Classify every ``last`` branch in a combined galaxy-history table.
+
+    ``units`` must state physical position/radius units, Gyr cosmic time, and
+    km/s velocity if velocities are supplied. Set ``pressure_scale='log10'``
+    for a stored log10(P_ram/k_B) column. ``merger_shocks`` has the same
+    saved member-cell schema as ``galaxy_stripping_catalog``.
+    The returned dictionary contains the event and final classification tables,
+    diagnostic arrays, population comparisons, and optional saved file paths.
+    A single snapshot catalog cannot establish complete non-exposure or a
+    moving-front crossing over a multi-output history.
+    """
+    columns = _stripping_table_columns(sample_galaxies_history)
+    required = ("first", "last", "iout", "t_BB", "gal_cen")
+    absent = [name for name in required if name not in columns]
+    if absent:
+        raise ValueError(f"combined galaxy history is missing {absent}")
+    selected = options.tracers if isinstance(options, StrippingOptions) else (options or {}).get("tracers")
+    if selected is None:
+        selected = [name for name in GAS_TRACERS if name in columns]
+        if not selected:
+            raise ValueError("combined galaxy history has no recognized gas tracer; supply options['tracers']")
+    selected = [selected] if isinstance(selected, str) else list(selected)
+    cfg = _stripping_options(replace(options, tracers=tuple(selected)) if isinstance(options, StrippingOptions)
+                             else {**(options or {}), "tracers": selected})
+    last_values = np.asarray(sample_galaxies_history["last"])
+    first_values = np.asarray(sample_galaxies_history["first"])
+    if last_values.ndim != 1 or first_values.shape != last_values.shape:
+        raise ValueError("first and last must be one-dimensional branch IDs")
+    histories = {}
+    for last in np.unique(last_values):
+        mask = last_values == last
+        first = np.unique(first_values[mask])
+        if len(first) != 1:
+            raise ValueError(f"last={last} maps to multiple first IDs; branch identity is ambiguous")
+        history = {}
+        for name in columns:
+            if name in ("units", "resolved", "valid", "mass_limits"):
+                continue
+            if name == "cluster_info":
+                history[name] = sample_galaxies_history[name]
+                continue
+            value = np.asarray(sample_galaxies_history[name])
+            history[name] = value.item() if value.ndim == 0 else value[mask].copy()
+        for name in cfg.tracers:
+            if name not in history:
+                history[name] = np.full(np.count_nonzero(mask), np.nan)
+        for key in ("resolved", "valid", "mass_limits"):
+            if key in columns and isinstance(sample_galaxies_history[key], dict):
+                history[key] = {tr: (np.asarray(value)[mask].copy() if np.ndim(value) else value)
+                                for tr, value in sample_galaxies_history[key].items()}
+        history["units"] = dict(units)
+        histories[last] = history
+    return galaxy_stripping_catalog(histories, merger_shocks, cluster_info,
+                                    options=cfg, output_dir=output_dir, make_plots=make_plots)
+
+
+def find_front_affected_galaxies(analysis, snapshot, front_id, *,
+                                 window_gyr=None, include_without_loss=False,
+                                 require_confirmed_exposure=False):
+    """Select galaxies geometrically exposed to one snapshot-local front.
+
+    A returned galaxy has a sampled shock-zone overlap or a confirmed moving
+    front encounter. By default it also has a significant gas-loss onset during
+    or shortly after that front observation. A one-output overlap is a
+    *candidate association*, never a measured crossing or causal proof.
+
+    ``front_id`` is the ID shown in the front catalog/map at ``snapshot``;
+    equal numeric IDs at different outputs do not identify the same front.
+    ``window_gyr`` defaults to max(configured window, 1.5 local cadences).
+    ``include_without_loss`` exposes the full geometric sample for comparison.
+    """
+    snapshot = int(snapshot)
+    local_id = str(front_id)
+    if not local_id or not local_id.isdecimal():
+        raise ValueError("front_id must be a nonnegative snapshot-local catalog ID")
+    local_id = str(int(local_id))
+    if window_gyr is not None and (not np.isfinite(window_gyr) or window_gyr <= 0):
+        raise ValueError("window_gyr must be positive and finite")
+    provenance = analysis.get("shock_provenance", {}).get(snapshot)
+    if provenance is None:
+        raise ValueError(f"snapshot {snapshot} has no extracted shock product")
+    supplied = provenance.get("supplied") or {}
+    selected = supplied.get("front_ids")
+    if selected is not None and int(local_id) not in selected:
+        raise ValueError(f"front {local_id} at output {snapshot} was not extracted; rerun with --front {snapshot}:{local_id}")
+    cfg = analysis["configuration"]
+    events_by_galaxy = {}
+    for event in analysis["gas_loss_events"]:
+        if event["significant"]:
+            events_by_galaxy.setdefault(event["galaxy_id"], []).append(event)
+    assessments = {a["gas_event_ids"][0]: a for a in analysis["episode_assessments"]}
+    classifications = {row["galaxy_id"]: row for row in analysis["classifications"]}
+    encounters = {}
+    for row in analysis["shock_encounters"]:
+        encounters.setdefault(row["galaxy_id"], []).append(row)
+    rows = []
+    for galaxy_id, data in analysis["diagnostic_series"].items():
+        at_snapshot = np.flatnonzero(data["iout"] == snapshot)
+        if len(at_snapshot) != 1:
+            continue
+        observation = next((sample for sample in data["shock_observations"]
+                            if sample["snapshot"] == snapshot
+                            and (sample.get("local_front_id") == local_id
+                                 or ("local_front_id" not in sample
+                                     and sample["front_id"] == f"{snapshot}:{local_id}"))), None)
+        if observation is None:
+            continue
+        front_encounters = [encounter for encounter in encounters.get(galaxy_id, [])
+                            if encounter["front_id"] == observation["front_id"]
+                            and snapshot in encounter["snapshots"] and encounter["confirmed"]]
+        encounter = max(front_encounters, key=lambda e: e["confidence_score"]) if front_encounters else None
+        if not observation["near"] and encounter is None:
+            continue
+        if require_confirmed_exposure and encounter is None:
+            continue
+        time = float(observation["time_gyr"])
+        cadence = _stripping_local_cadence(data, time)
+        window = (float(window_gyr) if window_gyr is not None else
+                  max(float(cfg["window_gyr"]), float(cfg["association_cadences"])*cadence)
+                  if np.isfinite(cadence) else float(cfg["window_gyr"]))
+        timely = [event for event in events_by_galaxy.get(galaxy_id, [])
+                  if -event["onset_uncertainty_gyr"] <= event["onset_time_gyr"]-time <= window
+                  and event["end_time_gyr"] >= time-event["onset_uncertainty_gyr"]]
+        best = max(timely, key=lambda e: (e["gas_loss_evidence"], e["fractional_loss"],
+                                          -abs(e["onset_time_gyr"]-time))) if timely else None
+        if best is None and not include_without_loss:
+            continue
+        assessment = assessments.get(best["event_id"]) if best else None
+        linked_ids = set(assessment["coincident_gas_event_ids"]) if assessment else set()
+        linked = [event for event in timely if event["event_id"] in linked_ids] if linked_ids else []
+        tracers = sorted({event["tracer"] for event in linked}) if linked else ([best["tracer"]] if best else [])
+        families = len({_stripping_tracer_family(tracer) for tracer in tracers})
+        radius = float(data["radius_kpc"][at_snapshot[0]]) if data["radius_valid"][at_snapshot[0]] else np.nan
+        exposure = ("modeled_surface_crossing" if encounter and encounter["crossed"] else
+                    "modeled_zone_exposure" if encounter else "single_output_zone_overlap")
+        encounter_score = float(encounter["confidence_score"]) if encounter else .3*observation["front_detection_evidence"]
+        timing = (float(np.exp(-max(abs(best["onset_time_gyr"]-time)-best["onset_uncertainty_gyr"], 0.)/window))
+                  if best else 0.)
+        score = (float(.40*encounter_score + .25*timing + .20*best["gas_loss_evidence"]
+                       + .15*min(1., families/2.)) if best else 0.)
+        flags = list(observation["quality_flags"])
+        if encounter:
+            flags.extend(encounter["quality_flags"])
+        else:
+            flags.append("single_output_overlap_unconfirmed")
+        if best:
+            flags.extend(best["quality_flags"])
+        else:
+            flags.append("no_temporally_associated_significant_gas_loss")
+        if window > cfg["max_association_window_gyr"]:
+            flags.append("cadence_too_coarse_for_mechanism_ordering")
+        rows.append({"galaxy_id": galaxy_id, "snapshot": snapshot, "front_id": int(local_id),
+                     "track_id": observation["front_id"], "front_time_gyr": time,
+                     "surface_distance_kpc": observation["surface_distance_kpc"],
+                     "gas_aperture_kpc": radius,
+                     "surface_distance_over_aperture": (observation["surface_distance_kpc"]/radius
+                                                        if np.isfinite(radius) and radius > 0 else np.nan),
+                     "sampled_zone_overlap": bool(observation["near"]),
+                     "exposure_status": exposure, "confirmed_exposure": encounter is not None,
+                     "modeled_surface_crossing": bool(encounter and encounter["crossed"]),
+                     "encounter_id": encounter["encounter_id"] if encounter else None,
+                     "encounter_score": encounter_score,
+                     "shock_cell_id": observation["shock_id"],
+                     "mach": observation["local_mach_median"],
+                     "dissipation_flux_erg_s_kpc2": observation["local_flux_median_erg_s_kpc2"],
+                     "dissipation_erg_s": observation["local_dissipation_total_erg_s"],
+                     "normal_coherence": observation["normal_coherence"],
+                     "velocity_normal_angle_deg": observation["velocity_normal_angle_deg"],
+                     "side": observation["side"], "association_window_gyr": window,
+                     "significant_loss_near_front": best is not None,
+                     "gas_event_id": best["event_id"] if best else None,
+                     "gas_tracer": best["tracer"] if best else None,
+                     "agreeing_tracers": tracers, "independent_tracer_families": families,
+                     "gas_loss_onset_gyr": best["onset_time_gyr"] if best else np.nan,
+                     "delta_t_onset_minus_front_gyr": best["onset_time_gyr"]-time if best else np.nan,
+                     "fractional_gas_loss": best["fractional_loss"] if best else np.nan,
+                     "peak_loss_rate_gyr": best["peak_loss_rate_gyr"] if best else np.nan,
+                     "gas_loss_timescale_gyr": best["timescale_gyr"] if best else np.nan,
+                     "P_ram_enhancement_factor": (assessment["P_ram_enhancement_factor"]
+                                                  if assessment else np.nan),
+                     "front_association_score": score,
+                     "galaxy_category": classifications[galaxy_id]["category"],
+                     "causal_confirmation": False, "quality_flags": sorted(set(flags))})
+    order = {"modeled_surface_crossing": 0, "modeled_zone_exposure": 1,
+             "single_output_zone_overlap": 2}
+    return sorted(rows, key=lambda row: (order[row["exposure_status"]],
+                                         -row["front_association_score"],
+                                         row["surface_distance_kpc"]))
+
+
+def find_stripped_epoch(gal_branch, *, tracers=None, options=None):
+    """Return the snapshot of the largest significant gas-loss onset, or None.
+
+    This gas-only helper uses the same event detector as ``classify_galaxy``.
+    It makes no claim about the physical stripping mechanism.
+    """
+    columns = _stripping_table_columns(gal_branch)
+    selected = tracers or [name for name in GAS_TRACERS if name in columns]
+    if not selected:
+        raise ValueError("no gas tracer columns available")
+    cfg = _stripping_options({**(options or {}), "tracers": selected})
+    t = np.asarray(gal_branch["t_BB"], dtype=float)
+    iout = np.asarray(gal_branch["iout"])
+    if t.ndim != 1 or len(t) == 0 or not np.all(np.isfinite(t)) or len(np.unique(t)) != len(t):
+        raise ValueError("t_BB must contain finite unique cosmic times")
+    order = np.argsort(t)
+    t = t[order]
+    cadence, gap_limit = _stripping_cadence(t, cfg)
+    raw = {name: np.asarray(gal_branch[name]) for name in selected if name in columns}
+    for name in selected:
+        raw.setdefault(name, np.full(len(t), np.nan))
+    if "ism_flag" in columns:
+        raw["ism_flag"] = np.asarray(gal_branch["ism_flag"])
+    for key in ("resolved", "valid", "mass_limits"):
+        if key in columns:
+            raw[key] = gal_branch[key]
+    data = {"time_gyr": t, "iout": iout[order], "order": order,
+            "gap_limit_gyr": gap_limit, "cadence_gyr": cadence, "raw": raw}
+    events = [event for tracer in cfg.tracers
+              for event in _stripping_events("branch", data, tracer, _stripping_mass_series(data, tracer, cfg), cfg)
+              if event["significant"]]
+    return max(events, key=lambda e: (e["fractional_loss"], e["peak_loss_rate_gyr"]))["onset_snapshot"] if events else None
+
+
+def find_pericenter(gal_branch, cluster_info, *, units, options=None):
+    """Return sampled orbital turning points as peri_iout, d_peri, and times."""
+    columns = _stripping_table_columns(gal_branch)
+    selected = next((name for name in GAS_TRACERS if name in columns), "_placeholder_mass")
+    history = {name: np.asarray(gal_branch[name]) for name in columns
+               if name not in ("units", "resolved", "valid", "mass_limits")}
+    if selected not in history:
+        history[selected] = np.full(len(history["iout"]), np.nan)
+    history["units"] = dict(units)
+    cfg = _stripping_options({**(options or {}), "tracers": selected})
+    data = _stripping_history("branch", history, cluster_info, cfg)
+    points = [p for p in data["pericenters"] if p["verified_turning_point"]]
+    return {"peri_iout": [p["snapshot"] for p in points],
+            "d_peri": [p["distance_kpc"] for p in points],
+            "time_gyr": [p["time_gyr"] for p in points],
+            "confidence_score": [p["confidence_score"] for p in points]}
+
+
+def shock_product_from_catalog(catalog, labels, result, dissipation, snapshot, *,
+                               front_ids, track_origins=None, complete=False,
+                               covered_galaxy_ids=None):
+    """Extract selected saved front members without assigning a shock origin.
+
+    ``front_ids`` is an explicit subset of snapshot-local catalog IDs. Labels
+    must be aligned with ``result`` rows, and dissipation must be aligned with
+    the same result. ``track_origins`` may provide externally checked
+    cross-output correspondence; an omitted track never implies that equal
+    snapshot-local IDs identify the same moving front. ``complete=True`` is
+    appropriate only when the supplied subset covers every relevant front
+    around the listed galaxies and their trajectory intervals.
+    """
+    catalog = np.asarray(catalog)
+    labels = np.asarray(labels)
+    ids = np.asarray(front_ids, dtype=int)
+    if catalog.ndim != 1 or catalog.dtype.names is None or "front_id" not in catalog.dtype.names:
+        raise ValueError("catalog must be a structured front array")
+    if ids.ndim != 1 or len(np.unique(ids)) != len(ids) or np.any(~np.isin(ids, catalog["front_id"])):
+        raise ValueError("front_ids must be unique IDs present in catalog")
+    n = len(labels)
+    if labels.ndim != 1 or len(_stripping_value(result, "mach")) != n:
+        raise ValueError("labels must align with result rows")
+    if not np.all(np.isin(ids, catalog["front_id"])):
+        raise ValueError("unknown front ID")
+    indices = np.flatnonzero(np.isin(labels, ids))
+    grouped = {int(fid): indices[labels[indices] == fid] for fid in ids}
+    for name in ("pos", "dx", "normal", "mach"):
+        if _stripping_value(result, name) is None:
+            raise ValueError(f"result is missing {name}")
+    for name in ("flux", "total", "area"):
+        if _stripping_value(dissipation, name) is None or len(_stripping_value(dissipation, name)) != n:
+            raise ValueError(f"dissipation.{name} must align with result rows")
+    members = []
+    tracks = track_origins or {}
+    for fid in ids:
+        fid = int(fid)
+        rows = grouped[fid]
+        if not len(rows):
+            raise ValueError(f"front {fid} has no member labels")
+        summary = catalog[np.flatnonzero(catalog["front_id"] == fid)[0]]
+        if len(rows) != int(summary["ncell"]):
+            raise ValueError(f"front {fid}: member count does not match catalog")
+        up = _stripping_value(result, "upstream_index")
+        down = _stripping_value(result, "downstream_index")
+        position = np.asarray(_stripping_value(result, "pos"))
+        member = {"iout": int(snapshot), "front_id": str(fid), "shock_id": rows.astype(np.int64),
+                  "position_unit": _stripping_value(result, "position_unit"),
+                  "pos": position[rows].copy(),
+                  "dx": np.asarray(_stripping_value(result, "dx"))[rows].copy(),
+                  "normal": np.asarray(_stripping_value(result, "normal"))[rows].copy(),
+                  "mach": np.asarray(_stripping_value(result, "mach"))[rows].copy(),
+                  "flux": np.asarray(_stripping_value(dissipation, "flux")[rows]).copy(),
+                  "total": np.asarray(_stripping_value(dissipation, "total")[rows]).copy(),
+                  "area": np.asarray(_stripping_value(dissipation, "area")[rows]).copy(),
+                  "dissipation_units": {"flux": "erg/s/kpc2", "total": "erg/s", "area": "kpc2"}}
+        for name in ("zone_width", "level"):
+            values = _stripping_value(result, name)
+            if values is not None:
+                member[name] = np.asarray(values)[rows].copy()
+        factor = _LENGTH_TO_KPC.get(member["position_unit"])
+        if factor is None:
+            raise ValueError("result position unit must be km, kpc, or Mpc")
+        center = np.average(member["pos"]*factor, axis=0, weights=member["area"])
+        if not np.allclose(center, summary["center"], atol=.05, rtol=1.e-6):
+            raise ValueError(f"front {fid}: member positions do not match catalog center")
+        if up is not None and down is not None:
+            upstream, downstream = np.asarray(up)[rows], np.asarray(down)[rows]
+            good = ((upstream >= 0) & (downstream >= 0) &
+                    (upstream < len(position)) & (downstream < len(position)))
+            member["upstream_pos"] = np.full((len(rows), 3), np.nan)
+            member["downstream_pos"] = np.full((len(rows), 3), np.nan)
+            member["upstream_pos"][good] = position[upstream[good]]
+            member["downstream_pos"][good] = position[downstream[good]]
+        if fid in tracks:
+            member["assessment"] = {"classification": "unattributed", "evidence": 1.,
+                                    "front_id": str(fid), "track_origin": str(tracks[fid]),
+                                    "shock_id": int(rows[0]),
+                                    "quality_flags": ["shock_origin_unverified", "front_track_geometry_only"]}
+        members.append(member)
+    return {"members": members, "complete": bool(complete),
+            "covered_galaxy_ids": covered_galaxy_ids,
+            "provenance": {"snapshot": int(snapshot), "front_ids": ids.tolist(),
+                           "shock_origin": "unattributed"}}
+
+
+def filter_shock_front_catalog(catalog, *, min_mach=None, min_cells=None,
+                               min_flux=None, min_diss_rate=None):
+    """Return fronts meeting all supplied inclusive summary-property cuts.
+
+    ``mach`` is the catalog's mean Mach (area-weighted where its areas are
+    reliable); ``ncell`` counts member
+    shock centers. ``min_flux`` is mean dissipation surface flux in
+    erg/s/kpc2, computed as complete diss_rate / area. ``min_diss_rate`` is
+    total cell-integrated dissipation in erg/s. Nonfinite measurements and
+    area/rate values flagged incomplete fail the corresponding cut.
+    """
+    catalog = np.asarray(catalog)
+    required = {"front_id"}
+    if min_mach is not None:
+        required.add("mach")
+    if min_cells is not None:
+        required.add("ncell")
+    if min_diss_rate is not None or min_flux is not None:
+        required.add("diss_rate")
+    if min_flux is not None:
+        required.add("area")
+    if catalog.ndim != 1 or catalog.dtype.names is None or not required.issubset(catalog.dtype.names):
+        raise ValueError(f"front catalog must be one-dimensional with fields {sorted(required)}")
+    for name, value in (("min_mach", min_mach), ("min_flux", min_flux),
+                        ("min_diss_rate", min_diss_rate)):
+        if value is not None and ((isinstance(value, (bool, np.bool_))
+                                   or not isinstance(value, (int, float, np.number)))
+                                  or not np.isfinite(value) or value < 0
+                                  or (name == "min_mach" and value <= 1)):
+            raise ValueError(f"{name} must be finite and {'greater than one' if name == 'min_mach' else 'nonnegative'}")
+    if min_cells is not None and (isinstance(min_cells, (bool, np.bool_))
+                                  or not isinstance(min_cells, (int, np.integer)) or min_cells < 1):
+        raise ValueError("min_cells must be a positive integer")
+    keep = np.ones(len(catalog), dtype=bool)
+    if min_mach is not None:
+        keep &= np.isfinite(catalog["mach"]) & (catalog["mach"] >= min_mach)
+    if min_cells is not None:
+        keep &= catalog["ncell"] >= min_cells
+    if min_diss_rate is not None:
+        keep &= np.isfinite(catalog["diss_rate"]) & (catalog["diss_rate"] >= min_diss_rate)
+        if "quality" in catalog.dtype.names:
+            keep &= (catalog["quality"] & 2) == 0
+    if min_flux is not None:
+        area = np.asarray(catalog["area"], float)
+        rate = np.asarray(catalog["diss_rate"], float)
+        valid = np.isfinite(area) & (area > 0) & np.isfinite(rate) & (rate >= 0)
+        if "quality" in catalog.dtype.names:
+            valid &= (catalog["quality"] & 3) == 0
+        flux = np.full(len(catalog), np.nan)
+        np.divide(rate, area, out=flux, where=valid)
+        keep &= np.isfinite(flux) & (flux >= min_flux)
+    return catalog[keep]
+
+
+def select_nearby_front_ids(catalog, galaxy_positions_kpc, radii_kpc, *, padding_kpc=20.):
+    """Select snapshot-local fronts whose saved bounding boxes approach galaxies.
+
+    This is an extraction filter, not a measured encounter. Member-cell
+    geometry must still be checked. The selected subset does not establish
+    complete shock coverage for non-exposure claims.
+    """
+    catalog = np.asarray(catalog)
+    position = np.asarray(galaxy_positions_kpc, float)
+    radii = np.asarray(radii_kpc, float)
+    if position.ndim != 2 or position.shape[1] != 3 or radii.shape != (len(position),):
+        raise ValueError("galaxy positions must be (N,3) and radii must be (N,)")
+    if not np.isfinite(padding_kpc) or padding_kpc < 0:
+        raise ValueError("padding_kpc must be nonnegative")
+    ids = set()
+    for point, radius in zip(position, radii):
+        if not np.all(np.isfinite(point)):
+            continue
+        radius = radius if np.isfinite(radius) and radius > 0 else 0.
+        delta = np.maximum(np.abs(catalog["center"]-point)-.5*catalog["extent"], 0.)
+        distance = np.linalg.norm(delta, axis=1)
+        ids.update(map(int, catalog["front_id"][distance <= radius+padding_kpc]))
+    return np.array(sorted(ids), dtype=int)
+
+
+def match_front_tracks(previous_catalog, current_catalog, previous_ids, current_ids,
+                       *, previous_tracks=None, track_prefix="front",
+                       max_center_shift_kpc=60., min_normal_cosine=.8):
+    """Match only mutually nearest, aligned front summaries across two outputs.
+
+    Returns a mapping of current snapshot-local IDs to persistent geometry
+    track strings. Unmatched and conflicting fronts remain untracked; patch
+    correspondence is checked again during galaxy crossing analysis.
+    """
+    from scipy.spatial import cKDTree
+
+    previous_ids = np.asarray(previous_ids, int)
+    current_ids = np.asarray(current_ids, int)
+    if not len(previous_ids) or not len(current_ids):
+        return {}
+    previous_catalog, current_catalog = np.asarray(previous_catalog), np.asarray(current_catalog)
+    previous_lookup = {int(fid): j for j, fid in enumerate(previous_catalog["front_id"])}
+    current_lookup = {int(fid): j for j, fid in enumerate(current_catalog["front_id"])}
+    if len(previous_lookup) != len(previous_catalog) or len(current_lookup) != len(current_catalog):
+        raise ValueError("front IDs must be unique within each snapshot")
+    if any(int(fid) not in previous_lookup for fid in previous_ids) or any(int(fid) not in current_lookup for fid in current_ids):
+        raise ValueError("selected front ID is absent from its snapshot catalog")
+    previous = previous_catalog[[previous_lookup[int(fid)] for fid in previous_ids]]
+    current = current_catalog[[current_lookup[int(fid)] for fid in current_ids]]
+    left = cKDTree(previous["center"])
+    right = cKDTree(current["center"])
+    distance, left_index = left.query(current["center"])
+    _, right_index = right.query(previous["center"])
+    alignment = np.abs(np.einsum("ij,ij->i", previous["normal"][left_index], current["normal"]))
+    good = ((distance <= max_center_shift_kpc) & (alignment >= min_normal_cosine)
+            & (right_index[left_index] == np.arange(len(current))))
+    parent = previous_tracks or {}
+    return {int(current_ids[j]): parent.get(int(previous_ids[left_index[j]]),
+                                            f"{track_prefix}:{int(previous_ids[left_index[j]])}")
+            for j in np.flatnonzero(good)}
+
+
 def _stripping_options(options):
     cfg = options if isinstance(options, StrippingOptions) else StrippingOptions(**(options or {}))
     tracers = (cfg.tracers,) if isinstance(cfg.tracers, str) else cfg.tracers
@@ -265,9 +739,10 @@ def _stripping_options(options):
     for key in bounded:
         if not np.isfinite(getattr(cfg, key)) or not 0 < getattr(cfg, key) <= 1:
             raise ValueError(f"{key} must be in (0,1]")
-    for key in ("min_loss_rate_gyr", "max_episode_duration_gyr", "max_gap_gyr", "gap_factor",
+    for key in ("min_loss_rate_gyr", "max_episode_duration_gyr", "rebound_window_gyr", "max_gap_gyr", "gap_factor",
                 "window_gyr", "association_cadences", "max_association_window_gyr",
-                "agreement_window_gyr", "patch_match_cells", "max_motion_km_s"):
+                "agreement_window_gyr", "patch_match_cells", "max_motion_km_s",
+                "min_pressure_jump_factor", "min_pressure_rise_factor", "merger_phase_window_gyr"):
         if not np.isfinite(getattr(cfg, key)) or getattr(cfg, key) <= 0:
             raise ValueError(f"{key} must be finite and positive")
     for key in ("smoothing_width_gyr", "zone_width_factor"):
@@ -276,10 +751,26 @@ def _stripping_options(options):
     if (isinstance(cfg.min_valid_samples, bool) or not isinstance(cfg.min_valid_samples, (int, np.integer))
             or cfg.min_valid_samples < 1):
         raise ValueError("invalid min_valid_samples")
+    if (isinstance(cfg.min_pressure_samples, bool) or not isinstance(cfg.min_pressure_samples, (int, np.integer))
+            or cfg.min_pressure_samples < 2):
+        raise ValueError("invalid min_pressure_samples")
+    if cfg.pressure_scale not in ("linear", "log10"):
+        raise ValueError("pressure_scale must be 'linear' or 'log10'")
+    if cfg.shock_search_mode not in ("events", "all"):
+        raise ValueError("shock_search_mode must be 'events' or 'all'")
+    if any(isinstance(s, (bool, np.bool_)) or not isinstance(s, (int, np.integer)) or s < 0
+           for s in cfg.extra_shock_snapshots):
+        raise ValueError("extra_shock_snapshots must contain nonnegative integer outputs")
+    if cfg.min_pressure_jump_factor <= 1 or cfg.min_pressure_rise_factor <= 1:
+        raise ValueError("pressure enhancement factors must exceed one")
     for field, grid in (("min_fractional_loss", cfg.sensitivity_fractions), ("min_loss_rate_gyr", cfg.sensitivity_rates_gyr),
-                        ("smoothing_width_gyr", cfg.sensitivity_smoothing_gyr), ("window_gyr", cfg.sensitivity_windows_gyr)):
+                        ("smoothing_width_gyr", cfg.sensitivity_smoothing_gyr), ("window_gyr", cfg.sensitivity_windows_gyr),
+                        ("min_pressure_jump_factor", cfg.sensitivity_pressure_jump_factors),
+                        ("min_pressure_rise_factor", cfg.sensitivity_pressure_rise_factors)):
         for value in grid:
-            if not np.isfinite(value) or value < 0 or (field != "smoothing_width_gyr" and value == 0) or (field == "min_fractional_loss" and value > 1):
+            if (not np.isfinite(value) or value < 0 or (field != "smoothing_width_gyr" and value == 0)
+                    or (field == "min_fractional_loss" and value > 1)
+                    or (field.startswith("min_pressure_") and value <= 1)):
                 raise ValueError(f"invalid sensitivity grid for {field}")
     return cfg
 
@@ -333,8 +824,11 @@ def _stripping_clusters(info):
     paired = np.isfinite(sep)
     # No interpolated secondary center, and no branch termination at zero separation.
     turns = [j for j in range(1, n-1) if paired[j-1:j+2].all() and sep[j] < sep[j-1] and sep[j] <= sep[j+1]]
-    epoch = {"core_passage_time_gyr": float(times[order[turns[0]]]) if turns else np.nan,
-             "verified": bool(turns), "source": "bracketed two-center separation minimum" if turns else "unresolved two-center turning point"}
+    # Minor center jitter can make several early local minima. Use the deepest
+    # bracketed separation minimum as the sampled core passage.
+    core_turn = min(turns, key=lambda j: sep[j]) if turns else None
+    epoch = {"core_passage_time_gyr": float(times[order[core_turn]]) if turns else np.nan,
+             "verified": bool(turns), "source": "deepest bracketed two-center separation minimum" if turns else "unresolved two-center turning point"}
     return {"snapshots": snapshots, "times": times, "c1": centers1, "c2": centers2,
             "r1": radii1, "r2": radii2, "box": box, "epoch": epoch}
 
@@ -474,6 +968,9 @@ def _stripping_mass_series(data, tracer, cfg):
     mass = _stripping_column(history, tracer, n)[order]
     valid, _ = _stripping_mask(history, "valid", tracer, n, order)
     resolved, known_resolution = _stripping_mask(history, "resolved", tracer, n, order)
+    if tracer == "m_ism" and not known_resolution and "ism_flag" in history:
+        resolved = _stripping_column(history, "ism_flag", n)[order] >= 1
+        known_resolution = True
     limits = np.asarray(history.get("mass_limits", {}).get(tracer, np.zeros(n)), dtype=float)
     if limits.ndim == 0:
         limits = np.full(n, limits)
@@ -544,6 +1041,18 @@ def _stripping_mass_series(data, tracer, cfg):
             "resolution_supplied": known_resolution}
 
 
+def _stripping_rebounds(mass_data, t, end, old_mass, low_mass, cfg, gap_limit):
+    previous = end
+    for j in range(end+1, len(t)):
+        if (t[j]-t[end] > cfg.rebound_window_gyr or t[j]-t[previous] > gap_limit
+                or not mass_data["positive"][j]):
+            break
+        if mass_data["smoothed_mass"][j]-low_mass > cfg.rebound_fraction*(old_mass-low_mass):
+            return True
+        previous = j
+    return False
+
+
 def _stripping_events(gid, data, tracer, mass_data, cfg):
     t, rate = data["time_gyr"], mass_data["loss_rate_gyr"]
     active = np.isfinite(rate) & (rate > cfg.onset_rate_fraction*cfg.min_loss_rate_gyr)
@@ -572,15 +1081,23 @@ def _stripping_events(gid, data, tracer, mass_data, cfg):
             flags.append("end_followed_by_history_gap")
         if b == a+1:
             flags.append("single_interval_loss_rate")
-        # A one-output loss that immediately reverses is a dip, not a robust episode.
-        rebound = False
-        if b+1 < len(t) and t[b+1]-t[b] <= data["gap_limit_gyr"] and mass_data["positive"][b+1]:
-            recovered = mass_data["smoothed_mass"][b+1]-last_mass
-            rebound = recovered > cfg.rebound_fraction*(first_mass-last_mass)
-            if rebound:
-                flags.append("transient_rebound")
+        # A short lived dip that recovers within the configured time window is noise.
+        rebound = _stripping_rebounds(mass_data, t, b, first_mass, last_mass, cfg, data["gap_limit_gyr"])
+        if rebound:
+            flags.append("transient_rebound")
+        # A temporary positive excursion followed by return to the old level
+        # is not evidence that the pre-existing gas reservoir was stripped.
+        previous = mass_data["smoothed_mass"][max(0, a-3):a]
+        previous = previous[np.isfinite(previous)]
+        spike_return = False
+        if len(previous) >= 2:
+            previous_level = float(np.median(previous))
+            spike_return = (first_mass > previous_level*(1.+cfg.min_fractional_loss)
+                            and last_mass >= previous_level*(1.-.5*cfg.min_fractional_loss))
+            if spike_return:
+                flags.append("drop_from_transient_mass_spike")
         significant = (fraction >= cfg.min_fractional_loss and rate[peak_index] >= cfg.min_loss_rate_gyr
-                       and duration <= cfg.max_episode_duration_gyr and not rebound)
+                       and duration <= cfg.max_episode_duration_gyr and not rebound and not spike_return)
         onset_uncertainty = .5*(t[a+1]-t[a])
         strength = min(1., fraction/cfg.min_fractional_loss) * min(1., rate[peak_index]/cfg.min_loss_rate_gyr)
         if rebound or duration > cfg.max_episode_duration_gyr:
@@ -600,7 +1117,129 @@ def _stripping_events(gid, data, tracer, mass_data, cfg):
                      "peak_uncertainty_gyr": float(.5*(t[peak_index+1]-t[peak_index])),
                      "significant": bool(significant), "gas_loss_evidence": float(strength),
                      "quality_flags": sorted(set(flags))})
+    # Resolved masses on both sides of a short missing run can bound a loss.
+    # The onset is interval censored; do not interpolate or log invalid values.
+    positive = mass_data["positive"]
+    for left in np.flatnonzero(positive[:-1] & ~positive[1:]):
+        right = left+2
+        while right < len(t) and not positive[right]:
+            right += 1
+        if right == len(t) or t[right]-t[left] > min(data["gap_limit_gyr"], cfg.max_episode_duration_gyr):
+            continue
+        start_mass = mass_data["smoothed_mass"][left]
+        end_mass = mass_data["smoothed_mass"][right]
+        fraction = float(1.-end_mass/start_mass)
+        rate = float(np.log(start_mass/end_mass)/(t[right]-t[left]))
+        if fraction <= 0 or rate <= cfg.onset_rate_fraction*cfg.min_loss_rate_gyr:
+            continue
+        rebound = _stripping_rebounds(mass_data, t, right, start_mass, end_mass,
+                                      cfg, data["gap_limit_gyr"])
+        previous = mass_data["smoothed_mass"][max(0, left-2):left]
+        previous = previous[np.isfinite(previous)]
+        spike_return = bool(len(previous) >= 2 and start_mass > np.median(previous)*(1.+cfg.min_fractional_loss)
+                            and end_mass >= np.median(previous)*(1.-.5*cfg.min_fractional_loss))
+        flags = list(mass_data["quality_flags"])+[
+            "loss_brackets_missing_samples", "loss_onset_interval_censored",
+            "peak_loss_rate_is_lower_bound", "loss_duration_is_upper_bound"]
+        if rebound:
+            flags.append("transient_rebound")
+        if spike_return:
+            flags.append("drop_from_transient_mass_spike")
+        significant = fraction >= cfg.min_fractional_loss and rate >= cfg.min_loss_rate_gyr and not rebound and not spike_return
+        rows.append({"event_id": f"{gid}:{tracer}:{int(data['iout'][left])}:gap", "galaxy_id": gid,
+                     "tracer": tracer, "onset_time_gyr": float(t[left]),
+                     "peak_time_gyr": float(.5*(t[left]+t[right])), "end_time_gyr": float(t[right]),
+                     "onset_snapshot": int(data["iout"][left]), "end_snapshot": int(data["iout"][right]),
+                     "peak_loss_rate_gyr": rate, "mean_loss_rate_gyr": rate,
+                     "fractional_loss": fraction,
+                     "raw_fractional_loss": float(1.-mass_data["raw_mass"][right]/mass_data["raw_mass"][left]),
+                     "duration_gyr": float(t[right]-t[left]), "timescale_gyr": 1./rate,
+                     "duration_is_lower_bound": False, "duration_is_upper_bound": True,
+                     "timescale_is_upper_bound": True,
+                     "fraction_is_lower_bound": False, "rate_is_lower_bound": True,
+                     "onset_uncertainty_gyr": float(t[right]-t[left]),
+                     "peak_uncertainty_gyr": float(.5*(t[right]-t[left])),
+                     "significant": bool(significant),
+                     "gas_loss_evidence": .5*min(1., fraction/cfg.min_fractional_loss)
+                     *min(1., rate/cfg.min_loss_rate_gyr),
+                     "quality_flags": sorted(set(flags))})
     return rows
+
+
+def _stripping_search_mask(data, cfg):
+    """Limit costly member-cell queries to gas-loss epochs and explicit probes.
+
+    Screen with the most permissive configured fraction/rate cuts and every
+    configured smoothing width, so the sensitivity sweep does not lose an
+    encounter merely because its baseline definition missed the gas event.
+    The adjacent output on each side permits a moving-front interpolation.
+    """
+    t, snapshots = data["time_gyr"], data["iout"]
+    if cfg.shock_search_mode == "all":
+        return np.ones(len(t), dtype=bool)
+    mask = np.zeros(len(t), dtype=bool)
+    width = max((cfg.window_gyr, *cfg.sensitivity_windows_gyr))
+    screen = replace(cfg,
+                     min_fractional_loss=min((cfg.min_fractional_loss, *cfg.sensitivity_fractions)),
+                     min_loss_rate_gyr=min((cfg.min_loss_rate_gyr, *cfg.sensitivity_rates_gyr)))
+    for smoothing in sorted({cfg.smoothing_width_gyr, *cfg.sensitivity_smoothing_gyr}):
+        candidate_cfg = replace(screen, smoothing_width_gyr=smoothing)
+        for tracer in cfg.tracers:
+            mass = _stripping_mass_series(data, tracer, candidate_cfg)
+            for event in _stripping_events(data.get("galaxy_id", "branch"), data, tracer, mass, candidate_cfg):
+                if not event["significant"]:
+                    continue
+                onset = event["onset_time_gyr"]
+                local = _stripping_local_cadence(data, onset)
+                half = max(width, cfg.association_cadences*local)
+                upper = event["end_time_gyr"] if "loss_onset_interval_censored" in event["quality_flags"] else onset
+                selected = np.flatnonzero((t >= onset-half) & (t <= upper+half))
+                if len(selected):
+                    mask[max(0, selected[0]-1):min(len(t), selected[-1]+2)] = True
+    for snapshot in cfg.extra_shock_snapshots:
+        positions = np.flatnonzero(snapshots == snapshot)
+        for j in positions:
+            mask[max(0, j-1):min(len(t), j+2)] = True
+    return mask
+
+
+def shock_search_schedule(sample_galaxies_history, *, options=None):
+    """Return branch IDs and outputs needing member-cell shock geometry.
+
+    This gas-only prepass does not read cluster or shock files. An empty branch
+    schedule means its shock exposure remains unknown, not absent.
+    """
+    columns = _stripping_table_columns(sample_galaxies_history)
+    selected = options.tracers if isinstance(options, StrippingOptions) else (options or {}).get("tracers")
+    if selected is None:
+        selected = [name for name in GAS_TRACERS if name in columns]
+    cfg = _stripping_options(replace(options, tracers=tuple(selected)) if isinstance(options, StrippingOptions)
+                             else {**(options or {}), "tracers": selected})
+    last_values = np.asarray(sample_galaxies_history["last"])
+    first_values = np.asarray(sample_galaxies_history["first"])
+    result = {}
+    for last in np.unique(last_values):
+        branch = last_values == last
+        if len(np.unique(first_values[branch])) != 1:
+            raise ValueError(f"last={last} maps to multiple first IDs; branch identity is ambiguous")
+        time = np.asarray(sample_galaxies_history["t_BB"][branch], dtype=float)
+        snapshots = np.asarray(sample_galaxies_history["iout"][branch])
+        if len(time) == 0 or not np.all(np.isfinite(time)) or len(np.unique(time)) != len(time):
+            raise ValueError(f"last={last}: t_BB must contain finite unique times")
+        order = np.argsort(time)
+        cadence, gap_limit = _stripping_cadence(time[order], cfg)
+        raw = {name: np.asarray(sample_galaxies_history[name])[branch] for name in cfg.tracers}
+        for name in ("ism_flag", "icm_flag"):
+            if name in columns:
+                raw[name] = np.asarray(sample_galaxies_history[name])[branch]
+        for name in ("resolved", "valid", "mass_limits"):
+            if name in columns and isinstance(sample_galaxies_history[name], dict):
+                raw[name] = {tr: (np.asarray(value)[branch] if np.ndim(value) else value)
+                             for tr, value in sample_galaxies_history[name].items()}
+        data = {"galaxy_id": last, "time_gyr": time[order], "iout": snapshots[order],
+                "order": order, "raw": raw, "cadence_gyr": cadence, "gap_limit_gyr": gap_limit}
+        result[last] = tuple(map(int, data["iout"][_stripping_search_mask(data, cfg)]))
+    return result
 
 
 def _stripping_local_cadence(data, time):
@@ -612,7 +1251,7 @@ def _stripping_local_cadence(data, time):
 
 
 def _stripping_groups(events, data, cfg):
-    """Group onset times for reporting only; never determine a mechanism."""
+    """Group distinct-tracer episodes whose onsets agree within local cadence."""
     groups = []
     for event in sorted((e for e in events if e["significant"]), key=lambda e: (e["onset_time_gyr"], e["tracer"])):
         window = max(cfg.agreement_window_gyr, _stripping_local_cadence(data, event["onset_time_gyr"]))
@@ -623,6 +1262,116 @@ def _stripping_groups(events, data, cfg):
         else:
             target.append(event)
     return groups
+
+
+def _stripping_tracer_family(tracer):
+    name = tracer.lower()
+    if "hi_" in name or name.startswith("hi") or "neutral" in name:
+        return "HI"
+    if "cold" in name:
+        return "cold"
+    if "ism" in name:
+        return "ISM"
+    if "gas" in name:
+        return "gas"
+    return tracer
+
+
+def _stripping_pressure_event(data, onset, window, cfg):
+    """Measure a local pressure step and inward trend with an explicit input scale."""
+    t = data["time_gyr"]
+    pressure = _stripping_column(data["raw"], "P_ram", len(t))[data["order"]]
+    valid = np.isfinite(pressure) & ((pressure > 0) if cfg.pressure_scale == "linear" else True)
+    if "pressure_resolved" in data["raw"]:
+        resolved = np.asarray(data["raw"]["pressure_resolved"])
+        if resolved.shape != (len(t),) or resolved.dtype.kind != "b":
+            raise ValueError("pressure_resolved must be a boolean (N,) array")
+        valid &= resolved[data["order"]]
+    elif "icm_flag" in data["raw"]:
+        valid &= _stripping_column(data["raw"], "icm_flag", len(t))[data["order"]] >= 1
+    log_pressure = np.full(len(t), np.nan)
+    if cfg.pressure_scale == "linear":
+        log_pressure[valid] = np.log(pressure[valid])
+    else:
+        log_pressure[valid] = pressure[valid]*np.log(10.)
+    raw_log_pressure = log_pressure.copy()
+    # Reject isolated one-output excursions whose two neighbors agree. A
+    # persistent step is retained; missing neighbors cannot verify a step.
+    transient = np.zeros(len(t), dtype=bool)
+    for j in range(1, len(t)-1):
+        if (valid[j-1:j+2].all() and t[j+1]-t[j-1] <= 2*data["gap_limit_gyr"]
+                and abs(log_pressure[j-1]-log_pressure[j+1]) < np.log(cfg.min_pressure_rise_factor)
+                and abs(log_pressure[j]-.5*(log_pressure[j-1]+log_pressure[j+1])) >= np.log(cfg.min_pressure_jump_factor)):
+            transient[j] = True
+    log_pressure[transient] = .5*(log_pressure[np.flatnonzero(transient)-1]
+                                  + log_pressure[np.flatnonzero(transient)+1])
+    result = {"status": "measured" if np.count_nonzero(valid) >= cfg.min_pressure_samples else "insufficient_pressure_history",
+              "valid_sample_count": int(np.count_nonzero(valid)), "baseline": np.nan,
+              "peak": np.nan, "peak_time_gyr": np.nan, "raw_peak": np.nan,
+              "raw_peak_time_gyr": np.nan, "enhancement_factor": np.nan,
+              "maximum_adjacent_factor": np.nan, "jump_time_gyr": np.nan,
+              "sudden_evidence": 0., "smooth_infall_evidence": 0.,
+              "quality_flags": []}
+    if not np.all(valid):
+        result["quality_flags"].append("pressure_missing_or_invalid_samples")
+    local_cadence = _stripping_local_cadence(data, onset)
+    local_pressure_gap = bool(np.any((np.abs(t-onset) <= local_cadence+1.e-9) & ~valid))
+    if local_pressure_gap:
+        result["quality_flags"].append("pressure_gap_near_loss")
+    if np.any(transient):
+        result["quality_flags"].append("pressure_transient_spike_filtered")
+    if result["status"] != "measured":
+        result["quality_flags"].append("insufficient_pressure_history")
+        return result
+    pre = valid & (t >= onset-2*window) & (t < onset-window)
+    near = valid & (t >= onset-window) & (t <= onset+window)
+    if np.count_nonzero(pre) < 2 or not np.any(near):
+        result["status"] = "insufficient_local_pressure_history"
+        result["quality_flags"].append("insufficient_local_pressure_history")
+        return result
+    baseline_log = float(np.median(log_pressure[pre]))
+    peak_index = int(np.flatnonzero(near)[np.argmax(log_pressure[near])])
+    raw_peak_index = int(np.flatnonzero(near)[np.argmax(raw_log_pressure[near])])
+    peak_log = float(log_pressure[peak_index])
+    enhancement_log = peak_log-baseline_log
+    enhancement = float(np.exp(np.clip(enhancement_log, -700., 700.)))
+    pair = valid[:-1] & valid[1:] & (np.diff(t) <= data["gap_limit_gyr"])
+    pair &= (t[:-1] >= onset-window) & (t[1:] <= onset+window)
+    jumps = np.full(len(t)-1, np.nan)
+    jumps[pair] = log_pressure[1:][pair]-log_pressure[:-1][pair]
+    jump_index = int(np.nanargmax(jumps)) if np.any(pair) else None
+    maximum_jump = float(np.exp(np.clip(jumps[jump_index], -700., 700.))) if jump_index is not None else np.nan
+    jump_time = float(.5*(t[jump_index]+t[jump_index+1])) if jump_index is not None else np.nan
+    sudden = (float(np.clip(jumps[jump_index]/np.log(cfg.min_pressure_jump_factor), 0., 1.))
+              if jump_index is not None else 0.)
+    sudden *= float(np.clip(enhancement_log/np.log(cfg.min_pressure_jump_factor), 0., 1.))
+    if sudden > 0 and jump_index is not None:
+        after = jump_index+2
+        persistent = (after < len(t) and valid[after]
+                      and t[after]-t[after-1] <= data["gap_limit_gyr"]
+                      and log_pressure[after] >= log_pressure[jump_index+1]-np.log(cfg.min_pressure_rise_factor))
+        if not persistent:
+            sudden = 0.
+            result["quality_flags"].append("pressure_step_persistence_unverified")
+    # A smooth infall trend requires several measured inward/pressure-rising pairs.
+    radius = data["cluster_distance_kpc"]
+    inward = pair & (t[1:] <= onset+window) & np.isfinite(radius[:-1]) & np.isfinite(radius[1:])
+    inward &= (radius[1:] < radius[:-1])
+    paired_count = int(np.count_nonzero(inward))
+    agreement = float(np.mean(log_pressure[1:][inward] >= log_pressure[:-1][inward])) if paired_count else 0.
+    rise = float(np.clip(enhancement_log/np.log(cfg.min_pressure_rise_factor), 0., 1.))
+    smooth = rise*agreement*(1.-sudden) if paired_count >= 2 else 0.
+    result.update(baseline=float(pressure[pre][np.argmin(np.abs(log_pressure[pre]-baseline_log))]),
+                  peak=float(pressure[peak_index]), peak_time_gyr=float(t[peak_index]),
+                  raw_peak=float(pressure[raw_peak_index]), raw_peak_time_gyr=float(t[raw_peak_index]),
+                  enhancement_factor=float(enhancement), maximum_adjacent_factor=maximum_jump,
+                  jump_time_gyr=jump_time, sudden_evidence=float(sudden),
+                  smooth_infall_evidence=float(smooth))
+    if local_pressure_gap:
+        result["status"] = "pressure_gap_near_loss"
+        result["sudden_evidence"] = 0.
+        result["smooth_infall_evidence"] = 0.
+    return result
 
 
 def _stripping_coverage(data, onset, window):
@@ -641,14 +1390,16 @@ def _stripping_coverage(data, onset, window):
     return fraction
 
 
-def _stripping_assess_episode(gid, event, data, cfg):
-    """Assess one tracer's significant episode without any tracer voting."""
+def _stripping_assess_episode(gid, event, data, cfg, support):
+    """Assess a gas-loss episode using independently measured exposure and pressure."""
     onset, peak = event["onset_time_gyr"], event["peak_time_gyr"]
     cadence = _stripping_local_cadence(data, onset)
     cadence = cadence if np.isfinite(cadence) else cfg.max_association_window_gyr*2
     window = max(cfg.window_gyr, cfg.association_cadences*cadence)
     uncertainty = event["onset_uncertainty_gyr"]
     gas_evidence = event["gas_loss_evidence"]
+    pressure = _stripping_pressure_event(data, onset, window, cfg)
+    tracer_evidence = support["evidence"]
     near = [e for e in data["encounters"] if e["end_time_gyr"] >= onset-window and e["start_time_gyr"] <= onset+uncertainty]
     def encounter_rank(e):
         lag = onset-e["peak_time_gyr"]
@@ -672,13 +1423,17 @@ def _stripping_assess_episode(gid, event, data, cfg):
     inward_pairs &= data["host_cluster"][:-1] == data["host_cluster"][1:]
     inward = float(np.mean(np.diff(r)[inward_pairs] < 0)) if np.any(inward_pairs) else 0.
     no_shock = min(1., coverage/cfg.min_shock_coverage) if not near else 0.
-    # Normalize the remaining geometric/timing/gas weights to sum to one.
-    # Shock: exposure .30/.85, timing*exposure .20/.85, gas .20/.85,
-    # geometry .15/.85. Infall: pericenter .25/.80, gas .20/.80,
-    # inward motion .15/.80, covered absence of shocks .20/.80.
-    # Neither pressure nor the number/type of other tracers enters these scores.
-    shock_score = (.30*exposure + .20*shock_timing*exposure + .20*gas_evidence + .15*geometry)/.85
-    rps_score = (.25*peri_timing + .20*gas_evidence + .15*inward + .20*no_shock)/.80
+    core = data["merger_epoch"]["core_passage_time_gyr"]
+    origin_verified = bool(encounter and encounter.get("merger_origin_verified", False))
+    phase_evidence = (1. if origin_verified else
+                      float(np.exp(-abs(onset-core)/cfg.merger_phase_window_gyr)) if np.isfinite(core) else 0.)
+    # Evidence indices, not calibrated probabilities. Generic shocks require
+    # independent merger-phase timing as context, without relabeling the front.
+    shock_score = (.24*exposure + .16*shock_timing*exposure + .16*gas_evidence
+                   + .12*geometry + .14*pressure["sudden_evidence"]
+                   + .08*tracer_evidence + .10*phase_evidence)
+    rps_score = (.25*peri_timing + .17*gas_evidence + .13*inward + .15*no_shock
+                 + .15*pressure["smooth_infall_evidence"] + .15*tracer_evidence)
     reasons = []
     flags = list(event["quality_flags"])
     credible = bool(encounter and encounter["confirmed"] and exposure >= cfg.encounter_score_cut)
@@ -691,8 +1446,16 @@ def _stripping_assess_episode(gid, event, data, cfg):
         reasons.append("shock_and_loss_order_unresolved")
     if any(f in flags for f in ("onset_left_censored", "onset_after_missing_or_unresolved_mass")):
         reasons.append("loss_onset_not_observed")
+    if "loss_onset_interval_censored" in flags:
+        reasons.append("loss_onset_interval_censored")
     if "insufficient_resolved_mass_samples" in flags:
         reasons.append("insufficient_resolved_mass_samples")
+    if support["conflicting_event"]:
+        reasons.append("gas_tracer_event_times_disagree")
+    if pressure["status"] != "measured":
+        flags.extend(pressure["quality_flags"])
+    if pressure["status"] == "pressure_gap_near_loss":
+        reasons.append("pressure_timing_unresolved_near_loss")
     if near and not credible:
         reasons.append("merger_shock_association_uncertain")
     if coverage < cfg.min_shock_coverage:
@@ -705,9 +1468,14 @@ def _stripping_assess_episode(gid, event, data, cfg):
     if np.any(local_indices & ~np.isfinite(r)):
         reasons.append("cluster_center_gap_near_loss")
     shock_ok = (credible and -uncertainty <= lag_shock <= window
+                and phase_evidence >= .35
                 and shock_score >= cfg.score_cut and not confounded and not ordering_unresolved)
     rps_ok = (peri is not None and abs(lag_peri) <= window
               and coverage >= cfg.min_shock_coverage and not near and rps_score >= cfg.score_cut)
+    if pressure["status"] == "measured":
+        shock_ok &= (pressure["sudden_evidence"] >= .35
+                     and pressure["jump_time_gyr"] <= onset+uncertainty)
+        rps_ok &= pressure["smooth_infall_evidence"] >= .35
     both_scores = shock_score >= cfg.score_cut and rps_score >= cfg.score_cut
     if both_scores and abs(shock_score-rps_score) < cfg.score_margin:
         reasons.append("both_mechanisms_have_comparable_evidence")
@@ -723,9 +1491,10 @@ def _stripping_assess_episode(gid, event, data, cfg):
     confidence = "medium" if category != "mixed_or_ambiguous" else "low"
     if encounter:
         flags.extend(encounter["quality_flags"])
-    if max(shock_score, rps_score) >= .85 and not flags and category != "mixed_or_ambiguous":
+    if (max(shock_score, rps_score) >= .85 and not reasons and
+            pressure["status"] == "measured" and support["independent_family_count"] >= 2
+            and category != "mixed_or_ambiguous"):
         confidence = "high"
-    core = data["merger_epoch"]["core_passage_time_gyr"]
     return {"galaxy_id": gid, "gas_event_ids": [event["event_id"]], "tracer": event["tracer"],
             "onset_time_gyr": onset, "peak_time_gyr": peak, "end_time_gyr": event["end_time_gyr"],
             "fractional_loss": event["fractional_loss"], "peak_loss_rate_gyr": event["peak_loss_rate_gyr"],
@@ -742,7 +1511,25 @@ def _stripping_assess_episode(gid, event, data, cfg):
             "modeled_surface_crossing": bool(encounter and encounter["crossed"]),
             "encounter_geometry_evidence": geometry,
             "merger_shock_origin_evidence": encounter["merger_evidence"] if encounter else np.nan,
+            "shock_origin_verified": origin_verified,
+            "merger_phase_evidence": phase_evidence,
             "temporal_coincidence_score": shock_timing, "gas_loss_evidence": gas_evidence,
+            "P_ram_enhancement_factor": pressure["enhancement_factor"],
+            "P_ram_peak_time_gyr": pressure["peak_time_gyr"],
+            "P_ram_raw_peak": pressure["raw_peak"],
+            "P_ram_raw_peak_time_gyr": pressure["raw_peak_time_gyr"],
+            "P_ram_jump_time_gyr": pressure["jump_time_gyr"],
+            "delta_t_ram_peak_gyr": float(onset-pressure["peak_time_gyr"]),
+            "delta_t_ram_jump_gyr": float(onset-pressure["jump_time_gyr"]),
+            "P_ram_maximum_adjacent_factor": pressure["maximum_adjacent_factor"],
+            "P_ram_sudden_evidence": pressure["sudden_evidence"],
+            "P_ram_smooth_infall_evidence": pressure["smooth_infall_evidence"],
+            "P_ram_status": pressure["status"],
+            "P_ram_quality_flags": pressure["quality_flags"],
+            "tracer_support_count": support["tracer_count"],
+            "independent_tracer_family_count": support["independent_family_count"],
+            "tracer_temporal_agreement": support["temporal_agreement"],
+            "tracer_support_evidence": tracer_evidence,
             "merger_shock_stripping_score": float(shock_score), "ordinary_rps_score": float(rps_score),
             "merger_phase": "unresolved" if not np.isfinite(core) else "before_core_passage" if onset < core else "after_core_passage",
             "delta_t_cluster_core_passage_gyr": float(onset-core),
@@ -758,20 +1545,28 @@ def _stripping_analyze_galaxy(gid, data, cfg, *, store=True):
         events.extend(_stripping_events(gid, data, tracer, md, cfg))
     if store:
         data["gas_tracers"] = tracer_data
-    assessments = [_stripping_assess_episode(gid, event, data, cfg) for event in events if event["significant"]]
     groups = _stripping_groups(events, data, cfg)
-    by_event = {a["gas_event_ids"][0]: a for a in assessments}
-    # Temporal agreement is descriptive. No timing is averaged before assessing
-    # a tracer, and no score or decision below uses these group measurements.
+    support = {}
     for group in groups:
         dispersion = float(np.std([e["onset_time_gyr"] for e in group]))
         cadence = _stripping_local_cadence(data, group[0]["onset_time_gyr"])
         scale = max(cfg.agreement_window_gyr, cadence) if np.isfinite(cadence) else cfg.agreement_window_gyr
+        agreement = float(np.exp(-dispersion/scale))
+        families = {_stripping_tracer_family(e["tracer"]) for e in group}
+        evidence = min(1., .4+.3*(len(families)-1))*agreement
         for event in group:
-            by_event[event["event_id"]].update(
-                tracer_temporal_agreement=float(np.exp(-dispersion/scale)),
-                onset_dispersion_gyr=dispersion,
-                coincident_gas_event_ids=[e["event_id"] for e in group])
+            support[event["event_id"]] = {
+                "tracer_count": len(group), "independent_family_count": len(families),
+                "temporal_agreement": agreement, "evidence": evidence,
+                "onset_dispersion_gyr": dispersion,
+                "coincident_gas_event_ids": [e["event_id"] for e in group],
+                "conflicting_event": False}
+    assessments = [_stripping_assess_episode(gid, event, data, cfg, support[event["event_id"]])
+                   for event in events if event["significant"]]
+    for assessment in assessments:
+        item = support[assessment["gas_event_ids"][0]]
+        assessment["onset_dispersion_gyr"] = item["onset_dispersion_gyr"]
+        assessment["coincident_gas_event_ids"] = item["coincident_gas_event_ids"]
     flags = list(data["quality_flags"])
     for md in tracer_data.values():
         flags.extend(md["quality_flags"])
@@ -798,8 +1593,12 @@ def _stripping_analyze_galaxy(gid, data, cfg, *, store=True):
         enough = all(md["valid_sample_count"] >= cfg.min_valid_samples
                      and np.mean(md["positive"]) >= cfg.min_mass_history_coverage for md in tracer_data.values())
         enough &= not any(f in data["quality_flags"] for f in ("history_time_gaps", "galaxy_position_gaps"))
+        terminal_unknown = any(np.any(md["positive"]) and not md["positive"][-1]
+                               and not md["censored"][-1] for md in tracer_data.values())
+        enough &= not terminal_unknown
         row = {"galaxy_id": gid, "category": "no_strong_stripping" if enough else "mixed_or_ambiguous",
-               "confidence": "medium" if enough else "low", "ambiguity_reasons": [] if enough else ["insufficient_gas_history"],
+               "confidence": "medium" if enough else "low", "ambiguity_reasons": [] if enough else
+               (["terminal_gas_mass_unresolved"] if terminal_unknown else ["insufficient_gas_history"]),
                "quality_flags": [], "merger_shock_stripping_score": 0., "ordinary_rps_score": 0.,
                "onset_time_gyr": np.nan, "peak_time_gyr": np.nan, "end_time_gyr": np.nan,
                "fractional_loss": np.nan, "timescale_gyr": np.nan,
@@ -807,6 +1606,12 @@ def _stripping_analyze_galaxy(gid, data, cfg, *, store=True):
                "delta_t_shock_gyr": np.nan, "delta_t_peri_gyr": np.nan,
                "summary_gas_event_id": None, "summary_tracer": None,
                "tracer_temporal_agreement": np.nan, "causal_confirmation": False}
+        row.update(P_ram_enhancement_factor=np.nan, P_ram_peak_time_gyr=np.nan,
+                   P_ram_raw_peak=np.nan, P_ram_raw_peak_time_gyr=np.nan,
+                   P_ram_jump_time_gyr=np.nan, P_ram_sudden_evidence=0.,
+                   P_ram_smooth_infall_evidence=0., P_ram_status="no_gas_loss_event",
+                   delta_t_ram_peak_gyr=np.nan, delta_t_ram_jump_gyr=np.nan,
+                   tracer_support_count=0, independent_tracer_family_count=0)
     row["tracers"] = list(cfg.tracers)
     row["gas_event_ids"] = [a["gas_event_ids"][0] for a in assessments]
     row["ambiguity_reasons"] = sorted(set(row["ambiguity_reasons"]))
@@ -841,7 +1646,9 @@ def _stripping_analyze_galaxy(gid, data, cfg, *, store=True):
 def _stripping_sensitivity(gid, data, cfg, baseline):
     variants = [("baseline", None, None, cfg)]
     for name, values in (("min_fractional_loss", cfg.sensitivity_fractions), ("min_loss_rate_gyr", cfg.sensitivity_rates_gyr),
-                         ("smoothing_width_gyr", cfg.sensitivity_smoothing_gyr), ("window_gyr", cfg.sensitivity_windows_gyr)):
+                         ("smoothing_width_gyr", cfg.sensitivity_smoothing_gyr), ("window_gyr", cfg.sensitivity_windows_gyr),
+                         ("min_pressure_jump_factor", cfg.sensitivity_pressure_jump_factors),
+                         ("min_pressure_rise_factor", cfg.sensitivity_pressure_rise_factors)):
         for value in values:
             if value != getattr(cfg, name):
                 variants.append((f"{name}={value:g}", name, value, replace(cfg, **{name: value})))
@@ -861,24 +1668,40 @@ def _stripping_value(obj, key):
 
 
 def _stripping_frame(product, snapshot, box, cfg):
-    """Compact saved merger-front membership; never run a detector."""
+    """Compact saved front membership, with optional origin evidence."""
     if product is None:
         return None
     members = product.get("members")
     result = product.get("result")
     time_gyr, epoch = product.get("time_gyr"), None
     if members is None:
-        raise ValueError("supply independently assessed merger members; generic shock_front_catalog outputs have no merger evidence")
+        raise ValueError("supply member cells; front summary rows alone have no crossing geometry")
     fronts = {}
     for member in members:
         if int(member["iout"]) != snapshot:
             raise ValueError("member snapshot does not match its product key")
-        assessment = member["assessment"]
-        if assessment["classification"] not in ("candidate", "uncertain") or assessment["evidence"] < cfg.min_front_evidence:
+        assessment = member.get("assessment")
+        if assessment is None:
+            # A detected front need not be assigned a merger origin. Its
+            # geometric encounter can still be measured, while origin remains
+            # unverified in the galaxy-level inference.
+            assessment = {"classification": "unattributed",
+                          "evidence": member.get("detection_evidence", 1.),
+                          "front_id": member.get("front_id"),
+                          "shock_id": int(np.asarray(member["shock_id"])[0]),
+                          "quality_flags": ["shock_origin_unverified"]}
+        if (assessment["classification"] not in ("candidate", "uncertain", "unattributed")
+                or assessment["evidence"] < cfg.min_front_evidence):
             continue
-        track = assessment.get("track_origin") or assessment.get("front_id")
-        if not isinstance(track, str) or not track or track in fronts:
-            raise ValueError("plausible merger fronts require unique front_id or independently supplied track_origin values")
+        persistent_track = assessment.get("track_origin")
+        local_front = assessment.get("front_id")
+        if persistent_track is not None and (not isinstance(persistent_track, str) or not persistent_track):
+            raise ValueError("track_origin must be a nonempty persistent string")
+        if local_front is None and persistent_track is None:
+            raise ValueError("front member requires front_id or track_origin")
+        track = persistent_track or f"{snapshot}:{local_front}"
+        if track in fronts:
+            raise ValueError("front IDs must be unique within a snapshot")
         factor = _LENGTH_TO_KPC.get(member.get("position_unit"))
         if factor is None:
             raise ValueError("shock members require explicit physical km/kpc/Mpc position_unit")
@@ -925,20 +1748,22 @@ def _stripping_frame(product, snapshot, box, cfg):
             normal[oriented] *= np.sign(projection[oriented, None])
         if not np.all(oriented):
             flags.append("upstream_downstream_orientation_unavailable")
-        zone = _stripping_column(member, "zone_width", n, default=0.)
+        zone = _stripping_column(member, "zone_width", n, default=0.)*factor
         if not np.all(np.isfinite(zone) & (zone >= 0)):
-            raise ValueError("zone_width must be a nonnegative cell count")
+            raise ValueError("zone_width must be a nonnegative physical length")
         if "zone_width" not in member:
             flags.append("zone_width_not_saved")
         disk_radius = np.sqrt(3.)*.5*dx
-        half = .5*dx*np.sum(np.abs(normal), axis=1)+cfg.zone_width_factor*zone*dx
+        half = .5*dx*np.sum(np.abs(normal), axis=1)+cfg.zone_width_factor*zone
         local = _stripping_delta(pos-pos[0], box)
         center = pos[0]+np.average(local, axis=0, weights=area)
-        front = {"front_id": track, "shock_id": ids.copy(), "pos": pos, "dx": dx,
+        front = {"front_id": track, "local_front_id": str(local_front) if local_front is not None else None,
+                 "shock_id": ids.copy(), "pos": pos, "dx": dx,
                  "normal": normal, "oriented": oriented, "radius": disk_radius, "half": half,
                  "mach": mach, "flux": flux, "total": total, "area": area,
                  "center": center, "evidence": float(assessment["evidence"]),
                  "classification": assessment["classification"], "quality_flags": flags,
+                 "merger_origin_verified": assessment["classification"] == "candidate",
                  "representative_shock_id": int(assessment["shock_id"]), "box": box, "buckets": []}
         front["level"] = _stripping_column(member, "level", n)
         if not 0 <= front["evidence"] <= 1:
@@ -1010,7 +1835,8 @@ def _stripping_query_front(front, point, gas_radius, velocity):
         side = "straddling" if abs(signed[j]) <= front["half"][nearest]+gas_radius else "upstream" if signed[j] < 0 else "downstream"
     def statistic(key, fn):
         return float(fn(front[key][sample_rows])) if len(sample_rows) else np.nan
-    return {"front_id": front["front_id"], "shock_id": int(front["shock_id"][nearest]),
+    return {"front_id": front["front_id"], "local_front_id": front["local_front_id"],
+            "shock_id": int(front["shock_id"][nearest]),
             "surface_distance_kpc": float(distance[j]),
             "cell_distance_kpc": float(np.linalg.norm(np.maximum(np.abs(delta[j])-.5*front["dx"][nearest], 0.))),
             "signed_distance_kpc": float(signed[j]), "normal": normal,
@@ -1022,7 +1848,10 @@ def _stripping_query_front(front, point, gas_radius, velocity):
             "local_mach_max": statistic("mach", np.max), "local_flux_median_erg_s_kpc2": statistic("flux", np.median),
             "local_dissipation_total_erg_s": statistic("total", np.sum),
             "local_dissipation_median_erg_s": statistic("total", np.median),
-            "merger_evidence": front["evidence"], "merger_classification": front["classification"],
+            "front_detection_evidence": front["evidence"],
+            "merger_evidence": front["evidence"] if front["merger_origin_verified"] else np.nan,
+            "merger_origin_verified": front["merger_origin_verified"],
+            "merger_classification": front["classification"],
             "quality_flags": front["quality_flags"]}
 
 
@@ -1104,10 +1933,11 @@ def _stripping_pair_front(data, left_index, right_index, previous, current, cfg)
         lo, hi, crossing = intersection
         crosses = bool(np.isfinite(crossing))
         phase = float(crossing) if crosses else float(.5*(lo+hi))
-        candidate = previous["classification"] == current["classification"] == "candidate"
-        origin_evidence = min(previous["evidence"], current["evidence"])
+        candidate = (previous["classification"] == current["classification"]
+                     and current["classification"] in ("candidate", "unattributed"))
+        front_evidence = min(previous["evidence"], current["evidence"])
         geometry = .95 if crosses else .65
-        score = geometry*np.sqrt(origin_evidence*abs(alignment))*np.exp(-.15*residual/mean_dx)
+        score = geometry*np.sqrt(front_evidence*abs(alignment))*np.exp(-.15*residual/mean_dx)
         if not candidate:
             score *= .65
         if not radius_valid:
@@ -1125,9 +1955,13 @@ def _stripping_pair_front(data, left_index, right_index, previous, current, cfg)
                      "crossing_times_gyr": [float(t0+crossing*dt)] if crosses else [],
                      "crossed": crosses, "confirmed": True, "geometry_evidence": geometry,
                      "geometry_status": "moving_surface_crossing" if crosses else "consistent_zone_exposure",
-                     "confidence_score": float(score), "merger_evidence": origin_evidence,
-                     "merger_classification": "candidate" if candidate else "uncertain",
+                     "confidence_score": float(score),
+                     "merger_evidence": front_evidence if previous["merger_origin_verified"] and current["merger_origin_verified"] else np.nan,
+                     "merger_origin_verified": bool(previous["merger_origin_verified"] and current["merger_origin_verified"]),
+                     "merger_classification": current["classification"] if candidate else "uncertain",
                      "snapshots": [int(data["iout"][left_index]), int(data["iout"][right_index])],
+                     "front_snapshot_ids": [(int(data["iout"][left_index]), previous["local_front_id"]),
+                                            (int(data["iout"][right_index]), current["local_front_id"])],
                      "shock_ids": [(int(data["iout"][left_index]), int(previous["shock_id"][a])),
                                    (int(data["iout"][right_index]), int(current["shock_id"][b]))],
                      "peak_mach": float(max(previous["mach"][a], current["mach"][b])),
@@ -1157,6 +1991,7 @@ def _stripping_encounter_union(gid, hits, observations, data):
         row["end_time_gyr"] = max(h["end_time_gyr"] for h in group)
         row["duration_gyr"] = row["end_time_gyr"]-row["start_time_gyr"]
         row["snapshots"] = sorted({s for h in group for s in h["snapshots"]})
+        row["front_snapshot_ids"] = sorted({tuple(s) for h in group for s in h["front_snapshot_ids"]})
         row["shock_ids"] = sorted({tuple(s) for h in group for s in h["shock_ids"]})
         row["crossing_times_gyr"] = sorted({round(t, 12) for h in group for t in h["crossing_times_gyr"]})
         row["crossed"] = bool(row["crossing_times_gyr"])
@@ -1174,10 +2009,14 @@ def _stripping_encounter_union(gid, hits, observations, data):
                            "galaxy_id": gid, "front_id": sample["front_id"],
                            "start_time_gyr": time, "peak_time_gyr": time, "end_time_gyr": time,
                            "duration_gyr": 0., "crossing_times_gyr": [], "crossed": False,
-                           "confirmed": False, "confidence_score": .3*sample["merger_evidence"],
+                           "confirmed": False, "confidence_score": .3*sample["front_detection_evidence"],
                            "confidence": "low", "geometry_evidence": .2, "geometry_status": "single_output_proximity",
-                           "merger_evidence": sample["merger_evidence"], "merger_classification": sample["merger_classification"],
-                           "snapshots": [sample["snapshot"]], "shock_ids": [(sample["snapshot"], sample["shock_id"])],
+                           "merger_evidence": sample["merger_evidence"],
+                           "merger_origin_verified": sample["merger_origin_verified"],
+                           "merger_classification": sample["merger_classification"],
+                           "snapshots": [sample["snapshot"]],
+                           "front_snapshot_ids": [(sample["snapshot"], sample["local_front_id"])],
+                           "shock_ids": [(sample["snapshot"], sample["shock_id"])],
                            "peak_mach": sample["local_mach_max"], "normal": sample["normal"].tolist(),
                            "flux_median_erg_s_kpc2": sample["local_flux_median_erg_s_kpc2"],
                            "dissipation_median_erg_s": sample["local_dissipation_median_erg_s"],
@@ -1187,7 +2026,7 @@ def _stripping_encounter_union(gid, hits, observations, data):
 
 
 def _stripping_associate_shocks(series, merger_shocks, cfg):
-    schedule, lookup = {}, {}
+    schedule, targets = {}, {}
     hits, observations = {gid: [] for gid in series}, {gid: [] for gid in series}
     provenance = {}
     for gid, data in series.items():
@@ -1203,9 +2042,11 @@ def _stripping_associate_shocks(series, merger_shocks, cfg):
         data["shock_normal"] = np.full((n, 3), np.nan)
         data["shock_output_covered"] = np.zeros(n, bool)
         data["shock_interval_covered"] = np.zeros(max(n-1, 0), bool)
-        lookup[gid] = {int(s): j for j, s in enumerate(data["iout"])}
         for j, snapshot in enumerate(data["iout"]):
+            if not data["shock_search_mask"][j]:
+                continue
             s = int(snapshot)
+            targets.setdefault(s, []).append((gid, j))
             box = None if data["box_kpc"] is None else data["box_kpc"][j]
             if s in schedule:
                 time, old_box = schedule[s]
@@ -1223,10 +2064,8 @@ def _stripping_associate_shocks(series, merger_shocks, cfg):
             raise ValueError("merger catalog and galaxy cosmic times disagree for the same snapshot")
         # Only compact previous/current cells are retained, supporting loaders.
         product = None
-        for gid, data in series.items():
-            j = lookup[gid].get(snapshot)
-            if j is None:
-                continue
+        for gid, j in targets[snapshot]:
+            data = series[gid]
             if frame is not None and frame["epoch"] and frame["epoch"].get("verified"):
                 supplied_core = frame["epoch"]["time_gyr"]
                 measured_core = data["merger_epoch"]["core_passage_time_gyr"]
@@ -1287,16 +2126,20 @@ def _stripping_associate_shocks(series, merger_shocks, cfg):
 
 def _stripping_population(analysis):
     rows = analysis["classifications"]
+    full_exposure_search = (analysis["configuration"]["shock_search_mode"] == "all"
+                            and all(np.all(data["shock_output_covered"])
+                                    and np.all(data["shock_interval_covered"])
+                                    for data in analysis["diagnostic_series"].values()))
     groups = {}
     for status in ("shock_exposed", "no_detected_exposure_with_coverage", "unknown_or_uncertain_exposure"):
         selected = [r for r in rows if r["exposure_status"] == status]
         losses = [r for r in selected if r["episode_count"] > 0]
         groups[status] = {"galaxy_count": len(selected), "galaxies_with_significant_loss": len(losses),
-                          "significant_loss_fraction": len(losses)/len(selected) if selected else np.nan,
+                          "significant_loss_fraction": len(losses)/len(selected) if selected and full_exposure_search else np.nan,
                           "median_loss_fraction": float(np.median([r["fractional_loss"] for r in losses])) if losses else np.nan,
                           "median_timescale_gyr": float(np.median([r["timescale_gyr"] for r in losses])) if losses else np.nan}
     return {"category_counts": {c: sum(r["category"] == c for r in rows) for c in STRIPPING_CATEGORIES},
-            "exposure_comparison": groups,
+            "exposure_comparison": groups, "exposure_comparison_valid": full_exposure_search,
             "comparisons_are_descriptive": True, "causal_confirmation": False,
             "sensitivity_category_counts": {
                 v: {c: sum(r["variant"] == v and r["category"] == c for r in analysis["sensitivity"]) for c in STRIPPING_CATEGORIES}
@@ -1319,29 +2162,48 @@ def plot_galaxy_stripping(analysis, galaxy_id):
     palette = plt.get_cmap("tab10").colors
     for number, (tracer, md) in enumerate(data["gas_tracers"].items()):
         positive = md["positive"]
-        scale = md["raw_mass"][np.flatnonzero(positive)[0]] if np.any(positive) else np.nan
-        if np.isfinite(scale):
+        if np.any(positive):
             color = palette[number % len(palette)]
-            axes[1].plot(t, np.where(positive, md["raw_mass"]/scale, np.nan), ".", color=color, alpha=.5)
-            axes[1].plot(t, md["smoothed_mass"]/scale, color=color, label=tracer)
+            raw_log = np.full(len(t), np.nan)
+            smooth_log = np.full(len(t), np.nan)
+            raw_log[positive] = np.log10(md["raw_mass"][positive])
+            smooth_valid = np.isfinite(md["smoothed_mass"]) & (md["smoothed_mass"] > 0)
+            smooth_log[smooth_valid] = np.log10(md["smoothed_mass"][smooth_valid])
+            axes[1].plot(t, raw_log, ".", color=color, alpha=.5)
+            axes[1].plot(t, smooth_log, color=color, label=tracer)
             censored = md["censored"]
-            axes[1].scatter(t[censored], md["upper_limit"][censored]/scale, color=color, marker="v")
+            axes[1].scatter(t[censored], np.log10(md["upper_limit"][censored]), color=color, marker="v")
             axes[2].plot(md["rate_time_gyr"], md["loss_rate_gyr"], color=color)
-    axes[1].set_ylabel("Gas mass / first valid mass")
+    axes[1].set_ylabel("log10 gas mass [tracer input unit]")
     if axes[1].lines:
         axes[1].legend(ncol=2, fontsize=8)
+    stellar = _stripping_column(data["raw"], "mstar", len(t))[data["order"]]
+    stellar_valid = np.isfinite(stellar) & (stellar > 0)
+    if np.any(stellar_valid):
+        stellar_log = np.full(len(t), np.nan)
+        stellar_log[stellar_valid] = np.log10(stellar[stellar_valid])
+        stellar_axis = axes[1].twinx()
+        stellar_axis.plot(t, stellar_log, color="firebrick", ls="--", alpha=.6)
+        stellar_axis.set_ylabel("log10 stellar mass [input unit]", color="firebrick")
     axes[2].axhline(analysis["configuration"]["min_loss_rate_gyr"], color="k", ls="--", label="rapid-loss threshold")
+    axes[2].set_yscale("symlog", linthresh=2.)
     axes[2].set_ylabel("−d ln M / dt [Gyr⁻¹]")
     axes[2].legend(fontsize=8)
-    # Pressure is read only for this diagnostic, after all decisions are made.
     p = _stripping_column(data["raw"], "P_ram", len(t))[data["order"]]
-    axes[3].plot(t, np.where(np.isfinite(p) & (p > 0), p, np.nan), color="purple")
-    if np.any(np.isfinite(p) & (p > 0)):
+    pressure_scale = analysis["configuration"]["pressure_scale"]
+    valid_pressure = np.isfinite(p) & ((p > 0) if pressure_scale == "linear" else True)
+    if "pressure_resolved" in data["raw"]:
+        valid_pressure &= np.asarray(data["raw"]["pressure_resolved"], dtype=bool)[data["order"]]
+    elif "icm_flag" in data["raw"]:
+        valid_pressure &= _stripping_column(data["raw"], "icm_flag", len(t))[data["order"]] >= 1
+    axes[3].plot(t, np.where(valid_pressure, p, np.nan), color="purple")
+    if pressure_scale == "linear" and np.any(valid_pressure):
         axes[3].set_yscale("log")
-    axes[3].set_ylabel("P_ram [input unit]\nDiagnostic only")
+    axes[3].set_ylabel("P_ram [input unit]" if pressure_scale == "linear" else "log10(P_ram) [input unit]")
     d = data["shock_distance_kpc"]
-    axes[4].plot(t, np.where(np.isfinite(d), d, np.nan), label="nearest plausible merger surface")
+    axes[4].plot(t, np.where(np.isfinite(d), d, np.nan), label="nearest saved front surface")
     axes[4].plot(t, np.where(data["radius_valid"], data["radius_kpc"], np.nan), ls="--", label="gas aperture")
+    axes[4].set_yscale("symlog", linthresh=10.)
     axes[4].set_ylabel("Shock distance [kpc]")
     axes[4].legend(fontsize=8)
     axes[5].plot(t, data["shock_mach"], label="nearest-cell Mach", color="teal")
@@ -1386,6 +2248,9 @@ def plot_stripping_population(analysis):
     ax[0].set_xticks(range(3), labels, rotation=15, ha="right")
     ax[0].set_xlim(-.6, 2.6)
     ax[0].set_ylabel("Fraction with significant gas loss")
+    if not analysis["population"]["exposure_comparison_valid"]:
+        ax[0].text(.5, .5, "Exposure fractions require full shock search and coverage",
+                   transform=ax[0].transAxes, ha="center", va="center", wrap=True)
     for j, g in enumerate(groups.values()):
         ax[0].text(j, 1., f"N={g['galaxy_count']}", ha="center")
     ax[0].set_ylim(0, 1.15)
@@ -1402,10 +2267,18 @@ def plot_stripping_population(analysis):
     for j, key in ((2, "delta_t_shock_gyr"), (3, "delta_t_peri_gyr")):
         for c in STRIPPING_CATEGORIES:
             measured = [r for r in rows if r["category"] == c and np.isfinite(r[key]) and np.isfinite(r["fractional_loss"])]
-            ax[j].scatter([r[key] for r in measured], [r["fractional_loss"] for r in measured], color=colors[c], label=c)
+            if key == "delta_t_shock_gyr":
+                confirmed = [r for r in measured if r.get("physical_shock_exposure")]
+                proximity = [r for r in measured if not r.get("physical_shock_exposure")]
+                ax[j].scatter([r[key] for r in confirmed], [r["fractional_loss"] for r in confirmed], color=colors[c], label=c)
+                ax[j].scatter([r[key] for r in proximity], [r["fractional_loss"] for r in proximity],
+                              facecolors="none", edgecolors=colors[c], alpha=.55)
+            else:
+                ax[j].scatter([r[key] for r in measured], [r["fractional_loss"] for r in measured], color=colors[c], label=c)
         ax[j].axvline(0, color="k", ls=":")
         ax[j].set_xlabel(key.replace("_", " "))
         ax[j].set_ylabel("Main episode fractional gas loss")
+    ax[2].set_title("Open circles: proximity only")
     counts = analysis["population"]["sensitivity_category_counts"]
     variants = list(counts)
     bottom = np.zeros(len(variants))
@@ -1445,6 +2318,31 @@ def save_galaxy_stripping_analysis(analysis, output_dir, *, make_plots=True):
             return {str(k): plain(v) for k, v in value.items()}
         return value
     paths = {}
+    summary_path = output_dir/"classifications_summary.csv"
+    flat_rows = []
+    for row in analysis["classifications"]:
+        flat = {key: value for key, value in row.items()
+                if key not in ("gas_loss_by_tracer", "gas_event_ids", "coincident_gas_event_ids")}
+        for tracer, measurement in row["gas_loss_by_tracer"].items():
+            prefix = f"{tracer}__"
+            flat[prefix+"status"] = measurement["status"]
+            flat[prefix+"valid_sample_count"] = measurement["valid_sample_count"]
+            flat[prefix+"significant_event_count"] = measurement["significant_event_count"]
+            significant = [event for event in measurement["events"] if event["significant"]]
+            main = max(significant, key=lambda event: (event["fractional_loss"], event["peak_loss_rate_gyr"])) if significant else None
+            for key in ("onset_time_gyr", "peak_time_gyr", "end_time_gyr",
+                        "peak_loss_rate_gyr", "fractional_loss", "duration_gyr", "timescale_gyr"):
+                flat[prefix+key] = main[key] if main else np.nan
+            flat[prefix+"quality_flags"] = measurement["quality_flags"]
+        flat_rows.append(flat)
+    flat_keys = list(dict.fromkeys(key for row in flat_rows for key in row))
+    with summary_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=flat_keys)
+        writer.writeheader()
+        for row in flat_rows:
+            writer.writerow({key: json.dumps(plain(value), allow_nan=False) if isinstance(value, (dict, list, tuple, np.ndarray)) else plain(value)
+                             for key, value in row.items()})
+    paths["classifications_summary"] = str(summary_path.resolve())
     for name in ("gas_loss_events", "classifications", "shock_encounters", "pericenters", "episode_assessments", "sensitivity"):
         path = output_dir/f"{name}.csv"
         rows = analysis[name]

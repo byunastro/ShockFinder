@@ -733,16 +733,17 @@ contains
     integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
     integer(8), intent(out) :: diagnostics(10)
 
-    integer :: i, step_count, done
+    integer :: i, step_count, done, sample_pass, side, ncellmax, endpoints(2)
     integer :: center, trial, upstream, downstream
     integer :: progress_count, next_progress
     integer :: clock_rate, clock_now, pre_start, scan_start
     real(8) :: grad_t(3), grad_s(3), dirvec(3), xwalk(3), xnext(3)
+    real(8) :: walk_points(2, 3), direction(3)
     real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m, elapsed
     real(8), allocatable :: divv_arr(:), grad_t_arr(:, :)
     logical, allocatable :: candidate(:), eligible_center(:)
     integer, allocatable :: resolved_center(:)
-    logical :: valid, ok_direction, endpoint_found
+    logical :: valid, ok_direction, sample_ok
 
     mach = 0.0_dp
     shock = 0
@@ -819,7 +820,7 @@ contains
     !$omp parallel do schedule(dynamic, 256) private(i, step_count, &
     !$omp& center, trial, upstream, downstream, grad_t, t_pre, t_post, &
     !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, &
-    !$omp& endpoint_found, done, clock_now, elapsed)
+    !$omp& sample_ok, sample_pass, side, ncellmax, endpoints, walk_points, direction, done, clock_now, elapsed)
     do i = 1, n
       if (show_progress /= 0 .and. progress_interval > 0) then
         !$omp atomic capture
@@ -853,107 +854,65 @@ contains
       call normalize_vector(grad_t, dirvec, ok_direction)
       if (.not. ok_direction) cycle
 
-      upstream = center
-      xwalk = pos(center, :)
-      endpoint_found = .false.
-      trial = -1
-      do step_count = 1, max_steps
-        call next_along_gradient(pos, dx, neighbors, fine_face_index, fine_neighbors, &
-             n, nfine, upstream, xwalk, -dirvec, &
-             trial, xnext)
-        if (trial <= 0) then
+      ! Measure two ray-crossed cells from the center on EACH side. If this
+      ! preliminary Mach is >= 10, continue the same rays to four cells and
+      ! replace both endpoint states. Do not stop at a shock-zone boundary:
+      ! numerical diffusion can broaden the temperature jump beyond it.
+      endpoints = center
+      walk_points(1, :) = pos(center, :)
+      walk_points(2, :) = pos(center, :)
+      sample_ok = .true.
+      do sample_pass = 1, 2
+        ncellmax = 2 * sample_pass
+        do side = 1, 2
+          direction = dirvec
+          if (side == 1) direction = -dirvec
+          xwalk = walk_points(side, :)
+          do step_count = ncellmax - 1, ncellmax
+            if (step_count > max_steps) then
+              !$omp atomic update
+              diagnostics(2 * side + 1) = diagnostics(2 * side + 1) + 1_8
+              sample_ok = .false.
+              exit
+            end if
+            call next_along_gradient(pos, dx, neighbors, fine_face_index, fine_neighbors, &
+                 n, nfine, endpoints(side), xwalk, direction, trial, xnext)
+            if (trial <= 0) then
+              !$omp atomic update
+              diagnostics(2 * side) = diagnostics(2 * side) + 1_8
+              sample_ok = .false.
+              exit
+            end if
+            endpoints(side) = trial
+            xwalk = xnext
+          end do
+          if (.not. sample_ok) exit
+          walk_points(side, :) = xwalk
+        end do
+        if (.not. sample_ok) exit
+
+        upstream = endpoints(1)
+        downstream = endpoints(2)
+        t_pre = max(temp(upstream), temp_floor)
+        t_post = temp(downstream)
+        rho_pre = rho(upstream)
+        rho_post = rho(downstream)
+        if (t_post <= t_pre .or. rho_post <= rho_pre) then
           !$omp atomic update
-          diagnostics(2) = diagnostics(2) + 1_8
+          diagnostics(9) = diagnostics(9) + 1_8
+          sample_ok = .false.
           exit
         end if
-        if (divv_arr(trial) >= 0.0_dp) then
-          !$omp atomic update
-          diagnostics(8) = diagnostics(8) + 1_8
-          upstream = trial
-          endpoint_found = .true.
-          exit
-        else if ((temp(trial) - temp(upstream)) * (rho(trial) - rho(upstream)) <= 0.0_dp) then
-          !$omp atomic update
-          diagnostics(7) = diagnostics(7) + 1_8
-          upstream = trial
-          endpoint_found = .true.
-          exit
-        else if (.not. candidate(trial)) then
-          !$omp atomic update
-          diagnostics(6) = diagnostics(6) + 1_8
-          upstream = trial
-          endpoint_found = .true.
-          exit
-        end if
-        upstream = trial
-        xwalk = xnext
+
+        ratio = t_post / t_pre
+        m = mach_from_temperature_jump(ratio, gamma)
+        ! Include Mach 10 in the four-cell branch, allowing roundoff in the
+        ! Rankine-Hugoniot inversion, as for the final min_mach comparison.
+        if (m < 10.0_dp * (1.0_dp - 1.0e-12_dp)) exit
       end do
-      ! A valid endpoint is the first cell outside the shock zone. If the walk
-      ! reaches its safety cap while still inside the zone, reject this center.
-      if (.not. endpoint_found) then
-        if (trial /= 0) then
-          !$omp atomic update
-          diagnostics(3) = diagnostics(3) + 1_8
-        end if
-        cycle
-      end if
-
-      downstream = center
-      xwalk = pos(center, :)
-      endpoint_found = .false.
-      trial = -1
-      do step_count = 1, max_steps
-        call next_along_gradient(pos, dx, neighbors, fine_face_index, fine_neighbors, &
-             n, nfine, downstream, xwalk, dirvec, &
-             trial, xnext)
-        if (trial <= 0) then
-          !$omp atomic update
-          diagnostics(4) = diagnostics(4) + 1_8
-          exit
-        end if
-        if (divv_arr(trial) >= 0.0_dp) then
-          !$omp atomic update
-          diagnostics(8) = diagnostics(8) + 1_8
-          downstream = trial
-          endpoint_found = .true.
-          exit
-        else if ((temp(trial) - temp(downstream)) * (rho(trial) - rho(downstream)) <= 0.0_dp) then
-          !$omp atomic update
-          diagnostics(7) = diagnostics(7) + 1_8
-          downstream = trial
-          endpoint_found = .true.
-          exit
-        else if (.not. candidate(trial)) then
-          !$omp atomic update
-          diagnostics(6) = diagnostics(6) + 1_8
-          downstream = trial
-          endpoint_found = .true.
-          exit
-        end if
-        downstream = trial
-        xwalk = xnext
-      end do
-      if (.not. endpoint_found) then
-        if (trial /= 0) then
-          !$omp atomic update
-          diagnostics(5) = diagnostics(5) + 1_8
-        end if
-        cycle
-      end if
-
-      t_pre = max(temp(upstream), temp_floor)
-      t_post = temp(downstream)
-      rho_pre = rho(upstream)
-      rho_post = rho(downstream)
-
-      if (t_post <= t_pre .or. rho_post <= rho_pre) then
-        !$omp atomic update
-        diagnostics(9) = diagnostics(9) + 1_8
-        cycle
-      end if
-
-      ratio = t_post / t_pre
-      m = mach_from_temperature_jump(ratio, gamma)
+      ! Missing required neighbors or a truncated four-cell pass must not
+      ! silently publish the shorter, potentially biased provisional result.
+      if (.not. sample_ok) cycle
       if (m < min_mach * (1.0_dp - 1.0e-12_dp)) then
         !$omp atomic update
         diagnostics(10) = diagnostics(10) + 1_8
