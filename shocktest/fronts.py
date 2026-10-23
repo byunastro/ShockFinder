@@ -63,7 +63,8 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
                         require_mach_consistent=False,
                         atol=1.e-9, rtol=1.e-7, normal_tolerance=1.e-6,
                         chunk_size=131072, query_chunk_size=4096,
-                        max_neighbor_pairs=200000, thread=1):
+                        max_neighbor_pairs=200000, thread=1,
+                        grouping_method="connected", persistence_dex=0.6):
     """Group saved ShockFinder centers in one cropped, open-boundary snapshot.
 
     result is ShockResult or ShockSamples (or a dense matching field mapping).
@@ -86,6 +87,16 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
 
     Options
     -------
+    grouping_method="connected": existing connected components, or experimental
+        "flux_persistence" to split them by log10 dissipation-flux persistence.
+        The latter requires the optional native helper (tools/build_persistence.py)
+        and finite positive flux for every selected center. Mach remains a local
+        edge gate. It identifies dissipation regions, not proven separate shocks.
+    persistence_dex=0.6: keep peaks whose log10 peak/merge contrast exceeds this
+        threshold; only used for flux_persistence. Larger values give fewer splits.
+        This is an experimental setting, not a calibrated physical significance.
+        Unlike connected grouping, persistence retains all accepted graph edges.
+
     return_labels=False: also return int32 labels in original result-record
         order; -1 means excluded/undersized, otherwise snapshot-local front_id.
     min_group_size=3: minimum accepted center count, not a quality-only flag.
@@ -132,6 +143,10 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
     PARTIAL_SUMMARY=32: some members lack valid aggregate values or a summary
         overflows. Valid-subset means carry this bit; incomplete totals are NaN.
     """
+    if grouping_method not in ('connected', 'flux_persistence'):
+        raise ValueError('grouping_method must be connected or flux_persistence')
+    if not np.isfinite(persistence_dex) or persistence_dex < 0:
+        raise ValueError('persistence_dex must be finite and nonnegative')
     min_group_size = _positive_int(min_group_size, 'min_group_size')
     for name, val in [('chunk_size', chunk_size), ('query_chunk_size', query_chunk_size),
                       ('max_neighbor_pairs', max_neighbor_pairs), ('thread', thread)]:
@@ -156,13 +171,18 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
     if connectivity not in ('touch', 'face'):
         raise ValueError("connectivity must be 'touch' or 'face'")
     data, nrecords = _prepare(result, dissipation, min_mach,
-                              require_mach_consistent, chunk_size)
+                              require_mach_consistent, chunk_size,
+                              include_flux=grouping_method == 'flux_persistence')
     n = len(data['rows'])
     labels = np.full(nrecords, -1, np.int32) if return_labels else None
     if not n:
         empty = np.empty(0, dtype=front_dtype)
         return (empty, labels) if return_labels else empty
-    components = _Components(n)
+    if grouping_method == 'flux_persistence':
+        from ._persistence import FluxComponents
+        components = FluxComponents(data['flux'], persistence_dex)
+    else:
+        components = _Components(n)
     flags = np.full(n, QUALITY_APPROX_CONNECTIVITY, np.uint16)
     options = (normal_cosine, surface_offset_factor, surface_angle_cosine,
                connectivity, gap_factor, atol, rtol, mach_tolerance)
@@ -170,10 +190,16 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
                                       query_chunk_size, max_neighbor_pairs, thread):
         _accept(left, right, data, components, flags, options)
     roots = components.roots(np.arange(n))
+    if grouping_method == 'flux_persistence':
+        components.update_gap_flags(flags, roots, QUALITY_GAP_BRIDGED)
     order = np.argsort(roots, kind='stable')
     cuts = np.r_[0, np.flatnonzero(np.diff(roots[order]))+1, n]
     counts = np.diff(cuts)
     keep = np.flatnonzero(counts >= min_group_size)
+    if grouping_method == 'flux_persistence':
+        # Selected records are already ordered by original input ID.
+        minima = np.minimum.reduceat(order, cuts[:-1])
+        keep = keep[np.argsort(minima[keep])]
     if len(keep) > _I32_MAX or (counts.size and counts.max() > _I32_MAX):
         raise OverflowError('front_id or ncell exceeds int32')
     catalog = np.empty(len(keep), dtype=front_dtype)
@@ -186,7 +212,7 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
     return (catalog, labels) if return_labels else catalog
 
 
-def _prepare(result, dissipation, min_mach, consistent, chunk):
+def _prepare(result, dissipation, min_mach, consistent, chunk, *, include_flux=False):
     compact = isinstance(result, ShockSamples)
     source = result.columns if compact else result
     pos = np.asarray(_value(source, 'pos'))
@@ -268,20 +294,25 @@ def _prepare(result, dissipation, min_mach, consistent, chunk):
     positions = np.asarray(pos[rows], dtype=np.float64)*factor
     if not np.all(np.isfinite(positions)):
         raise ValueError('converted positions must be finite')
-    area, total = _dissipation(source, ids, rows, dissipation, compact, chunk)
-    return dict(rows=rows, pos=positions, dx=widths,
+    keys = ('area', 'total', 'flux') if include_flux else ('area', 'total')
+    values = _dissipation(source, ids, rows, dissipation, compact, chunk, keys=keys)
+    area, total = values[:2]
+    data = dict(rows=rows, pos=positions, dx=widths,
                 normal=normals, normal_valid=normal_valid,
                 mach=np.full(count, np.nan) if mach is None else np.asarray(mach[rows], dtype=float),
-                area=area, total=total), n
+                area=area, total=total)
+    if include_flux:
+        data['flux'] = values[2]
+    return data, n
 
 
-def _dissipation(source, ids, rows, diss, compact, chunk):
+def _dissipation(source, ids, rows, diss, compact, chunk, *, keys=('area', 'total')):
     if diss is None:
         if compact:
             return tuple(np.full(len(rows), np.nan) if _value(source, 'dissipation_'+key) is None
                          else np.asarray(_array(source, 'dissipation_'+key, (len(ids),))[rows], dtype=float)
-                         for key in ('area', 'total'))
-        return np.full(len(rows), np.nan), np.full(len(rows), np.nan)
+                         for key in keys)
+        return tuple(np.full(len(rows), np.nan) for _ in keys)
     for key, expected in [('area_unit', 'kpc2'), ('total_unit', 'erg/s')]:
         if _value(diss, key, expected) != expected:
             raise ValueError(f'{key} must be {expected}; convert saved values explicitly')
@@ -291,7 +322,7 @@ def _dissipation(source, ids, rows, diss, compact, chunk):
         for key in ('flux', 'efficiency', 'sound_speed'):
             _array(diss, key, (n,), optional=True)
         output = []
-        for key in ('area', 'total'):
+        for key in keys:
             values = _array(diss, key, (n,), optional=True)
             output.append(np.full(len(rows), np.nan) if values is None
                           else np.asarray(values[rows], dtype=float))
@@ -321,7 +352,7 @@ def _dissipation(source, ids, rows, diss, compact, chunk):
     for key in ('flux', 'efficiency', 'sound_speed'):
         _array(diss, key, (n,), optional=True)
     out = []
-    for key in ('area', 'total'):
+    for key in keys:
         values = _array(diss, key, (n,), optional=True)
         field = np.full(len(rows), np.nan)
         if values is not None:
@@ -446,6 +477,8 @@ def _accept(left, right, data, components, flags, options):
     bridged = ~touch[close]
     flags[left[bridged]] |= QUALITY_GAP_BRIDGED | QUALITY_APPROX_CONNECTIVITY
     flags[right[bridged]] |= QUALITY_GAP_BRIDGED | QUALITY_APPROX_CONNECTIVITY
+    if hasattr(components, 'record_gaps'):
+        components.record_gaps(left[bridged], right[bridged])
     components.merge(left, right)
 
 
