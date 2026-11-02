@@ -14,8 +14,11 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-tests/output/
 /amr_data/
+
+# Local documentation and development tests; excluded from version control.
+/docs/
+/tests/
 
 # Local Codex performance and analysis support files; never stage or commit.
 /local_work/

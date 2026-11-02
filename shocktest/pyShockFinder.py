@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 import shocktest
+from .compact import _sampled_states
 
 
 K_BOLTZMANN = 1.380649e-16  # erg K^-1
@@ -160,6 +161,8 @@ def compute_dissipation(
     Dense outputs retain exactly result's row count and order; valid values are
     scattered into their original rows, and other rows stay zero. _compact is
     internal: its order is flatnonzero(result.shock), not the dense result.
+    Interpolated upstream states are used when saved in result.sampling;
+    endpoint indices are a fallback for legacy results.
     """
 
     gamma = result.gamma if gamma is None else float(gamma)
@@ -185,9 +188,27 @@ def compute_dissipation(
     upstream_rows = retained_rows[result.upstream_index[valid]]
     center_rows = retained_rows[np.nonzero(valid)[0]]
 
-    temp1 = np.asarray(np.asarray(cell["T", "K"])[upstream_rows], dtype=np.float64)
+    sampled = _sampled_states(result, np.flatnonzero(valid), names=('temperature', 'density'))
+    if sampled is None:
+        temp1 = np.asarray(cell["T", "K"])[upstream_rows]
+        rho1 = np.asarray(cell["rho", "Msol/kpc3"])[upstream_rows]
+    else:
+        temp1, rho1 = sampled['temperature'][:, 0], sampled['density'][:, 0]
+        # A constant unit conversion commutes with CIC interpolation. Read the
+        # same canonical table fields used by the legacy dissipation path.
+        density_unit = getattr(result, 'density_unit', 'Msol/kpc3')
+        if density_unit != 'Msol/kpc3':
+            native_density = np.asarray(cell['rho', density_unit])[upstream_rows]
+            canonical_density = np.asarray(cell['rho', 'Msol/kpc3'])[upstream_rows]
+            rho1 = rho1 * (canonical_density / native_density)
+        temperature_unit = getattr(result, 'temperature_unit', 'K')
+        if temperature_unit != 'K':
+            native_temperature = np.asarray(cell['T', temperature_unit])[upstream_rows]
+            canonical_temperature = np.asarray(cell['T', 'K'])[upstream_rows]
+            temp1 = temp1 * (canonical_temperature / native_temperature)
+    temp1 = np.asarray(temp1, dtype=np.float64)
     temp1 = np.maximum(temp1, float(temperature_floor))
-    rho1 = np.asarray(np.asarray(cell["rho", "Msol/kpc3"])[upstream_rows], dtype=np.float64)
+    rho1 = np.asarray(rho1, dtype=np.float64)
     dx = np.asarray(np.asarray(cell["dx", "km"])[center_rows], dtype=np.float64)
     mach = result.mach[valid]
 
@@ -229,8 +250,12 @@ def shock_surface_area(result, valid, dx_kpc, *, mode: str = "normal"):
     if result.pos is None or not np.any(ok):
         return area
 
-    normal = (result.normal[rows[ok]] if result.normal is not None
-              else result.pos[downstream[ok]] - result.pos[upstream[ok]])
+    if result.normal is not None:
+        normal = result.normal[rows[ok]]
+    else:
+        sampled = _sampled_states(result, rows[ok], names=('pos',))
+        normal = (result.pos[downstream[ok]] - result.pos[upstream[ok]] if sampled is None
+                  else sampled['pos'][:, 1] - sampled['pos'][:, 0])
     norm = np.linalg.norm(normal, axis=1)
     ok_norm = norm > 0.0
     if not np.any(ok_norm):

@@ -6,8 +6,7 @@ and supporting galaxy matching and time-resolved exposure measurements. The AMR
 shock detector follows the methodology of Skillman et al. (2008, ApJ 689, 1063).
 
 For galaxy gas-loss classification with saved shock fronts, start with the
-[notebook workflow](examples/galaxy_stripping_workflow.ipynb) or its
-[function reference](docs/galaxy_stripping.md).
+[notebook workflow](examples/galaxy_stripping_workflow.ipynb).
 
 ## 1. Build
 
@@ -51,6 +50,7 @@ finder.min_temperature = None        # Optional seed-cell lower T cut [K]; None 
 finder.min_density = None            # Optional seed-cell lower density cut [Msol/kpc3].
 finder.max_density = None            # Optional seed-cell upper density cut [Msol/kpc3].
 finder.min_mach = 1.0                # Minimum accepted temperature-jump Mach number (>= 1).
+finder.sampling_tolerance = 0.01      # Relative T/profile and temperature-ratio convergence threshold.
 
 # Unit keys used to access the input table; use these units for the full pipeline.
 finder.position_unit = "km"          # Positions and cell widths.
@@ -76,29 +76,6 @@ The adopted Mach number always comes from the temperature
 jump. With `filter_inconsistent=False`, validation is diagnostic and does not alter the
 shock mask. With filtering enabled, Mach values and endpoint indices remain
 available for auditing rejected centers: always select using `result.shock`.
-
-Mach measurement samples the cell **two cells away from the shock center on
-each side**, along the center's temperature-gradient normal. If this preliminary
-temperature-jump Mach number is **10 or greater**, both rays continue to
-**four cells away** and the Mach number is recomputed from those endpoints.
-These are individual endpoint temperatures, not averages over two or four cells.
-The upstream temperature floor applies to both estimates; `min_mach` is applied
-only to the final estimate. Saved endpoint indices, validation ratios, and
-dissipation all use the final selected endpoints.
-
-Distances count cells crossed by the AMR ray, excluding the center; across a
-refinement boundary they need not equal two/four center-cell widths. Sampling
-continues past the old shock-zone stopping conditions. If a required endpoint
-is missing, or `max_steps` prevents reaching it, the center is rejected rather
-than accepting a shorter measurement. `max_steps` remains a safety cap (default
-50); values above four do not increase the measurement distance. The legacy
-`candidate_exit`, `thermodynamic_exit`, and `nonconverging_exit` diagnostic
-counters remain present and are zero under this sampling rule.
-
-The switch depends on the **measured two-cell Mach**, not an independently known
-true Mach: a strong shock underestimated below 10 at this stage will still use
-two cells. Four-cell sampling also cannot guarantee recovery if the numerical
-transition extends beyond those endpoints.
 
 Level cuts change the retained mesh, so overly restrictive cuts can remove
 needed neighbors. Temperature/density cuts affect only detection seeds: other
@@ -195,17 +172,22 @@ arrays with the same length, using these keys and physical units:
 | --- | --- |
 | `mach`, `shock` | Temperature-jump Mach number and accepted-center mask |
 | `selected_indices` | Mapping from retained rows to original input rows |
-| `center_index`, `upstream_index`, `downstream_index` | Indices in **retained-row space**; `-1` when unavailable |
+| `center_index`, `upstream_index`, `downstream_index` | Indices in **retained-row space**; endpoint indices identify containing cells; `-1` when unavailable |
 | `pos`, `dx`, `level` | Retained geometry; positions have shape `(N, 3)` |
 | `normal` | Unit temperature-gradient normal from upstream toward downstream |
 | `zone_width` | Endpoint separation projected on the normal, in position units |
+| `sampling` | Sparse interpolated upstream/downstream states and positions, aligned through `sampling['rows']` |
 | `diagnostics` | Counters for missing neighbors, search limits, and rejected jumps; legacy exit counters are zero |
-| `gamma`, `temperature_floor`, `position_unit` | Measurement settings and geometry unit |
+| `gamma`, `temperature_floor`, `position_unit`, `temperature_unit`, `density_unit` | Measurement settings and units |
 
 Mach and normals are zero outside detected centers. Filtering inconsistent
 centers changes the mask, not their stored measurements. `zone_width` measures
-the selected two/four-cell sampling span projected on the normal; it is not
+the accepted interpolated sampling span projected on the normal; it is not
 automatically a physical interaction width or the full numerical shock thickness.
+Sampling adapts the extended-probe strategy of Dubois et al. (2019) using
+temperature extrema and temperature-profile convergence. Unsettled profiles
+are extended even when the initial Mach is below 5. `sampling['converged']`
+flags measurements that stabilize within the configured tolerance.
 
 With validation enabled, additional fields include `mach_temperature` (an alias
 of `mach`), `mach_pressure`, `mach_density`, the three jump ratios,

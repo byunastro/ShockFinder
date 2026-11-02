@@ -60,6 +60,12 @@ class ShockResult:
     gamma: float = 5.0 / 3.0
     temperature_floor: float = 1.0e4
     position_unit: str = "km"
+    temperature_unit: str = "K"
+    density_unit: str = "Msol/kpc3"
+    sampling_tolerance: float = 0.01
+    # Sparse, center-aligned interpolated states. Cell indices are containing
+    # leaves only; the measured states/positions can differ from leaf centers.
+    sampling: dict[str, Any] | None = None
 
     def __getstate__(self):
         """Omit redundant flags from pickle, preserving independently edited flags.
@@ -86,6 +92,14 @@ class ShockResult:
         values = state[1] if isinstance(state, tuple) else state
         for name, value in values.items():
             setattr(self, name, value)
+        if 'sampling' not in values:
+            self.sampling = None
+        if 'temperature_unit' not in values:
+            self.temperature_unit = 'K'
+        if 'density_unit' not in values:
+            self.density_unit = 'Msol/kpc3'
+        if 'sampling_tolerance' not in values:
+            self.sampling_tolerance = 0.01
         status = values.get('mach_validation_status')
         for name, bit in _VALIDATION_BITS.items():
             if name not in values:
@@ -131,6 +145,7 @@ class ShockResult:
         self.density_check_applicable = None
         self.mach_consistent = None
         self.mach_validation_status = None
+        self.sampling = None
         gc.collect()
 
 
@@ -146,9 +161,10 @@ class ShockFinder:
         self.min_density = None
         self.max_density = None
         self.min_mach = 1.0
-        # Safety cap; Mach sampling uses two cells per side, or four when the
-        # preliminary two-cell Mach is >= 10. Raising this cap adds no samples.
+        # Geometry-walk safety cap for each interpolated query. Sampling probes
+        # 1/2 center widths, extending for Mach >= 5 or unsettled temperatures.
         self.max_steps = 50
+        self.sampling_tolerance = 0.01
         self.max_center_steps = 50
         self.center_normal_cosine = 0.7
         self.center_plateau_tolerance = 1.0e-12
@@ -311,7 +327,8 @@ class ShockFinder:
                 "the repository root."
             ) from _IMPORT_ERROR
 
-        if not hasattr(_shockfinder.shockfinder_kernel, "shock_normals"):
+        if (not hasattr(_shockfinder.shockfinder_kernel, "measure_shock_states")
+                or getattr(_shockfinder.shockfinder_kernel, 'temperature_sampling_revision', 0) < 2):
             raise ImportError("The compiled ShockFinder extension is outdated; rebuild for this Python interpreter (see README Build).")
 
         self._progress("ShockFinder: reading AMR cell fields")
@@ -355,6 +372,9 @@ class ShockFinder:
             result.gamma = float(self.gamma)
             result.temperature_floor = float(self.temperature_floor)
             result.position_unit = self.position_unit
+            result.temperature_unit = self.temperature_unit
+            result.density_unit = self.density_unit
+            result.sampling_tolerance = float(self.sampling_tolerance)
             if self.validate_mach:
                 self._validate_result(cell, arrays, result, validation_sink)
             timings["scan"] = 0.0
@@ -363,52 +383,91 @@ class ShockFinder:
 
         self._progress("ShockFinder: running Fortran shock scan")
         stage_start = time.perf_counter()
-        mach, shock, center, upstream, downstream, diagnostic_counts = (
-            _shockfinder.shockfinder_kernel.find_shocks(
-                arrays["pos"],
-                arrays["vel"],
-                arrays["dx"],
-                arrays["temp"],
-                arrays["rho"],
-                arrays["level"],
-                arrays["detection_mask"],
-                neighbors,
-                fine_face_index,
-                fine_neighbors,
-                float(self.gamma),
-                float(self.temperature_floor),
-                float(self.min_mach),
-                int(self.max_steps),
-                int(self.max_center_steps),
-                float(self.center_normal_cosine),
-                float(self.center_plateau_tolerance),
-                int(bool(self.show_progress)),
-                int(interval),
-                n,
-                fine_neighbors.shape[0],
-            )
+        kernel = _shockfinder.shockfinder_kernel
+        center_mask, center_counts = kernel.find_shock_centers(
+            arrays["pos"], arrays["vel"], arrays["dx"], arrays["temp"], arrays["rho"],
+            arrays["detection_mask"], neighbors, fine_face_index, fine_neighbors,
+            float(self.gamma), int(self.max_center_steps), float(self.center_normal_cosine),
+            float(self.center_plateau_tolerance), int(bool(self.show_progress)), int(interval),
+            n, fine_neighbors.shape[0],
         )
+        candidate_rows = np.flatnonzero(center_mask)
+        del center_mask
+        mach = np.zeros(n, dtype=np.float64)
+        shock = np.zeros(n, dtype=bool)
+        center = np.zeros(n, dtype=np.int32)
+        upstream = np.zeros(n, dtype=np.int32)
+        downstream = np.zeros(n, dtype=np.int32)
+        normal = np.zeros_like(arrays["pos"])
+        zone_width = np.zeros(n, dtype=np.float64)
+        diagnostic_counts = np.asarray(center_counts, dtype=np.int64)
+        sampling = {
+            "rows": np.empty(0, dtype=np.int64),
+            "temperature": np.empty((0, 2)), "density": np.empty((0, 2)),
+            "pressure": np.empty((0, 2)), "distance": np.empty((0, 2)),
+            "pos": np.empty((0, 2, 3)),
+            "relative_temperature_change": np.empty((0, 2)),
+            "relative_ratio_change": np.empty(0), "converged": np.empty(0, dtype=bool),
+        }
+        if candidate_rows.size:
+            native_centers = np.asarray(candidate_rows + 1, dtype=np.int32)
+            measured, accepted, up, down, normals, states, distances, convergence, sample_counts = (
+                kernel.measure_shock_states(
+                    arrays["pos"], arrays["vel"], arrays["dx"], arrays["temp"], arrays["rho"],
+                    neighbors, fine_face_index, fine_neighbors, native_centers,
+                    float(self.gamma), float(self.temperature_floor), float(self.min_mach),
+                    int(self.max_steps), float(self.sampling_tolerance), int(bool(self.show_progress)), int(interval),
+                    n, fine_neighbors.shape[0], candidate_rows.size,
+                )
+            )
+            diagnostic_counts += np.asarray(sample_counts, dtype=np.int64)
+            keep = np.asarray(accepted, dtype=bool)
+            rows = candidate_rows[keep]
+            mach[rows] = measured[keep]
+            shock[rows] = True
+            center[rows] = np.asarray(rows + 1, dtype=np.int32)
+            upstream[rows] = up[keep]
+            downstream[rows] = down[keep]
+            normal[rows] = normals[keep]
+            distances = distances[keep].copy()
+            zone_width[rows] = distances.sum(axis=1)
+            points = (arrays["pos"][rows, None, :]
+                      + np.array([-1., 1.])[None, :, None]
+                      * distances[:, :, None] * normal[rows, None, :])
+            sampling = {
+                "rows": rows,
+                "temperature": states[keep, :, 0].copy(),
+                "density": states[keep, :, 1].copy(),
+                "pressure": states[keep, :, 2].copy(),
+                "distance": distances,
+                "pos": points,
+                "relative_temperature_change": convergence[keep, :2].copy(),
+                "relative_ratio_change": convergence[keep, 2].copy(),
+                "converged": np.asarray(convergence[keep, 3] > 0.5, dtype=bool),
+            }
+            # Validate directly supplied pressure at the SAME interpolated
+            # positions, without using it to select states or estimate Mach.
+            if self.validate_mach and rows.size:
+                pressure, inferred = self._thermal_pressure_values(
+                    cell, selected_indices, arrays, dtype=np.float64,
+                )
+                if pressure is not None:
+                    pressure_temperature = pressure / arrays["rho"]
+                    pressure_states, pressure_valid = kernel.sample_states_at_offsets(
+                        arrays["pos"], arrays["dx"], pressure_temperature, arrays["rho"],
+                        neighbors, fine_face_index, fine_neighbors,
+                        np.asarray(rows + 1, dtype=np.int32), normal[rows], distances,
+                        int(self.max_steps), n, fine_neighbors.shape[0], rows.size,
+                    )
+                    checked_pressure = pressure_states[:, :, 2].copy()
+                    checked_pressure[np.asarray(pressure_valid) == 0] = np.nan
+                    sampling["validation_pressure"] = checked_pressure
+            del measured, accepted, up, down, normals, states
         timings["scan"] = time.perf_counter() - stage_start
         self._progress("ShockFinder: done")
-
         result_pos = arrays["pos"]
         result_dx = arrays["dx"]
         result_level = arrays["level"]
-        normal = np.zeros_like(result_pos)
-        zone_width = np.zeros(n, dtype=np.float64)
-        valid_normal = (upstream > 0) & (downstream > 0)
-        if np.any(valid_normal):
-            upstream_rows = np.asarray(upstream[valid_normal], dtype=np.int64) - 1
-            downstream_rows = np.asarray(downstream[valid_normal], dtype=np.int64) - 1
-            vectors = result_pos[downstream_rows] - result_pos[upstream_rows]
-            valid_rows = np.nonzero(valid_normal)[0]
-            normal[valid_rows] = _shockfinder.shockfinder_kernel.shock_normals(
-                arrays["pos"], arrays["vel"], arrays["dx"], arrays["temp"], arrays["rho"],
-                neighbors, fine_face_index, fine_neighbors,
-                np.asarray(valid_rows + 1, dtype=np.int32), float(self.gamma),
-                n, fine_neighbors.shape[0], valid_rows.size,
-            )
-            zone_width[valid_rows] = np.abs(np.sum(vectors * normal[valid_rows], axis=1))
         result = ShockResult(
             mach=np.asarray(mach, dtype=np.float64),
             shock=np.asarray(shock, dtype=np.int32).astype(bool),
@@ -421,6 +480,7 @@ class ShockFinder:
             normal=normal,
             level=result_level,
             zone_width=zone_width,
+            sampling=sampling,
             diagnostics=dict(
                 zip(
                     (
@@ -430,7 +490,7 @@ class ShockFinder:
                         "downstream_missing_neighbor",
                         "downstream_step_limit",
                         # Legacy zone-exit slots are retained for compatibility
-                        # and are zero with fixed-distance Mach sampling.
+                        # and are zero with interpolated distance sampling.
                         "candidate_exit",
                         "thermodynamic_exit",
                         "nonconverging_exit",
@@ -444,6 +504,9 @@ class ShockFinder:
         result.gamma = float(self.gamma)
         result.temperature_floor = float(self.temperature_floor)
         result.position_unit = self.position_unit
+        result.temperature_unit = self.temperature_unit
+        result.density_unit = self.density_unit
+        result.sampling_tolerance = float(self.sampling_tolerance)
         # Release f2py integer outputs and velocity storage before validation.
         del shock, center, upstream, downstream
         arrays.pop("vel", None)
@@ -469,6 +532,9 @@ class ShockFinder:
             downstream_index=result.downstream_index[rows],
             selected_indices=result.selected_indices,
         )
+        if result.sampling is not None:
+            validation.sampling = dict(result.sampling)
+            validation.sampling["rows"] = np.arange(rows.size, dtype=np.int64)
         self._populate_mach_validation(cell, arrays, validation)
         if self.filter_inconsistent:
             result.shock[rows] = validation.shock
@@ -528,35 +594,42 @@ class ShockFinder:
             down = downstream[endpoints_ok]
 
             if valid_rows.size:
-                temp1_raw = arrays["temp"][up]
-                temp1 = np.maximum(temp1_raw, float(self.temperature_floor))
-                temp2 = arrays["temp"][down]
-                rho1 = arrays["rho"][up]
-                rho2 = arrays["rho"][down]
-                temperature_ratio[valid_rows] = jump_ratio(
-                    temp1, temp2, dtype=validation_dtype
-                )
-                density_ratio[valid_rows] = jump_ratio(
-                    rho1, rho2, dtype=validation_dtype
-                )
-
-                pressure, pressure_from_rho_t = self._thermal_pressure_values(
-                    cell,
-                    result.selected_indices,
-                    arrays,
-                    dtype=validation_dtype,
-                    endpoint_rows=np.concatenate((up, down)),
-                )
-                if pressure is None:
+                sampling = result.sampling
+                if sampling is not None:
+                    slots = np.searchsorted(sampling["rows"], valid_rows)
+                    if (np.any(slots >= len(sampling["rows"]))
+                            or not np.array_equal(sampling["rows"][slots], valid_rows)):
+                        raise ValueError("sampled states are missing detected centers")
+                    temp1_raw = sampling["temperature"][slots, 0]
+                    temp2 = sampling["temperature"][slots, 1]
+                    rho1 = sampling["density"][slots, 0]
+                    rho2 = sampling["density"][slots, 1]
+                    pressure_from_rho_t = "validation_pressure" not in sampling
+                    sampled_pressure = sampling.get("validation_pressure", sampling["pressure"])[slots]
                     pressure_ratio[valid_rows] = jump_ratio(
-                        rho1 * temp1_raw,
-                        rho2 * temp2,
-                        dtype=validation_dtype,
+                        sampled_pressure[:, 0], sampled_pressure[:, 1], dtype=validation_dtype,
                     )
                 else:
-                    pressure_ratio[valid_rows] = jump_ratio(
-                        pressure[:up.size], pressure[up.size:], dtype=validation_dtype
+                    # Legacy/supplied results still refer directly to cell values.
+                    temp1_raw = arrays["temp"][up]
+                    temp2 = arrays["temp"][down]
+                    rho1 = arrays["rho"][up]
+                    rho2 = arrays["rho"][down]
+                    pressure, pressure_from_rho_t = self._thermal_pressure_values(
+                        cell, result.selected_indices, arrays, dtype=validation_dtype,
+                        endpoint_rows=np.concatenate((up, down)),
                     )
+                    if pressure is None:
+                        pressure_ratio[valid_rows] = jump_ratio(
+                            rho1 * temp1_raw, rho2 * temp2, dtype=validation_dtype,
+                        )
+                    else:
+                        pressure_ratio[valid_rows] = jump_ratio(
+                            pressure[:up.size], pressure[up.size:], dtype=validation_dtype,
+                        )
+                temp1 = np.maximum(temp1_raw, float(self.temperature_floor))
+                temperature_ratio[valid_rows] = jump_ratio(temp1, temp2, dtype=validation_dtype)
+                density_ratio[valid_rows] = jump_ratio(rho1, rho2, dtype=validation_dtype)
 
                 mach_pressure[valid_rows] = mach_from_pressure_ratio(
                     pressure_ratio[valid_rows],
@@ -769,6 +842,10 @@ class ShockFinder:
         return digest.hexdigest()
 
     def _validate_settings(self) -> None:
+        if (isinstance(self.sampling_tolerance, (bool, np.bool_))
+                or not np.isfinite(self.sampling_tolerance)
+                or not 0.0 <= self.sampling_tolerance < 1.0):
+            raise ValueError("sampling_tolerance must be finite and in [0, 1)")
         if self.index_dtype not in ("int64", "auto"):
             raise ValueError("index_dtype must be 'int64' or 'auto'")
         if not np.isfinite(self.gamma) or self.gamma <= 1.0:

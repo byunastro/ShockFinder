@@ -4,6 +4,8 @@ module shockfinder_kernel
   integer, parameter :: dp = kind(1.0d0)
   private
   public :: find_shocks, build_neighbor_index, fill_fine_neighbors, paint_cells_to_map, shock_normals
+  public :: find_shock_centers, measure_shock_states, sample_states_at_offsets
+  integer, parameter, public :: temperature_sampling_revision = 2
 
 contains
 
@@ -711,49 +713,233 @@ contains
     deallocate(lo, widths, hash_keys, hash_rows)
   end subroutine fill_fine_neighbors
 
-  ! Scan AMR cells for Skillman-style shock zones and assign center Mach numbers.
-  ! Neighbor tables are supplied by Python/Numba and the cell loop is OpenMP-ready.
-  subroutine find_shocks(pos, vel, dx, temp, rho, level, detection_mask, neighbors, &
-       fine_face_index, fine_neighbors, n, nfine, &
-       gamma, temp_floor, min_mach, max_steps, max_center_steps, center_normal_cosine, &
-       center_plateau_tolerance, show_progress, progress_interval, mach, shock, center_index, &
-       upstream_index, downstream_index, diagnostics)
-    !f2py intent(in) pos, vel, dx, temp, rho, level, detection_mask, neighbors
-    !f2py intent(in) fine_face_index, fine_neighbors, n, nfine
-    !f2py intent(in) gamma, temp_floor, min_mach, max_steps, max_center_steps
-    !f2py intent(in) center_normal_cosine, center_plateau_tolerance, show_progress, progress_interval
-    !f2py intent(out) mach, shock, center_index, upstream_index, downstream_index, diagnostics
-    integer, intent(in) :: n, nfine, max_steps, max_center_steps, show_progress, progress_interval
-    integer, intent(in) :: level(n), detection_mask(n), neighbors(n, 6), fine_face_index(n, 6)
-    integer, intent(in) :: fine_neighbors(nfine, 4)
-    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n)
-    real(8), intent(in) :: gamma, temp_floor, min_mach
+  ! Locate a point using the existing geometric AMR face walk. A boundary point
+  ! may belong to either adjacent leaf; the enclosing virtual-cell restriction
+  ! below samples child centers and therefore does not depend on that tie.
+  pure subroutine sampling_locate_cell(pos, dx, neighbors, fine_face_index, fine_neighbors, &
+       n, nfine, start_cell, point, max_steps, cell, ok, failure)
+    integer, intent(in) :: n, nfine, start_cell, max_steps
+    integer, intent(in) :: neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), dx(n), point(3)
+    integer, intent(out) :: cell, failure
+    logical, intent(out) :: ok
+    integer :: current, trial, crossed, axis, pass, step_count, face
+    real(8) :: walk(3), probe(3), direction(3), delta(3)
+    real(8) :: tolerance, scale, distance, norm, boundary, t, tbest, offset
+
+    cell = 0
+    failure = 1
+    ok = .false.
+    if (start_cell < 1 .or. start_cell > n) return
+    current = start_cell
+    walk = pos(current, :)
+    do step_count = 0, max(0, max_steps)
+      scale = max(dx(current), maxval(abs(pos(current, :))), maxval(abs(point)))
+      tolerance = 32.0_dp * epsilon(1.0_dp) * scale
+      if (all(abs(point - pos(current, :)) <= 0.5_dp * dx(current) + tolerance)) then
+        cell = current
+        failure = 0
+        ok = .true.
+        return
+      end if
+      if (step_count >= max_steps) then
+        failure = 2
+        return
+      end if
+
+      delta = point - walk
+      distance = maxval(abs(delta))
+      if (distance <= 0.0_dp) return
+      direction = delta / distance
+      norm = sqrt(dot_product(direction, direction))
+      direction = direction / norm
+      distance = distance * norm
+      face = 0
+      tbest = huge(1.0_dp)
+      do axis = 1, 3
+        if (direction(axis) > 1.0e-14_dp) then
+          boundary = pos(current, axis) + 0.5_dp * dx(current)
+          t = (boundary - walk(axis)) / direction(axis)
+          if (t >= -tolerance .and. max(t, 0.0_dp) < tbest) then
+            tbest = max(t, 0.0_dp)
+            face = plus_face(axis)
+          end if
+        else if (direction(axis) < -1.0e-14_dp) then
+          boundary = pos(current, axis) - 0.5_dp * dx(current)
+          t = (boundary - walk(axis)) / direction(axis)
+          if (t >= -tolerance .and. max(t, 0.0_dp) < tbest) then
+            tbest = max(t, 0.0_dp)
+            face = minus_face(axis)
+          end if
+        end if
+      end do
+      if (face == 0) return
+      ! Never step past the target. Unlike the older walk, the offset has no
+      ! absolute length scale, so code-unit, kpc and cgs coordinates agree.
+      offset = max(dx(current) * 1.0e-10_dp, 4.0_dp * tolerance)
+      offset = min(offset, max(0.0_dp, 0.5_dp * (distance - tbest)))
+      probe = walk + direction * (tbest + offset)
+      trial = choose_face_neighbor(pos, neighbors, fine_face_index, fine_neighbors, &
+           n, nfine, current, face, probe)
+      ! A diagonal can cross two or three faces at the same point.
+      do pass = 1, 3
+        if (trial < 1 .or. trial > n) return
+        crossed = 0
+        scale = max(dx(trial), maxval(abs(pos(trial, :))), maxval(abs(probe)))
+        tolerance = 32.0_dp * epsilon(1.0_dp) * scale
+        do axis = 1, 3
+          if (probe(axis) > pos(trial, axis) + 0.5_dp * dx(trial) + tolerance) then
+            crossed = plus_face(axis)
+            exit
+          else if (probe(axis) < pos(trial, axis) - 0.5_dp * dx(trial) - tolerance) then
+            crossed = minus_face(axis)
+            exit
+          end if
+        end do
+        if (crossed == 0) exit
+        trial = choose_face_neighbor(pos, neighbors, fine_face_index, fine_neighbors, &
+             n, nfine, trial, crossed, probe)
+      end do
+      if (trial < 1 .or. trial > n .or. crossed /= 0) return
+      current = trial
+      walk = probe
+    end do
+  end subroutine sampling_locate_cell
+
+  ! Project a leaf hierarchy onto one virtual cell of the center's resolution.
+  ! Coarse leaves prolong constantly. Finer leaves restrict density and thermal
+  ! pressure by volume, so the reconstructed temperature remains P/rho.
+  recursive pure subroutine sampling_virtual_state(pos, dx, temp, rho, neighbors, fine_face_index, &
+       fine_neighbors, n, nfine, start_cell, node, width, max_steps, depth, values, ok, failure)
+    use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+    integer, intent(in) :: n, nfine, start_cell, max_steps, depth
+    integer, intent(in) :: neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), dx(n), temp(n), rho(n), node(3), width
+    real(8), intent(out) :: values(2)
+    logical, intent(out) :: ok
+    integer, intent(out) :: failure
+    integer :: cell, ix, iy, iz
+    real(8) :: child(3), part(2)
+
+    values = 0.0_dp
+    call sampling_locate_cell(pos, dx, neighbors, fine_face_index, fine_neighbors, &
+         n, nfine, start_cell, node, max_steps, cell, ok, failure)
+    if (.not. ok) return
+    if (dx(cell) >= width * (1.0_dp - 1.0e-12_dp)) then
+      values(1) = rho(cell)
+      values(2) = rho(cell) * temp(cell)
+      ok = all(values > 0.0_dp) .and. all(ieee_is_finite(values))
+      if (.not. ok) failure = 1
+      return
+    end if
+    ! An aligned dyadic AMR hierarchy reaches the finest covering leaves well
+    ! before this limit. Guard malformed/incommensurate meshes explicitly.
+    if (depth >= 50 .or. width <= tiny(width) * 4.0_dp) then
+      ok = .false.
+      failure = 1
+      return
+    end if
+    do iz = -1, 1, 2
+      do iy = -1, 1, 2
+        do ix = -1, 1, 2
+          child = node + 0.25_dp * width * real([ix, iy, iz], 8)
+          call sampling_virtual_state(pos, dx, temp, rho, neighbors, fine_face_index, &
+               fine_neighbors, n, nfine, cell, child, 0.5_dp * width, max_steps, &
+               depth + 1, part, ok, failure)
+          if (.not. ok) return
+          values = values + 0.125_dp * part
+        end do
+      end do
+    end do
+  end subroutine sampling_virtual_state
+
+  ! CIC on the lattice of cell centers at spacing h. Every support value is a
+  ! virtual cell average, not an arbitrary covering leaf at that node.
+  pure subroutine interpolated_state(pos, dx, temp, rho, neighbors, fine_face_index, fine_neighbors, &
+       n, nfine, origin, h, start_cell, point, max_steps, state, containing, ok, failure)
+    use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+    integer, intent(in) :: n, nfine, start_cell, max_steps
+    integer, intent(in) :: neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), dx(n), temp(n), rho(n), origin(3), h, point(3)
+    real(8), intent(out) :: state(3)
+    integer, intent(out) :: containing, failure
+    logical, intent(out) :: ok
+    integer :: lower(3), ix, iy, iz
+    real(8) :: coordinate(3), fraction(3), node(3), pair(2), sum_pair(2)
+    real(8) :: axis_weight(3), weight, total_weight
+
+    state = 0.0_dp
+    containing = 0
+    failure = 1
+    ok = .false.
+    if (h <= 0.0_dp .or. .not. ieee_is_finite(h)) return
+    call sampling_locate_cell(pos, dx, neighbors, fine_face_index, fine_neighbors, &
+         n, nfine, start_cell, point, max_steps, containing, ok, failure)
+    if (.not. ok) return
+    coordinate = (point - origin) / h
+    ! Fractions near an integer must stay at that node: otherwise roundoff can
+    ! demand nonphysical support across an otherwise irrelevant domain edge.
+    where (abs(coordinate - anint(coordinate)) <= &
+         64.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(coordinate), abs(point) / h, abs(origin) / h))
+      coordinate = anint(coordinate)
+    end where
+    lower = floor(coordinate)
+    fraction = coordinate - real(lower, 8)
+    sum_pair = 0.0_dp
+    total_weight = 0.0_dp
+    do iz = 0, 1
+      do iy = 0, 1
+        do ix = 0, 1
+          axis_weight = [1.0_dp - fraction(1), 1.0_dp - fraction(2), 1.0_dp - fraction(3)]
+          if (ix == 1) axis_weight(1) = fraction(1)
+          if (iy == 1) axis_weight(2) = fraction(2)
+          if (iz == 1) axis_weight(3) = fraction(3)
+          weight = product(axis_weight)
+          if (weight <= 1.0e-14_dp) cycle
+          node = origin + real(lower + [ix, iy, iz], 8) * h
+          call sampling_virtual_state(pos, dx, temp, rho, neighbors, fine_face_index, &
+               fine_neighbors, n, nfine, containing, node, h, max_steps, 0, pair, ok, failure)
+          if (.not. ok) return
+          sum_pair = sum_pair + weight * pair
+          total_weight = total_weight + weight
+        end do
+      end do
+    end do
+    if (total_weight <= 0.0_dp) then
+      ok = .false.
+      failure = 1
+      return
+    end if
+    sum_pair = sum_pair / total_weight
+    state(1) = sum_pair(2) / sum_pair(1)
+    state(2) = sum_pair(1)
+    state(3) = sum_pair(2)
+    ok = all(state > 0.0_dp) .and. all(ieee_is_finite(state))
+    failure = 0
+    if (.not. ok) failure = 1
+  end subroutine interpolated_state
+
+  ! Center selection is kept separate so state storage scales with centers,
+  ! rather than adding interpolated-state arrays for every retained AMR cell.
+  subroutine find_shock_centers(pos, vel, dx, temp, rho, detection_mask, neighbors, &
+       fine_face_index, fine_neighbors, gamma, max_center_steps, center_normal_cosine, &
+       center_plateau_tolerance, show_progress, progress_interval, n, nfine, center_mask, diagnostics)
+    integer, intent(in) :: n, nfine, max_center_steps, show_progress, progress_interval
+    integer, intent(in) :: detection_mask(n), neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma
     real(8), intent(in) :: center_normal_cosine, center_plateau_tolerance
-    real(8), intent(out) :: mach(n)
-    integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
+    integer, intent(out) :: center_mask(n)
     integer(8), intent(out) :: diagnostics(10)
-
-    integer :: i, step_count, done, sample_pass, side, ncellmax, endpoints(2)
-    integer :: center, trial, upstream, downstream
-    integer :: progress_count, next_progress
-    integer :: clock_rate, clock_now, pre_start, scan_start
-    real(8) :: grad_t(3), grad_s(3), dirvec(3), xwalk(3), xnext(3)
-    real(8) :: walk_points(2, 3), direction(3)
-    real(8) :: t_pre, t_post, rho_pre, rho_post, ratio, m, elapsed
+    integer :: i, center, done, progress_count, next_progress, clock_rate, clock_now, pre_start
+    real(8) :: grad_s(3), elapsed
     real(8), allocatable :: divv_arr(:), grad_t_arr(:, :)
-    logical, allocatable :: candidate(:), eligible_center(:)
     integer, allocatable :: resolved_center(:)
-    logical :: valid, ok_direction, sample_ok
+    logical, allocatable :: candidate(:), eligible_center(:)
+    logical :: valid
 
-    mach = 0.0_dp
-    shock = 0
-    center_index = 0
-    upstream_index = 0
-    downstream_index = 0
     diagnostics = 0_8
-
+    center_mask = 0
     allocate(divv_arr(n), grad_t_arr(n, 3), candidate(n), resolved_center(n), eligible_center(n))
-
     ! Precompute all local shock diagnostics once. This loop is independent for
     ! each AMR cell and is therefore a good OpenMP target.
     progress_count = 0
@@ -804,7 +990,7 @@ contains
          grad_t_arr, max_center_steps, center_normal_cosine, center_plateau_tolerance, &
          resolved_center, diagnostics(1))
 
-    ! Selection controls seeds, never the physical shock-zone endpoints.
+    ! Seed selection does not truncate the retained mesh used for sampling.
     eligible_center = .false.
     do i = 1, n
       if (detection_mask(i) == 0) cycle
@@ -812,131 +998,275 @@ contains
       if (center > 0) eligible_center(center) = .true.
     end do
 
-    ! Each resolved center is processed exactly once.
+
+    where (eligible_center) center_mask = 1
+    deallocate(divv_arr, grad_t_arr, candidate, resolved_center, eligible_center)
+  end subroutine find_shock_centers
+
+  ! Auxiliary direction checks allow a density/pressure plateau, while
+  ! rejecting the opposite changes expected across a contact or nearby clump.
+  pure logical function sampling_ordered(state, reference, direction_sign) result(ok)
+    real(8), intent(in) :: state(3), reference(3), direction_sign
+    real(8) :: margin(3)
+    margin = 1.0e-12_dp * max(abs(state), abs(reference), tiny(1.0_dp))
+    ok = all(direction_sign * (state - reference) >= -margin)
+  end function sampling_ordered
+
+  ! Temperature-oriented adaptation of the extended sampling idea of Dubois
+  ! et al. (2019). Primary extrema and flattening use T, not thermal pressure.
+  subroutine measure_shock_states(pos, vel, dx, temp, rho, neighbors, fine_face_index, &
+       fine_neighbors, centers, gamma, temp_floor, min_mach, max_steps, sampling_tolerance, show_progress, &
+       progress_interval, n, nfine, ns, mach, shock, upstream, downstream, normals, states, distances, &
+       convergence, diagnostics)
+    integer, intent(in) :: n, nfine, ns, max_steps, show_progress, progress_interval
+    integer, intent(in) :: centers(ns), neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma, temp_floor, min_mach
+    real(8), intent(in) :: sampling_tolerance
+    real(8), intent(out) :: mach(ns), normals(ns, 3), states(ns, 2, 3), distances(ns, 2), convergence(ns, 4)
+    integer, intent(out) :: shock(ns), upstream(ns), downstream(ns)
+    integer(8), intent(out) :: diagnostics(10)
+    integer :: j, center, side, probe, containing, failure, chosen(2), done, clock_rate, clock_now, started
+    integer :: progress_count
+    real(8) :: point(3), state_now(3), selected(2, 3), selected_distance(2)
+    real(8) :: previous_temperature(2), previous_slope(2), relative_change(2), slope, temperature_gain
+    real(8) :: direction_sign, h, m, t_pre, elapsed, margin, ratio, previous_ratio, ratio_change
+    logical :: ok, sample_ok, active(2), ordered(2), is_converged, round_complete
+
+    mach = 0.0_dp
+    shock = 0
+    upstream = 0
+    downstream = 0
+    states = 0.0_dp
+    distances = 0.0_dp
+    convergence = 0.0_dp
+    diagnostics = 0_8
     progress_count = 0
-    next_progress = progress_interval
-    call system_clock(scan_start)
+    call system_clock(count_rate=clock_rate)
+    call system_clock(started)
+    call shock_normals(pos, vel, dx, temp, rho, neighbors, fine_face_index, fine_neighbors, &
+         centers, gamma, n, nfine, ns, normals)
 
-    !$omp parallel do schedule(dynamic, 256) private(i, step_count, &
-    !$omp& center, trial, upstream, downstream, grad_t, t_pre, t_post, &
-    !$omp& rho_pre, rho_post, ratio, m, dirvec, xwalk, xnext, ok_direction, &
-    !$omp& sample_ok, sample_pass, side, ncellmax, endpoints, walk_points, direction, done, clock_now, elapsed)
-    do i = 1, n
-      if (show_progress /= 0 .and. progress_interval > 0) then
-        !$omp atomic capture
-        progress_count = progress_count + 1
-        done = progress_count
-        !$omp end atomic
-        if (mod(done, progress_interval) == 0) then
-          !$omp critical(progress_write)
-          if (done >= next_progress) then
-            call system_clock(clock_now)
-            elapsed = real(clock_now - scan_start, 8) / real(max(clock_rate, 1), 8)
-            write(output_unit, '(A,I0,A,I0,A,F5.1,A,F10.1,A)') "ShockFinder Fortran scan: ", &
-                 done, "/", n, " (", 100.0_dp * real(done, 8) / real(max(n, 1), 8), "%) elapsed=", &
-                 elapsed, " s"
-            flush(output_unit)
-            do while (next_progress <= done)
-              next_progress = next_progress + progress_interval
-            end do
-          end if
-          !$omp end critical(progress_write)
-        end if
-      end if
-      if (.not. candidate(i)) cycle
-
-      center = resolved_center(i)
-      if (center <= 0) cycle
-      if (center /= i) cycle
-      if (.not. eligible_center(i)) cycle
-
-      grad_t = grad_t_arr(center, :)
-      call normalize_vector(grad_t, dirvec, ok_direction)
-      if (.not. ok_direction) cycle
-
-      ! Measure two ray-crossed cells from the center on EACH side. If this
-      ! preliminary Mach is >= 10, continue the same rays to four cells and
-      ! replace both endpoint states. Do not stop at a shock-zone boundary:
-      ! numerical diffusion can broaden the temperature jump beyond it.
-      endpoints = center
-      walk_points(1, :) = pos(center, :)
-      walk_points(2, :) = pos(center, :)
+    !$omp parallel do schedule(dynamic, 64) private(j, center, side, probe, containing, failure, &
+    !$omp& chosen, point, state_now, selected, selected_distance, previous_temperature, previous_slope, &
+    !$omp& relative_change, slope, temperature_gain, direction_sign, h, m, t_pre, elapsed, margin, &
+    !$omp& ratio, previous_ratio, ratio_change, ok, sample_ok, active, ordered, is_converged, round_complete, done, clock_now)
+    do j = 1, ns
+      center = centers(j)
+      if (dot_product(normals(j, :), normals(j, :)) <= 0.0_dp) cycle
+      h = dx(center)
+      selected = 0.0_dp
+      selected_distance = 0.0_dp
+      chosen = 0
+      previous_temperature = temp(center)
+      previous_slope = huge(1.0_dp)
+      relative_change = 1.0_dp
+      previous_ratio = 1.0_dp
+      ratio_change = 1.0_dp
       sample_ok = .true.
-      do sample_pass = 1, 2
-        ncellmax = 2 * sample_pass
+      ordered = .true.
+      ! The nearest states initialize each side. A farther initial state must
+      ! extend the T jump without reversing density or thermal pressure.
+      do probe = 1, 2
         do side = 1, 2
-          direction = dirvec
-          if (side == 1) direction = -dirvec
-          xwalk = walk_points(side, :)
-          do step_count = ncellmax - 1, ncellmax
-            if (step_count > max_steps) then
-              !$omp atomic update
-              diagnostics(2 * side + 1) = diagnostics(2 * side + 1) + 1_8
-              sample_ok = .false.
-              exit
+          direction_sign = real(2 * side - 3, dp)
+          point = pos(center, :) + direction_sign * real(probe, dp) * h * normals(j, :)
+          call interpolated_state(pos, dx, temp, rho, neighbors, fine_face_index, fine_neighbors, &
+               n, nfine, pos(center, :), h, center, point, max_steps, state_now, containing, ok, failure)
+          if (.not. ok) then
+            !$omp atomic update
+            diagnostics(2 * side + failure - 1) = diagnostics(2 * side + failure - 1) + 1_8
+            sample_ok = .false.
+            exit
+          end if
+          slope = abs(state_now(1) - previous_temperature(side)) / h
+          relative_change(side) = abs(state_now(1) - previous_temperature(side)) / &
+               max(abs(state_now(1)), abs(previous_temperature(side)), tiny(1.0_dp))
+          if (probe == 1) then
+            selected(side, :) = state_now
+            selected_distance(side) = h
+            chosen(side) = containing
+          else
+            ordered(side) = sampling_ordered(state_now, selected(side, :), direction_sign)
+            temperature_gain = direction_sign * (state_now(1) - selected(side, 1))
+            margin = 1.0e-12_dp * max(abs(state_now(1)), abs(selected(side, 1)), tiny(1.0_dp))
+            if (ordered(side) .and. temperature_gain > margin) then
+              selected(side, :) = state_now
+              selected_distance(side) = real(probe, dp) * h
+              chosen(side) = containing
             end if
-            call next_along_gradient(pos, dx, neighbors, fine_face_index, fine_neighbors, &
-                 n, nfine, endpoints(side), xwalk, direction, trial, xnext)
-            if (trial <= 0) then
-              !$omp atomic update
-              diagnostics(2 * side) = diagnostics(2 * side) + 1_8
-              sample_ok = .false.
-              exit
-            end if
-            endpoints(side) = trial
-            xwalk = xnext
-          end do
-          if (.not. sample_ok) exit
-          walk_points(side, :) = xwalk
+          end if
+          previous_temperature(side) = state_now(1)
+          previous_slope(side) = slope
         end do
         if (.not. sample_ok) exit
-
-        upstream = endpoints(1)
-        downstream = endpoints(2)
-        t_pre = max(temp(upstream), temp_floor)
-        t_post = temp(downstream)
-        rho_pre = rho(upstream)
-        rho_post = rho(downstream)
-        if (t_post <= t_pre .or. rho_post <= rho_pre) then
-          !$omp atomic update
-          diagnostics(9) = diagnostics(9) + 1_8
-          sample_ok = .false.
-          exit
-        end if
-
-        ratio = t_post / t_pre
-        m = mach_from_temperature_jump(ratio, gamma)
-        ! Include Mach 10 in the four-cell branch, allowing roundoff in the
-        ! Rankine-Hugoniot inversion, as for the final min_mach comparison.
-        if (m < 10.0_dp * (1.0_dp - 1.0e-12_dp)) exit
+        ratio = selected(2, 1) / max(selected(1, 1), temp_floor)
+        ratio_change = abs(ratio - previous_ratio) / max(abs(ratio), abs(previous_ratio), tiny(1.0_dp))
+        previous_ratio = ratio
       end do
-      ! Missing required neighbors or a truncated four-cell pass must not
-      ! silently publish the shorter, potentially biased provisional result.
       if (.not. sample_ok) cycle
+      m = mach_from_temperature_jump(ratio, gamma)
+      is_converged = all(ordered) .and. all(relative_change <= sampling_tolerance) &
+           .and. ratio_change <= sampling_tolerance
+      ! A biased preliminary Mach must not hide an unflattened T profile.
+      if (m >= 5.0_dp * (1.0_dp - 1.0e-12_dp) .or. .not. is_converged) then
+        active = .true.
+        do probe = 3, 4
+          round_complete = all(active)
+          ordered = .false.
+          do side = 1, 2
+            if (.not. active(side)) cycle
+            direction_sign = real(2 * side - 3, dp)
+            point = pos(center, :) + direction_sign * real(probe, dp) * h * normals(j, :)
+            call interpolated_state(pos, dx, temp, rho, neighbors, fine_face_index, fine_neighbors, &
+                 n, nfine, pos(center, :), h, center, point, max_steps, state_now, containing, ok, failure)
+            if (.not. ok) then
+              !$omp atomic update
+              diagnostics(2 * side + failure - 1) = diagnostics(2 * side + failure - 1) + 1_8
+              active(side) = .false.
+              relative_change(side) = 1.0_dp
+              round_complete = .false.
+              cycle
+            end if
+            slope = abs(state_now(1) - previous_temperature(side)) / h
+            relative_change(side) = abs(state_now(1) - previous_temperature(side)) / &
+                 max(abs(state_now(1)), abs(previous_temperature(side)), tiny(1.0_dp))
+            ordered(side) = sampling_ordered(state_now, selected(side, :), direction_sign)
+            temperature_gain = direction_sign * (state_now(1) - selected(side, 1))
+            margin = 1.0e-12_dp * max(abs(state_now(1)), abs(selected(side, 1)), tiny(1.0_dp))
+            if (ordered(side) .and. temperature_gain > margin &
+                 .and. slope <= previous_slope(side) * (1.0_dp + 1.0e-12_dp)) then
+              selected(side, :) = state_now
+              selected_distance(side) = real(probe, dp) * h
+              chosen(side) = containing
+            end if
+            previous_temperature(side) = state_now(1)
+            previous_slope(side) = slope
+          end do
+          ratio = selected(2, 1) / max(selected(1, 1), temp_floor)
+          ratio_change = abs(ratio - previous_ratio) / max(abs(ratio), abs(previous_ratio), tiny(1.0_dp))
+          previous_ratio = ratio
+          is_converged = round_complete .and. all(ordered) &
+               .and. all(relative_change <= sampling_tolerance) .and. ratio_change <= sampling_tolerance
+          if (is_converged) exit
+        end do
+      end if
+      t_pre = max(selected(1, 1), temp_floor)
+      if (selected(2, 1) <= t_pre .or. selected(2, 2) <= selected(1, 2)) then
+        !$omp atomic update
+        diagnostics(9) = diagnostics(9) + 1_8
+        cycle
+      end if
+      m = mach_from_temperature_jump(selected(2, 1) / t_pre, gamma)
       if (m < min_mach * (1.0_dp - 1.0e-12_dp)) then
         !$omp atomic update
         diagnostics(10) = diagnostics(10) + 1_8
         cycle
       end if
-
-      if (m > mach(center)) then
-        mach(center) = m
-        shock(center) = 1
-        center_index(center) = center
-        upstream_index(center) = upstream
-        downstream_index(center) = downstream
+      mach(j) = m
+      shock(j) = 1
+      upstream(j) = chosen(1)
+      downstream(j) = chosen(2)
+      states(j, :, :) = selected
+      distances(j, :) = selected_distance
+      convergence(j, 1:2) = relative_change
+      convergence(j, 3) = ratio_change
+      if (is_converged) convergence(j, 4) = 1.0_dp
+      if (show_progress /= 0 .and. progress_interval > 0) then
+        !$omp atomic capture
+        progress_count = progress_count + 1
+        done = progress_count
+        !$omp end atomic
+        if (mod(done, progress_interval) == 0 .or. done == ns) then
+          !$omp critical(progress_write)
+          call system_clock(clock_now)
+          elapsed = real(clock_now - started, dp) / real(max(clock_rate, 1), dp)
+          write(output_unit, '(A,I0,A,I0,A,F10.1,A)') &
+               'ShockFinder Fortran sampling: ', done, '/', ns, ' centers elapsed=', elapsed, ' s'
+          flush(output_unit)
+          !$omp end critical(progress_write)
+        end if
       end if
     end do
     !$omp end parallel do
-    if (show_progress /= 0 .and. (progress_interval <= 0 .or. mod(n, max(1, progress_interval)) /= 0)) then
-      call system_clock(clock_now)
-      elapsed = real(clock_now - scan_start, 8) / real(max(clock_rate, 1), 8)
-      write(output_unit, '(A,I0,A,I0,A,F10.1,A)') "ShockFinder Fortran scan: ", &
-           n, "/", n, " (100.0%) elapsed=", elapsed, " s"
-      flush(output_unit)
-    end if
+  end subroutine measure_shock_states
 
-    deallocate(divv_arr, grad_t_arr, candidate, resolved_center, eligible_center)
+  ! Reuse precisely the detection interpolation at known accepted offsets.
+  ! This also allows validation of directly supplied thermal-pressure fields.
+  subroutine sample_states_at_offsets(pos, dx, temp, rho, neighbors, fine_face_index, fine_neighbors, &
+       centers, normals, distances, max_steps, n, nfine, ns, states, valid)
+    integer, intent(in) :: n, nfine, ns, max_steps, centers(ns)
+    integer, intent(in) :: neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), dx(n), temp(n), rho(n), normals(ns, 3), distances(ns, 2)
+    real(8), intent(out) :: states(ns, 2, 3)
+    integer, intent(out) :: valid(ns, 2)
+    integer :: j, side, containing, failure, center
+    real(8) :: point(3), state_now(3)
+    logical :: ok
+    states = 0.0_dp
+    valid = 0
+    !$omp parallel do schedule(dynamic, 64) private(j, side, center, point, state_now, containing, failure, ok)
+    do j = 1, ns
+      center = centers(j)
+      do side = 1, 2
+        point = pos(center, :) + real(2 * side - 3, dp) * distances(j, side) * normals(j, :)
+        call interpolated_state(pos, dx, temp, rho, neighbors, fine_face_index, fine_neighbors, &
+             n, nfine, pos(center, :), dx(center), center, point, max_steps, state_now, containing, ok, failure)
+        if (ok) then
+          states(j, side, :) = state_now
+          valid(j, side) = 1
+        end if
+      end do
+    end do
+    !$omp end parallel do
+  end subroutine sample_states_at_offsets
+
+  ! Compatibility entry point for callers needing only Mach and cell indices.
+  ! Python uses the two center-sized APIs to retain interpolated endpoint states.
+  subroutine find_shocks(pos, vel, dx, temp, rho, level, detection_mask, neighbors, &
+       fine_face_index, fine_neighbors, n, nfine, gamma, temp_floor, min_mach, max_steps, &
+       max_center_steps, center_normal_cosine, center_plateau_tolerance, show_progress, &
+       progress_interval, mach, shock, center_index, upstream_index, downstream_index, diagnostics)
+    integer, intent(in) :: n, nfine, max_steps, max_center_steps, show_progress, progress_interval
+    integer, intent(in) :: level(n), detection_mask(n), neighbors(n, 6), fine_face_index(n, 6), fine_neighbors(nfine, 4)
+    real(8), intent(in) :: pos(n, 3), vel(n, 3), dx(n), temp(n), rho(n), gamma, temp_floor, min_mach
+    real(8), intent(in) :: center_normal_cosine, center_plateau_tolerance
+    real(8), intent(out) :: mach(n)
+    integer, intent(out) :: shock(n), center_index(n), upstream_index(n), downstream_index(n)
+    integer(8), intent(out) :: diagnostics(10)
+    integer :: ns, i, j
+    integer, allocatable :: center_mask(:), centers(:), accepted(:), up(:), down(:)
+    real(8), allocatable :: m(:), normals(:, :), states(:, :, :), distances(:, :), convergence(:, :)
+    integer(8) :: center_diagnostics(10), sample_diagnostics(10)
+    mach = 0.0_dp
+    shock = 0
+    center_index = 0
+    upstream_index = 0
+    downstream_index = 0
+    allocate(center_mask(n))
+    call find_shock_centers(pos, vel, dx, temp, rho, detection_mask, neighbors, fine_face_index, fine_neighbors, &
+         gamma, max_center_steps, center_normal_cosine, center_plateau_tolerance, show_progress, &
+         progress_interval, n, nfine, center_mask, center_diagnostics)
+    ns = count(center_mask > 0)
+    allocate(centers(ns), accepted(ns), up(ns), down(ns), m(ns), normals(ns, 3), states(ns, 2, 3), distances(ns, 2), convergence(ns, 4))
+    j = 0
+    do i = 1, n
+      if (center_mask(i) == 0) cycle
+      j = j + 1
+      centers(j) = i
+    end do
+    call measure_shock_states(pos, vel, dx, temp, rho, neighbors, fine_face_index, fine_neighbors, &
+         centers, gamma, temp_floor, min_mach, max_steps, 0.01_dp, show_progress, progress_interval, &
+         n, nfine, ns, m, accepted, up, down, normals, states, distances, convergence, sample_diagnostics)
+    diagnostics = center_diagnostics + sample_diagnostics
+    do j = 1, ns
+      i = centers(j)
+      if (accepted(j) == 0) cycle
+      mach(i) = m(j)
+      shock(i) = 1
+      center_index(i) = i
+      upstream_index(i) = up(j)
+      downstream_index(i) = down(j)
+    end do
   end subroutine find_shocks
 
 end module shockfinder_kernel

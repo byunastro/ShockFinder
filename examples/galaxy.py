@@ -21,6 +21,7 @@ import numpy as np
 
 import shocktest
 from shocktest import pyShockFinder
+from shocktest.compact import _sampled_states
 from shocktest.spatial import nearest_points, connected_components, nearest_segment_shock
 
 
@@ -587,7 +588,11 @@ def shock_product_from_catalog(catalog, labels, result, dissipation, snapshot, *
         center = np.average(member["pos"]*factor, axis=0, weights=member["area"])
         if not np.allclose(center, summary["center"], atol=.05, rtol=1.e-6):
             raise ValueError(f"front {fid}: member positions do not match catalog center")
-        if up is not None and down is not None:
+        sampled = _sampled_states(result, rows, names=('pos',))
+        if sampled is not None:
+            member['upstream_pos'] = sampled['pos'][:, 0].copy()
+            member['downstream_pos'] = sampled['pos'][:, 1].copy()
+        elif up is not None and down is not None:
             upstream, downstream = np.asarray(up)[rows], np.asarray(down)[rows]
             good = ((upstream >= 0) & (downstream >= 0) &
                     (upstream < len(position)) & (downstream < len(position)))
@@ -1727,7 +1732,12 @@ def _stripping_frame(product, snapshot, box, cfg):
         oriented = np.zeros(n, bool)
         flags = list(assessment.get("quality_flags", ()))
         upstream_pos, downstream_pos = member.get("upstream_pos"), member.get("downstream_pos")
-        if ((upstream_pos is None or downstream_pos is None) and result is not None
+        sampled = _sampled_states(result, ids, names=('pos',)) if result is not None else None
+        if sampled is not None:
+            if _stripping_value(result, "position_unit") != member["position_unit"]:
+                raise ValueError("member and result endpoint position units disagree")
+            upstream_pos, downstream_pos = sampled['pos'][:, 0], sampled['pos'][:, 1]
+        elif ((upstream_pos is None or downstream_pos is None) and result is not None
                 and _stripping_value(result, "pos") is not None
                 and "upstream_index" in member and "downstream_index" in member):
             if _stripping_value(result, "position_unit") != member["position_unit"]:
@@ -2402,26 +2412,35 @@ def run_shockfinder(cell, *, minlevel=15, maxlevel=20, min_mach=1.5, show_progre
 def shock_front_samples(result, dissipation, *, min_mach=1.5, min_flux=0.0):
     """Build positions, normals, and strengths for selected shock cells."""
 
-    shock_mask = result.shock & (result.mach >= min_mach) & (dissipation.flux > min_flux)
+    mach = np.asarray(_stripping_value(result, 'mach'))
+    flux = np.asarray(_stripping_value(dissipation, 'flux'))
+    shock_mask = np.asarray(_stripping_value(result, 'shock')) & (mach >= min_mach) & (flux > min_flux)
     shock_rows = np.nonzero(shock_mask)[0]
 
-    shock_pos = result.pos[shock_rows]
-    shock_dx = result.dx[shock_rows]
-    shock_mach = result.mach[shock_rows]
-    shock_flux = dissipation.flux[shock_rows]
+    position = np.asarray(_stripping_value(result, 'pos'))
+    shock_pos = position[shock_rows]
+    shock_dx = np.asarray(_stripping_value(result, 'dx'))[shock_rows]
+    shock_mach = mach[shock_rows]
+    shock_flux = flux[shock_rows]
+    zone_width = _stripping_value(result, 'zone_width')
     shock_zone_width = (
-        np.asarray(result.zone_width, dtype=np.float64)[shock_rows]
-        if getattr(result, "zone_width", None) is not None
+        np.asarray(zone_width, dtype=np.float64)[shock_rows]
+        if zone_width is not None
         else np.zeros(shock_rows.size, dtype=np.float64)
     )
 
-    upstream = result.upstream_index[shock_rows]
-    downstream = result.downstream_index[shock_rows]
+    upstream = np.asarray(_stripping_value(result, 'upstream_index'))[shock_rows]
+    downstream = np.asarray(_stripping_value(result, 'downstream_index'))[shock_rows]
     valid = (upstream >= 0) & (downstream >= 0)
 
     normal = np.zeros_like(shock_pos)
-    normal[valid] = (result.normal[shock_rows[valid]] if result.normal is not None
-                     else result.pos[downstream[valid]] - result.pos[upstream[valid]])
+    saved_normal = _stripping_value(result, 'normal')
+    if saved_normal is not None:
+        normal[valid] = np.asarray(saved_normal)[shock_rows[valid]]
+    else:
+        sampled = _sampled_states(result, shock_rows[valid], names=('pos',))
+        normal[valid] = (position[downstream[valid]] - position[upstream[valid]] if sampled is None
+                         else sampled['pos'][:, 1] - sampled['pos'][:, 0])
     norm = np.linalg.norm(normal, axis=1)
     valid &= norm > 0.0
     normal[valid] /= norm[valid, None]
