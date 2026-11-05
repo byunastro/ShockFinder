@@ -1,10 +1,12 @@
 import sys as _sys
 
+__version__ = '0.3.0'
+
 from ._native import load_extension as _load_extension
 
 
 _NATIVE_IMPORT_ERRORS = {}
-for _name in ("_shockfinder", "_merger_neighbors"):
+for _name in ("_shockfinder", "_merger_neighbors", "_profile_geometry"):
     try:
         globals()[_name] = _load_extension(_name)
     except ImportError as _exc:
@@ -19,6 +21,7 @@ from .exposure import (
     ExposureAccumulator, attribute_merger_shocks, integrate_galaxy_exposure,
 )
 from .compact import ShockSamples, compact_shocks
+from .profile_quality import ProfileQualityFlag, galaxy_pressure
 from .core import ShockFinder, ShockResult
 from .fronts import (
     shock_front_catalog, front_dtype, QUALITY_OK, QUALITY_NO_AREA,
@@ -44,6 +47,7 @@ from .catalog_io import (
 from .catalog_qa import plot_catalog_quality, summarize_catalog_quality
 
 __all__ = [
+    "ProfileQualityFlag", "galaxy_pressure",
     "shock_front_catalog", "front_dtype", "QUALITY_OK", "QUALITY_NO_AREA",
     "QUALITY_NO_DISS_RATE", "QUALITY_UNDEFINED_NORMAL", "QUALITY_APPROX_CONNECTIVITY",
     "QUALITY_GAP_BRIDGED", "QUALITY_PARTIAL_SUMMARY",

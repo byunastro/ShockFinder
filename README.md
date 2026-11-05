@@ -1,20 +1,48 @@
 # ShockFinder
 
-ShockFinder is a Fortran-backed Python framework for detecting shocks in the intracluster medium
-(ICM), measuring Mach numbers and thermal dissipation, groups shock structures,
-and supporting galaxy matching and time-resolved exposure measurements. The AMR
-shock detector follows the methodology of Skillman et al. (2008, ApJ 689, 1063).
+ShockFinder is a Python framework for detecting shocks on AMR leaf meshes,
+measuring Mach numbers and thermal dissipation, grouping shock structures,
+and supporting galaxy matching and time-resolved exposure measurements.
+The current detector uses **local profile reconstruction only**: it reconstructs
+a subcell shock surface from column mass and adopts a pressure-jump Mach number.
+There is no selector for the earlier center-search methods.
 
-For galaxy gas-loss classification with saved shock fronts, start with the
-[notebook workflow](examples/galaxy_stripping_workflow.ipynb).
+## 1. Install
 
-## 1. Build
+Requirements: Python >= 3.10, NumPy >= 2.0, and SciPy >= 1.13.
+From the repository root:
 
-Requirements: Python >= 3.10, NumPy >= 1.26, and a Fortran compiler such as
-GNU Fortran. NumPy releases that use the Meson F2PY backend also require Meson
-and Ninja in the selected environment.
+```bash
+python -m pip install -e .
+# Include Matplotlib, JupyterLab, and notebook tools:
+python -m pip install -e '.[notebook]'
+```
 
-From the repository root, build all Fortran extensions with **the same Python
+Profile reconstruction also runs without a Fortran build. For faster AMR
+lookup, derivatives, and virtual-cell sampling, build its optional kernel:
+
+```bash
+python -m pip install -e '.[native]'
+python tools/build_profile_geometry.py
+```
+
+Restart an already running Python/Jupyter kernel after building. The finder
+automatically uses the compiled geometry when available and keeps the same
+Profile reconstruction algorithm. Check `result.diagnostics['geometry_native']`
+(`1` for Fortran, `0` for Python), and `diagnostics['model_native']` for fitting.
+The native build also accelerates background-window fitting, density quadrature,
+and conservative mass roots. Candidate peak detection and model selection use
+Python/SciPy. `OMP_NUM_THREADS` controls parallel mesh queries; short background
+fits are serial Fortran. The default connected
+catalog and Python map rendering do not require native extensions.
+
+### Optional native utilities
+
+The Fortran utilities also include a map rasterizer and neighbor helpers.
+To use them, install a Fortran compiler such as GNU Fortran. NumPy releases
+using the Meson F2PY backend also require Meson and Ninja.
+
+Build the extensions with **the same Python
 executable that runs the analysis**:
 
 ```bash
@@ -23,7 +51,7 @@ RUN_PYTHON="$CONDA_PREFIX/bin/python"
 PYTHON="$RUN_PYTHON" ./f2py.sh
 # Use "$RUN_PYTHON" for the analysis job too.
 
-# OMP settings
+# Optional settings for native OpenMP utilities.
 export OMP_NUM_THREADS=8
 export OMP_PROC_BIND=spread
 export OMP_PLACES=cores
@@ -45,43 +73,92 @@ finder.minlevel = 0                  # Lowest retained AMR level.
 finder.maxlevel = 20                 # Highest retained AMR level.
 
 # Thermodynamics and candidate selection.
-finder.temperature_floor = 1.0e4     # Preshock temperature floor [K] for Mach/sound speed.
+finder.temperature_floor = 0.0       # Must remain zero for profile reconstruction.
+finder.mean_molecular_weight = 0.59   # EOS and sound-speed mean molecular weight.
 finder.min_temperature = None        # Optional seed-cell lower T cut [K]; None disables it.
 finder.min_density = None            # Optional seed-cell lower density cut [Msol/kpc3].
 finder.max_density = None            # Optional seed-cell upper density cut [Msol/kpc3].
-finder.min_mach = 1.0                # Minimum accepted temperature-jump Mach number (>= 1).
-finder.sampling_tolerance = 0.01      # Relative T/profile and temperature-ratio convergence threshold.
+finder.min_mach = 1.3                # Accepted pressure Mach must be strictly greater.
+finder.sampling_tolerance = 0.01      # Relative background-profile fitting tolerance.
+finder.seed_bounds = None            # Optional (3,2) coordinate bounds for starting seeds.
 
 # Unit keys used to access the input table; use these units for the full pipeline.
 finder.position_unit = "km"          # Positions and cell widths.
 finder.velocity_unit = "km/s"        # Velocity components.
 finder.temperature_unit = "K"        # Gas temperature.
 finder.density_unit = "Msol/kpc3"     # Gas mass density.
+finder.thermal_pressure_field = None # Infer thermal pressure from rho, T, and mu if absent.
+finder.thermal_pressure_unit = "erg/cm3"  # Unit of an explicitly supplied thermal pressure.
 
-# Independent pressure/density-jump Mach checks.
-finder.validate_mach = True          # Attach secondary Mach estimates and consistency flags.
+# Saved diagnostic Mach estimates and optional post-filtering.
+finder.validate_mach = True          # Attach temperature/density estimates and jump diagnostics.
 finder.filter_inconsistent = False   # True removes failed checks from result.shock only.
-finder.consistency_factor = 1.5      # Accept secondary Mach within [M_T/f, f*M_T], f >= 1.
+finder.consistency_factor = 1.5      # Diagnostic comparison to adopted Mach within a factor f.
 finder.density_check_max_mach = 3.0   # Restrict density consistency checks to weak shocks.
 
 # Memory and progress controls.
-finder.show_progress = False         # Print input, neighbor, and shock-scan progress.
-finder.progress_interval = 0         # 0: automatic (~5%); otherwise a retained-cell count.
+finder.profile_batch_size = 32       # Limit temporary profile-sampling arrays.
+finder.show_progress = False         # Print input and profile-batch progress.
 
 result = finder.find(cell)
 print("Detected centers:", result.shock.sum())
 ```
 
-The adopted Mach number always comes from the temperature
-jump. With `filter_inconsistent=False`, validation is diagnostic and does not alter the
-shock mask. With filtering enabled, Mach values and endpoint indices remain
+The adopted Mach number comes from reconstructed **thermal pressure** states,
+with `result.mach_estimator == 'profile_pressure'`. Temperature Mach is a separate
+diagnostic, not an alias of `result.mach`. The pressure consistency flag reuses
+the adopted pressure jump and is **not an independent validation**. With
+`filter_inconsistent=False`, saved consistency diagnostics do not alter the
+shock mask; the profile's entropy and velocity-closure tests still apply.
+With filtering enabled, Mach values and support indices remain
 available for auditing rejected centers: always select using `result.shock`.
 
 Level cuts change the retained mesh, so overly restrictive cuts can remove
 needed neighbors. Temperature/density cuts affect only detection seeds: other
-retained cells remain available as neighbors and endpoints. Center search uses local gradient normals,
-relative plateau tolerances, and physical-position tie breaking. AMR sampling
-uses the geometry of the contributing cells, including refinement interfaces.
+retained cells remain available to reconstructed profiles. `seed_bounds` also
+restricts only starting seeds, in `position_unit`; it does not crop the mesh.
+Use all available leaf levels when possible. Inputs have open boundaries;
+periodic wrapping is not performed.
+
+### Profile reconstruction
+
+1. Seed locally compressing cells with nonzero temperature gradient and
+   `grad(T) · grad(P) > 0`. The normal is `grad(T) / |grad(T)|`, directed from
+   upstream to downstream.
+2. Sample density, thermal pressure, and momentum conservatively on a common
+   virtual AMR mesh. The reference width `h` is the coarsest covering leaf at
+   preliminary offsets `0, ±4, ±8, ±12` local cell widths. Sample from `-12h` to
+   `+12h` at spacing `h/4`, averaging a central ray and four transverse rays.
+   If the transverse stencil is incomplete, use the central ray.
+3. Fit resolved upstream/downstream backgrounds in `ln(rho)`, pressure, and
+   normal velocity. Locate a subcell surface where the joined density
+   backgrounds preserve the measured column mass across the transition.
+4. Recompute the normal in the containing leaf and repeat, using two to six
+   passes. The accepted profile uses the final leaf's normal. A last-pass
+   bounded solution is allowed only if the free mass surface is within `h/4`
+   of the current surface; it is explicitly flagged. Retain the best fit per
+   containing leaf.
+5. Evaluate one-sided states at the reconstructed surface and adopt
+
+   $$\mathcal{M}_P = \left[\frac{(\gamma+1)P_{\rm down}/P_{\rm up}+\gamma-1}{2\gamma}\right]^{1/2}.$$
+
+   Require positive pressure/density jumps, positive entropy production,
+   normal velocity-jump agreement within 15% of
+   the RH prediction, and `M_P > min_mach`. Density-jump agreement contributes
+   to fit ranking rather than imposing a hard rejection inside reconstruction.
+
+An entropy signal smaller than estimated background-model sensitivity is now
+retained with `ENTROPY_UNCERTAIN`, rather than silently removed. `result.shock`
+includes these tentative measurements. Use and report the quality flags when
+selecting a scientific sample. They are diagnostics, not calibrated confidence
+levels or ground-truth shock labels. Derivatives are computed for eligible seeds
+and lazily for newly located center leaves; sampling always retains all leaves.
+
+The detector does not use a velocity-divergence minimum as its final center,
+an intercell normal-dot-product gate, a two/four-crossing switch, or a
+temperature floor. Setting the removed `center_normal_cosine`,
+`center_plateau_tolerance`, `max_center_steps`, `max_steps`, or `method`
+attributes raises an error. Positive `temperature_floor` values also raise an error.
 
 `finder.analyze` combines detection, optional dissipation, and optional catalog
 construction. Set `compute_dissipation` and `build_catalog` independently.
@@ -104,7 +181,7 @@ analysis = finder.analyze(
     build_catalog=True,        # Build fronts and retain their membership labels.
     catalog_options=catalog_options,
     dissipation_options={
-        "mu": 0.59,            # Mean molecular weight for the sound speed.
+        # mu defaults to the mean molecular weight saved by the finder.
         "area_mode": "normal", # Normal-corrected area; "cell" uses dx**2.
     },
     compact=False,             # Return dense ShockAnalysis; True returns ShockSamples.
@@ -115,7 +192,7 @@ catalog, labels = analysis.catalog, analysis.labels
 ```
 
 `catalog_options=None` and `dissipation_options=None` use their defaults. Only supply `catalog_options` when `build_catalog=True`.
-`return_labels=False` returns only the catalog.
+For a standalone `shock_front_catalog` call, `return_labels=False` returns only the catalog.
 `return_labels=True` returns `(catalog, labels)`. Membership means which shock
 front each original result record belongs to; it does not contain copies of
 positions or other cell measurements.
@@ -123,6 +200,7 @@ positions or other cell measurements.
 With `compute_dissipation=False`, the catalog's unavailable area and power are NaN.
 
 Catalog options
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `min_group_size` | 3 | Minimum center count; smaller components are excluded |
@@ -141,7 +219,12 @@ Catalog options
 | `chunk_size` | 131072 | Selection/summary batch size |
 | `query_chunk_size` | 4096 | Spatial query batch size |
 | `max_neighbor_pairs` | 200000 | Candidate-pair batch limit |
+| `grouping_method` | `'connected'` | Front grouping; experimental `'flux_persistence'` requires an additional native helper |
+| `persistence_dex` | 0.6 | Peak/merge contrast used only by flux-persistence grouping |
 
+These are front-grouping options, separate from the fixed shock detector.
+Build the optional persistence helper with `python tools/build_persistence.py` before using
+`grouping_method='flux_persistence'`.
 
 Call `analysis.clear()` or `result.clear()` once finished with those arrays;
 do not clear a result that is still needed for plotting or galaxy matching.
@@ -160,37 +243,89 @@ arrays with the same length, using these keys and physical units:
 | `("rho", "Msol/kpc3")` | Gas mass density | solar masses / kpc³ |
 | `"level"` | Integer AMR refinement level | dimensionless |
 
+The geometry must be a common, aligned dyadic leaf mesh with positive widths,
+temperatures, and densities. Matching bare field names are also accepted by
+the finder. Other supported velocity units are `m/s` and `cm/s`; temperature
+must be in K. Supported density units include `g/cc`, `g/cm3`, `g/cm^3`, and
+`kg/m3` as well as `Msol/kpc3`.
+
+To supply thermal pressure explicitly, set its exact table key, for example
+`finder.thermal_pressure_field = ('thermal_pressure', 'erg/cm3')`. Supported
+pressure units are `erg/cm3`, `erg/cm^3`, `dyn/cm2`, and `Pa`. Automatic discovery
+is limited to names explicitly denoting thermal pressure (`thermal_pressure`,
+`pressure_thermal`, `p_thermal`, `pth`). Otherwise the finder uses the ideal-gas
+EOS with the configured mean molecular weight. Temperature and supplied thermal
+pressure should describe the same gas; total MHD/CR pressure is not a substitute.
+
 ## 4. Output
 
 ### Dense detection and dissipation
 
-`find()` returns `ShockResult`, with one row per cell.
+`find()` returns `ShockResult`, with one row per retained leaf cell.
 `analyze(compact=False)` returns `ShockAnalysis`, containing `result`, optional
 `dissipation`, `catalog`, and `labels`, plus `counts` and `timings`.
 
 | `ShockResult` field | Meaning |
 | --- | --- |
-| `mach`, `shock` | Temperature-jump Mach number and accepted-center mask |
+| `mach`, `shock` | Adopted profile pressure-jump Mach and accepted-center mask |
+| `mach_estimator` | `'profile_pressure'` for current detections |
 | `selected_indices` | Mapping from retained rows to original input rows |
 | `center_index`, `upstream_index`, `downstream_index` | Indices in **retained-row space**; endpoint indices identify containing cells; `-1` when unavailable |
 | `pos`, `dx`, `level` | Retained geometry; positions have shape `(N, 3)` |
+| `center_position` | Fitted subcell positions `(N,3)`; NaN outside measured centers |
 | `normal` | Unit temperature-gradient normal from upstream toward downstream |
-| `zone_width` | Endpoint separation projected on the normal, in position units |
-| `sampling` | Sparse interpolated upstream/downstream states and positions, aligned through `sampling['rows']` |
-| `diagnostics` | Counters for missing neighbors, search limits, and rejected jumps; legacy exit counters are zero |
-| `gamma`, `temperature_floor`, `position_unit`, `temperature_unit`, `density_unit` | Measurement settings and units |
+| `zone_width` | Distance between background support positions, in position units |
+| `sampling` | Sparse one-sided fitted states, support geometry, and fit diagnostics, aligned through `sampling['rows']` |
+| `diagnostics` | Counts of seeds, rejected profiles, duplicate leaf models, and accepted centers |
+| `gamma`, `mean_molecular_weight`, `temperature_floor`, `position_unit`, `temperature_unit`, `density_unit`, `pressure_unit` | Measurement settings and units; reconstructed pressure is in erg/cm3 |
 
 Mach and normals are zero outside detected centers. Filtering inconsistent
-centers changes the mask, not their stored measurements. `zone_width` measures
-the accepted interpolated sampling span projected on the normal; it is not
-automatically a physical interaction width or the full numerical shock thickness.
-Sampling adapts the extended-probe strategy of Dubois et al. (2019) using
-temperature extrema and temperature-profile convergence. Unsettled profiles
-are extended even when the initial Mach is below 5. `sampling['converged']`
-flags measurements that stabilize within the configured tolerance.
+centers changes the mask, not their stored measurements. For position accuracy,
+use `center_position`, not `pos`: the latter remains the containing leaf center.
+`zone_width` is a background support span, not a measured physical shock thickness.
 
-With validation enabled, additional fields include `mach_temperature` (an alias
-of `mach`), `mach_pressure`, `mach_density`, the three jump ratios,
+`sampling['temperature']`, `['density']`, and `['pressure']` have shape `(K,2)`
+for `K` measured centers; columns are upstream/downstream. Both states are
+evaluated at the same fitted surface, so `sampling['pos']` has two co-located
+positions. `sampling['support_pos']` instead stores the two background support
+locations. The upstream/downstream indices refer to leaves containing these
+supports, not cells whose center values equal the fitted states. Use the saved
+normal or support geometry for orientation.
+
+Other sampling fields include `reference_width`, `density_residual`,
+`velocity_residual`, `quality`, `background_orders`, `profile_passes`,
+`center_constraint_active`, and `mass_surface_displacement`. The latter records
+the displacement from a bounded final surface to its free column-mass solution.
+`sampling['converged']` is true for accepted reconstructions, including flagged
+bounded solutions; it is not the old temperature-profile convergence criterion.
+
+Additional sparse fields are `velocity` `(K,2,3)` in km/s, `shock_speed_mass`
+and `shock_speed_pressure` in km/s, `momentum_residual`, `energy_residual`,
+`entropy_margin`, `background_model_count`, `mach_model_range`, and
+`center_model_range` (two displacements from the adopted center, position units).
+`center_sensitivity` estimates the amplification of background-model errors by
+small density contrast. The ranges describe valid models in the selected
+constant/nonconstant family; they are not statistical confidence intervals.
+`profile_quality_flags` is a `ProfileQualityFlag` bitmask; `quality_clear` means
+no listed diagnostic fired. It does not certify an ideal-gas EOS, physical
+coordinate conversion, completeness, or a galaxy crossing.
+
+```python
+from shocktest import ProfileQualityFlag, galaxy_pressure
+s = result.sampling
+rows = s['rows']
+clear_rows = rows[s['quality_clear']]  # Conservative diagnostic subset.
+uncertain = (s['profile_quality_flags'] & int(ProfileQualityFlag.ENTROPY_UNCERTAIN)) != 0
+# Gas and galaxy velocities MUST use the same physical frame and km/s.
+forcing = galaxy_pressure(s, galaxy_velocity, density_factor=1.0)  # g/cc input
+```
+
+Cosmological inputs require verified physical coordinates, velocity conventions,
+thermal pressure/EOS, and source masks. A quality-clear flag alone does not
+establish completeness or the presence of a physical shock.
+
+With validation enabled, additional fields include separately computed `mach_temperature`,
+`mach_pressure` (the same pressure-jump estimate as adopted `mach`), `mach_density`, the three jump ratios,
 `pressure_check_valid`, `pressure_consistent`, `density_check_valid`,
 `density_consistent`, `density_check_applicable`, `mach_consistent`, and
 `mach_validation_status`. The latter is a bit mask described by
@@ -207,6 +342,22 @@ of `mach`), `mach_pressure`, `mach_density`, the three jump ratios,
 | `efficiency` | Thermalization efficiency | dimensionless |
 | `sound_speed` | Preshock sound speed | km s⁻¹ |
 
+### Compact storage
+
+```python
+samples = analysis.to_compact(profile="science", index_dtype="auto")
+samples.save("shock_samples.npz")
+restored = shocktest.ShockSamples.load("shock_samples.npz")
+analysis.clear()  # samples owns its arrays.
+```
+
+`finder.find(cell, compact=True)` returns detections as `ShockSamples`;
+`finder.analyze(cell, compact=True)` also includes requested downstream products.
+Both compact profiles (`'full'` and `'science'`) preserve `center_position`,
+one-sided states, and available profile diagnostics. Compact input and support
+indices address the **original input table**. NPZ storage does not require pickle.
+Historical pickles retain their original temperature-jump interpretation;
+loading them does not recompute detections or add fitted subcell positions.
 
 ### Generic fronts from saved detections
 
@@ -228,7 +379,7 @@ front_dtype = np.dtype([
 | --- | --- |
 | `front_id` | Snapshot-local ID, ordered by minimum original input-cell ID; no temporal identity |
 | `ncell` | Number of contributing shock centers |
-| `center` | Area-weighted centroid in kpc; unweighted over all members if any area is unreliable |
+| `center` | Centroid of fitted `center_position` when available, in kpc; area-weighted, or unweighted if any area is unreliable |
 | `normal` | Normalized mean upstream-to-downstream normal; dimensionless; no sign flipping |
 | `extent` | Axis-aligned extent in kpc, including half-cell widths on each side |
 | `area` | Sum of effective unique-center areas, kpc²; NaN if incomplete |
@@ -248,6 +399,9 @@ Quality constants are exported from `shocktest` and `shocktest.fronts`:
 | 16 / `QUALITY_GAP_BRIDGED` | At least one accepted connection spans a non-contact gap |
 | 32 / `QUALITY_PARTIAL_SUMMARY` | Missing aggregate members or numerical overflow |
 
+Connectivity and cell extents use leaf geometry; the reported centroid uses
+fitted surface positions. Summed cell-area estimates are not a reconstructed
+triangle-mesh surface area or a completeness measurement.
 
 ## 5. Usage Python examples
 
@@ -329,7 +483,8 @@ catalog, labels = shock_front_catalog(
 if len(catalog):
     front_id = int(catalog["front_id"][0])
     member_rows = np.flatnonzero(labels == front_id)
-    member_positions = result.pos[member_rows]  # In result.position_unit.
+    member_positions = result.center_position[member_rows]  # Fitted positions, in result.position_unit.
+    member_leaf_positions = result.pos[member_rows]         # Containing leaf centers.
     member_mach = result.mach[member_rows]
     member_flux = dissipation.flux[member_rows]
     input_rows = result.selected_indices[member_rows]  # Rows in the original cell table.
@@ -344,3 +499,49 @@ If you already called `finder.analyze(..., build_catalog=True)` in Section 2,
 use `catalog, labels = analysis.catalog, analysis.labels` directly and start
 with the member-selection block. A label of `-1` means that the record belongs
 to no retained front. Membership must stay paired with the same result row order.
+
+For historical results without `center_position`, use `result.pos` and label
+those measurements as cell-center positions.
+
+## 6. Reading RAMSES outputs and exporting results
+
+The single-rank RAMSES reader supports the current idealized simulations:
+3D, five pure-hydro variables, and gamma=5/3, on either uniform or AMR meshes.
+It checks the output layout and converts `unit_l`, `unit_t`, and `unit_d` to
+physical units. Multi-rank, RT, and MHD output layouts are not supported by this
+reader. OpenMP runs with one MPI rank satisfy the single-rank requirement.
+
+Run detection in a Python script and export the measurements for later analysis:
+
+```python
+from shocktest.ramses import load_snapshot, snapshot_finder
+from shocktest.profile_analysis import save_profiles, save_slice
+
+cell, meta = load_snapshot("/path/to/run/output_00003")
+finder = snapshot_finder(meta)
+result = finder.find(cell)
+save_profiles("results/profiles.npz", result, meta)
+save_slice("results/slice_z.npz", cell, axis="z")
+```
+
+The saved NPZ files can be read without the original snapshot or another
+detection run. For example, use the following in an analysis notebook:
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+from shocktest.profile_analysis import plot_saved_slice
+
+with np.load("results/profiles.npz", allow_pickle=False) as saved:
+    mach = saved["mach"].copy()
+    quality_clear = saved["quality_clear"].copy()
+
+fig, ax = plot_saved_slice("results/slice_z.npz", field="temperature",
+                           profiles="results/profiles.npz")
+plt.show()
+```
+
+Area weights based on cell width and normal direction are detection-area
+proxies. Accuracy distributions conditioned on detected centers do not measure
+complete shock-surface coverage. Analytic references, when used for evaluation,
+must not enter the detector.

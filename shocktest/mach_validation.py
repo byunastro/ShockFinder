@@ -1,7 +1,7 @@
 """Rankine--Hugoniot Mach estimators and cross-validation helpers.
 
-The temperature jump remains ShockFinder's primary Mach estimator.  Pressure
-and density jumps are independent diagnostics for ideal, adiabatic,
+Profile reconstruction adopts the pressure-jump Mach. Temperature and density
+jumps provide additional diagnostics for ideal, adiabatic,
 hydrodynamic shocks.  In particular, the density jump approaches the finite
 strong-shock compression ``(gamma + 1) / (gamma - 1)`` and is consequently a
 poor high-Mach estimator.

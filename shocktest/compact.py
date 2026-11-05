@@ -84,18 +84,20 @@ _SCIENCE_COLUMNS = frozenset({
     'upstream_temperature', 'downstream_temperature',
     'upstream_density', 'downstream_density', 'upstream_pressure', 'downstream_pressure',
     'upstream_distance', 'downstream_distance', 'upstream_pos', 'downstream_pos',
-    'sampling_converged', 'relative_ratio_change',
+    'center_position', 'mach_temperature', 'sampling_converged', 'relative_ratio_change',
     'upstream_relative_temperature_change', 'downstream_relative_temperature_change',
 })
 
 
-def _sampled_states(result, rows, names=('temperature', 'density', 'pressure', 'distance', 'pos')):
+def _sampled_states(result, rows, names=('temperature', 'density', 'pressure', 'distance', 'pos'), *, geometry=False):
     """Join sparse sampled states to dense result rows, preserving their order.
 
     A sampled endpoint's index identifies its containing cell; reading that
     cell cannot reconstruct the interpolated thermodynamic state or position.
     Missing measured rows therefore raise instead of silently changing states.
     Dictionaries are accepted for the saved galaxy-analysis interfaces.
+    geometry=True returns profile background support positions for orientation;
+    the default returns the co-located one-sided state evaluation positions.
     """
     sampling = result.get('sampling') if isinstance(result, dict) else getattr(result, 'sampling', None)
     if sampling is None:
@@ -111,7 +113,8 @@ def _sampled_states(result, rows, names=('temperature', 'density', 'pressure', '
         raise ValueError('sampling is missing a requested shock result row')
     states = {}
     for name in names:
-        values = np.asarray(sampling[name])
+        key = 'support_pos' if geometry and name=='pos' and 'support_pos' in sampling else name
+        values = np.asarray(sampling[key])
         shape = (len(sampled_rows), 2, 3) if name == 'pos' else (len(sampled_rows), 2)
         if values.shape != shape:
             raise ValueError(f'sampling {name} must have shape {shape}')
@@ -135,7 +138,7 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
     keep = (lambda name: True) if profile == 'full' else _SCIENCE_COLUMNS.__contains__
     rows = np.flatnonzero(result.shock)
     columns = {'retained_row': rows, 'input_row': result.selected_indices[rows]}
-    excluded = {'selected_indices', 'center_index', 'upstream_index', 'downstream_index', 'mach_temperature'}
+    excluded = {'selected_indices', 'center_index', 'upstream_index', 'downstream_index'}
     for field in fields(result):
         value = getattr(result, field.name)
         if field.name not in excluded and keep(field.name) and isinstance(value, np.ndarray):
@@ -173,6 +176,15 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
             for side, endpoint in enumerate(('upstream', 'downstream')):
                 columns[endpoint + '_relative_temperature_change'] = (
                     raw_sampling['relative_temperature_change'][slots, side].copy())
+        for name in ('support_pos','reference_width','density_residual','velocity_residual',
+                     'center_constraint_active','mass_surface_displacement','profile_passes',
+                     'quality','background_orders','velocity','entropy_margin','center_sensitivity',
+                     'momentum_residual','energy_residual','shock_speed_mass','shock_speed_pressure',
+                     'mach_model_range','center_model_range','background_model_count',
+                     'profile_quality_flags','quality_clear'):
+            if name in raw_sampling:
+                key=name if name.startswith('profile_') else 'profile_'+name
+                columns[key]=raw_sampling[name][slots].copy()
     if dissipation is not None:
         for field in fields(dissipation):
             name = 'dissipation_' + field.name
@@ -197,7 +209,9 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
                 columns[name] = value.astype(np.int32)
     metadata = {
         'profile': profile, 'index_dtype': index_dtype,
+        'mach_estimator': getattr(result,'mach_estimator','temperature_jump'),
         'gamma': result.gamma, 'temperature_floor': result.temperature_floor,
+        'mean_molecular_weight': getattr(result,'mean_molecular_weight',.59),
         'position_unit': result.position_unit, 'endpoint_index_space': 'input_table',
         'group_index_space': 'snapshot_front_id',
         'counts': {'retained': result.mach.size, 'shock': len(rows),
@@ -207,15 +221,18 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
     }
     if sampled is not None:
         metadata['endpoint_index_role'] = 'representative_containing_cell'
-        metadata['endpoint_state_sampling'] = 'interpolated'
+        metadata['endpoint_state_sampling'] = ('reconstructed_one_sided_limits' if result.mach_estimator=='profile_pressure' else 'interpolated')
         if 'converged' in result.sampling:
             metadata['sampling_tolerance'] = float(result.sampling_tolerance)
-            metadata['endpoint_selection'] = 'temperature_extrema_with_density_pressure_ordering'
+            metadata['endpoint_selection'] = ('resolved_background_models' if result.mach_estimator=='profile_pressure' else 'temperature_extrema_with_density_pressure_ordering')
         metadata['sampled_state_units'] = {
             'temperature': getattr(result, 'temperature_unit', 'K'),
             'density': getattr(result, 'density_unit', 'Msol/kpc3'),
-            'pressure': (getattr(result, 'density_unit', 'Msol/kpc3') + ' '
-                         + getattr(result, 'temperature_unit', 'K')),
+            'pressure': (getattr(result, 'pressure_unit', 'erg/cm3')
+                         if result.mach_estimator=='profile_pressure' else
+                         getattr(result, 'density_unit', 'Msol/kpc3')+' '+getattr(result, 'temperature_unit', 'K')),
             'distance': result.position_unit, 'pos': result.position_unit,
+            'velocity': 'km/s', 'shock_speed_mass':'km/s', 'shock_speed_pressure':'km/s',
+            'center_sensitivity':result.position_unit,'center_model_range':result.position_unit,
         }
     return ShockSamples(columns, groups, metadata, dict(timings or {}))

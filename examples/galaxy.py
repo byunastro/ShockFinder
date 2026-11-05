@@ -588,7 +588,7 @@ def shock_product_from_catalog(catalog, labels, result, dissipation, snapshot, *
         center = np.average(member["pos"]*factor, axis=0, weights=member["area"])
         if not np.allclose(center, summary["center"], atol=.05, rtol=1.e-6):
             raise ValueError(f"front {fid}: member positions do not match catalog center")
-        sampled = _sampled_states(result, rows, names=('pos',))
+        sampled = _sampled_states(result, rows, names=('pos',),geometry=True)
         if sampled is not None:
             member['upstream_pos'] = sampled['pos'][:, 0].copy()
             member['downstream_pos'] = sampled['pos'][:, 1].copy()
@@ -1732,7 +1732,7 @@ def _stripping_frame(product, snapshot, box, cfg):
         oriented = np.zeros(n, bool)
         flags = list(assessment.get("quality_flags", ()))
         upstream_pos, downstream_pos = member.get("upstream_pos"), member.get("downstream_pos")
-        sampled = _sampled_states(result, ids, names=('pos',)) if result is not None else None
+        sampled = _sampled_states(result, ids, names=('pos',),geometry=True) if result is not None else None
         if sampled is not None:
             if _stripping_value(result, "position_unit") != member["position_unit"]:
                 raise ValueError("member and result endpoint position units disagree")
@@ -2418,7 +2418,8 @@ def shock_front_samples(result, dissipation, *, min_mach=1.5, min_flux=0.0):
     shock_rows = np.nonzero(shock_mask)[0]
 
     position = np.asarray(_stripping_value(result, 'pos'))
-    shock_pos = position[shock_rows]
+    fitted_position = _stripping_value(result, 'center_position')
+    shock_pos = position[shock_rows] if fitted_position is None else np.asarray(fitted_position)[shock_rows]
     shock_dx = np.asarray(_stripping_value(result, 'dx'))[shock_rows]
     shock_mach = mach[shock_rows]
     shock_flux = flux[shock_rows]
@@ -2438,7 +2439,7 @@ def shock_front_samples(result, dissipation, *, min_mach=1.5, min_flux=0.0):
     if saved_normal is not None:
         normal[valid] = np.asarray(saved_normal)[shock_rows[valid]]
     else:
-        sampled = _sampled_states(result, shock_rows[valid], names=('pos',))
+        sampled = _sampled_states(result, shock_rows[valid], names=('pos',),geometry=True)
         normal[valid] = (position[downstream[valid]] - position[upstream[valid]] if sampled is None
                          else sampled['pos'][:, 1] - sampled['pos'][:, 0])
     norm = np.linalg.norm(normal, axis=1)

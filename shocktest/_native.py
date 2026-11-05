@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 
-_EXTENSIONS = frozenset({"_shockfinder", "_merger_neighbors"})
+_EXTENSIONS = frozenset({"_shockfinder", "_merger_neighbors", "_profile_geometry"})
 
 
 def extension_directory() -> Path:

@@ -147,7 +147,7 @@ def compute_dissipation(
     result,
     *,
     gamma: float | None = None,
-    mu: float = 0.59,
+    mu: float | None = None,
     temperature_floor: float | None = None,
     area_mode: str = "normal",
     _compact: bool = False,
@@ -166,6 +166,7 @@ def compute_dissipation(
     """
 
     gamma = result.gamma if gamma is None else float(gamma)
+    mu = getattr(result,'mean_molecular_weight',.59) if mu is None else float(mu)
     temperature_floor = result.temperature_floor if temperature_floor is None else float(temperature_floor)
     if not np.isclose(gamma, result.gamma) or not np.isclose(temperature_floor, result.temperature_floor):
         raise ValueError("dissipation gamma and temperature_floor must match detection settings")
@@ -189,6 +190,7 @@ def compute_dissipation(
     center_rows = retained_rows[np.nonzero(valid)[0]]
 
     sampled = _sampled_states(result, np.flatnonzero(valid), names=('temperature', 'density'))
+    density_factor = MSUN/KPC**3
     if sampled is None:
         temp1 = np.asarray(cell["T", "K"])[upstream_rows]
         rho1 = np.asarray(cell["rho", "Msol/kpc3"])[upstream_rows]
@@ -197,7 +199,10 @@ def compute_dissipation(
         # A constant unit conversion commutes with CIC interpolation. Read the
         # same canonical table fields used by the legacy dissipation path.
         density_unit = getattr(result, 'density_unit', 'Msol/kpc3')
-        if density_unit != 'Msol/kpc3':
+        if getattr(result,'mach_estimator','temperature_jump')=='profile_pressure':
+            from .profile_reconstruction import density_cgs
+            density_factor = density_cgs(density_unit)
+        elif density_unit != 'Msol/kpc3':
             native_density = np.asarray(cell['rho', density_unit])[upstream_rows]
             canonical_density = np.asarray(cell['rho', 'Msol/kpc3'])[upstream_rows]
             rho1 = rho1 * (canonical_density / native_density)
@@ -209,10 +214,13 @@ def compute_dissipation(
     temp1 = np.asarray(temp1, dtype=np.float64)
     temp1 = np.maximum(temp1, float(temperature_floor))
     rho1 = np.asarray(rho1, dtype=np.float64)
-    dx = np.asarray(np.asarray(cell["dx", "km"])[center_rows], dtype=np.float64)
+    if getattr(result,'mach_estimator','temperature_jump')=='profile_pressure' and result.dx is not None:
+        length_factor={'km':1.,'kpc':KPC/1e5,'Mpc':KPC/1e2}[result.position_unit]
+        dx=np.asarray(result.dx[valid],dtype=np.float64)*length_factor
+    else:dx = np.asarray(np.asarray(cell["dx", "km"])[center_rows], dtype=np.float64)
     mach = result.mach[valid]
 
-    rho_cgs = rho1 * MSUN / KPC**3
+    rho_cgs = rho1 * density_factor
     cs_cgs = np.sqrt(gamma * K_BOLTZMANN * temp1 / (mu * PROTON_MASS))
     delta = thermalization_efficiency(mach, gamma=gamma)
 
@@ -253,7 +261,7 @@ def shock_surface_area(result, valid, dx_kpc, *, mode: str = "normal"):
     if result.normal is not None:
         normal = result.normal[rows[ok]]
     else:
-        sampled = _sampled_states(result, rows[ok], names=('pos',))
+        sampled = _sampled_states(result, rows[ok], names=('pos',),geometry=True)
         normal = (result.pos[downstream[ok]] - result.pos[upstream[ok]] if sampled is None
                   else sampled['pos'][:, 1] - sampled['pos'][:, 0])
     norm = np.linalg.norm(normal, axis=1)
@@ -287,8 +295,8 @@ def make_shock_maps(
     show_progress: bool = True,
     progress_interval: int = 0,
     gamma: float = 5.0 / 3.0,
-    mu: float = 0.59,
-    temperature_floor: float = 1.0e4,
+    mu: float | None = None,
+    temperature_floor: float | None = None,
     area_mode: str = "normal",
     valid_mach=None,
     fill_gaps: int = 0,

@@ -301,6 +301,13 @@ def _prepare(result, dissipation, min_mach, consistent, chunk, *, include_flux=F
                 normal=normals, normal_valid=normal_valid,
                 mach=np.full(count, np.nan) if mach is None else np.asarray(mach[rows], dtype=float),
                 area=area, total=total)
+    # Mesh connectivity uses leaf centers; the scientific centroid uses the
+    # reconstructed surface positions when supplied by the current detector.
+    reconstructed = _array(source, 'center_position', (n, 3), optional=True)
+    fitted = positions if reconstructed is None else np.asarray(reconstructed[rows], dtype=float)*factor
+    if not np.isfinite(fitted).all():
+        raise ValueError('contributing center_position values must be finite')
+    data['center_position'] = fitted
     if include_flux:
         data['flux'] = values[2]
     return data, n
@@ -515,7 +522,7 @@ def _summarize(front_id, rows, data, quality, normal_tol, chunk_size):
     if nmach != n or nnormal != n:
         quality |= QUALITY_PARTIAL_SUMMARY
 
-    anchor = data['pos'][rows[0]].copy()
+    anchor = data['center_position'][rows[0]].copy()
     center_delta, normal_sum = np.zeros(3), np.zeros(3)
     lower, upper = np.full(3, np.inf), np.full(3, -np.inf)
     mean_mach = 0. if nmach else np.nan
@@ -526,7 +533,8 @@ def _summarize(front_id, rows, data, quality, normal_tol, chunk_size):
             pos -= anchor
             area = data['area'][part]
             weights = area/area_sum if reliable_area else np.full(len(part), 1./n)
-            center_delta += np.sum(pos*weights[:, None], axis=0)
+            fitted = data['center_position'][part]-anchor
+            center_delta += np.sum(fitted*weights[:, None], axis=0)
             half = data['dx'][part, None]*.5
             lower = np.minimum(lower, np.min(pos-half, axis=0))
             upper = np.maximum(upper, np.max(pos+half, axis=0))
