@@ -1,0 +1,8 @@
+__pycache__/
+.matplotlib-cache/
+local_check/
+demo_output/
+*_diagnostics/
+*_preflight/
+snapshot_metadata.csv
+snapshot_metadata.provenance.json
