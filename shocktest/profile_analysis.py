@@ -15,11 +15,6 @@ def save_profiles(path, result, metadata=None):
         normal=result.normal[rows],
         width=result.dx[rows],
         input_row=result.selected_indices[rows],
-        mach_temperature=(
-            result.mach_temperature[rows]
-            if result.mach_temperature is not None
-            else np.full(len(rows), np.nan)
-        ),
     )
     for name in (
         "temperature",

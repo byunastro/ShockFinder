@@ -111,7 +111,9 @@ def shock_front_catalog(result, dissipation=None, *, return_labels=False,
     gap_factor=0: disabled. Positive values extend reach by larger dx * factor,
         still subject to Mach/normal/tangential checks; accepted gaps flag 16.
     min_mach=1: lower Mach threshold (exclusive for finite values).
-    require_mach_consistent=False: opt in to saved consistency diagnostics.
+    require_mach_consistent=False: historical saved consistency diagnostics only;
+        new profile results do not provide them. Select profile-quality rows
+        explicitly when constructing a quality-selected front catalog.
     atol=1e-9 (kpc), rtol=1e-7: absolute/relative contact tolerances.
     normal_tolerance=1e-6: weighted normal resultant threshold; cancellation
         returns NaN normal, retaining the front.

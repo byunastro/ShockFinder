@@ -148,7 +148,6 @@ def compute_dissipation(
     *,
     gamma: float | None = None,
     mu: float | None = None,
-    temperature_floor: float | None = None,
     area_mode: str = "normal",
     _compact: bool = False,
 ):
@@ -167,9 +166,8 @@ def compute_dissipation(
 
     gamma = result.gamma if gamma is None else float(gamma)
     mu = getattr(result,'mean_molecular_weight',.59) if mu is None else float(mu)
-    temperature_floor = result.temperature_floor if temperature_floor is None else float(temperature_floor)
-    if not np.isclose(gamma, result.gamma) or not np.isclose(temperature_floor, result.temperature_floor):
-        raise ValueError("dissipation gamma and temperature_floor must match detection settings")
+    if not np.isclose(gamma, result.gamma):
+        raise ValueError("dissipation gamma must match detection settings")
     if not np.isfinite(mu) or mu <= 0:
         raise ValueError("mu must be finite and positive")
     center_selection = np.flatnonzero(result.shock) if _compact else None
@@ -212,7 +210,11 @@ def compute_dissipation(
             canonical_temperature = np.asarray(cell['T', 'K'])[upstream_rows]
             temp1 = temp1 * (canonical_temperature / native_temperature)
     temp1 = np.asarray(temp1, dtype=np.float64)
-    temp1 = np.maximum(temp1, float(temperature_floor))
+    # Preserve a stored floor only when reproducing historical temperature-jump
+    # results. New profile states are used directly, without a configurable floor.
+    if getattr(result,'mach_estimator','temperature_jump') != 'profile_pressure':
+        historical_floor=getattr(result,'temperature_floor',0.0)
+        if historical_floor:temp1=np.maximum(temp1,float(historical_floor))
     rho1 = np.asarray(rho1, dtype=np.float64)
     if getattr(result,'mach_estimator','temperature_jump')=='profile_pressure' and result.dx is not None:
         length_factor={'km':1.,'kpc':KPC/1e5,'Mpc':KPC/1e2}[result.position_unit]
@@ -296,7 +298,6 @@ def make_shock_maps(
     progress_interval: int = 0,
     gamma: float = 5.0 / 3.0,
     mu: float | None = None,
-    temperature_floor: float | None = None,
     area_mode: str = "normal",
     valid_mach=None,
     fill_gaps: int = 0,
@@ -304,7 +305,9 @@ def make_shock_maps(
 ):
     """Convenience wrapper returning both ``machmap`` and ``disspEmap``.
 
-    ``valid_mach`` overrides the default ``result.mach_consistent`` selection.
+    New profile results default to all tentative detections. ``valid_mach``
+    supplies an explicit analysis mask; historical archives can retain their
+    saved ``mach_consistent`` selection.
     ``fill_gaps`` is a display-only, narrow-gap inpainting width in pixels; it
     defaults to zero so quantitative maps remain untouched.
     ``backend="auto"`` uses the Fortran rasterizer when it is available.
@@ -326,7 +329,6 @@ def make_shock_maps(
             result,
             gamma=gamma,
             mu=mu,
-            temperature_floor=temperature_floor,
             area_mode=area_mode,
         )
     if extent is None:

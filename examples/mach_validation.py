@@ -1,8 +1,8 @@
-"""Plot and summarize ShockFinder Mach cross-validation diagnostics.
+"""Inspect secondary Mach diagnostics in HISTORICAL saved results only.
 
-Call ``plot_mach_validation(result)`` after running a finder with its default
-``validate_mach=True``.  The function returns aggregate reason counts and AMR
-level pass rates in addition to creating the four-panel diagnostic figure.
+Current profile reconstruction does not generate these arrays or accept
+validate_mach/filter_inconsistent settings. Use sampling profile quality flags
+for current outputs. This module remains for reading older research products.
 """
 
 from __future__ import annotations

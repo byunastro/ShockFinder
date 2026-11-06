@@ -143,6 +143,10 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
         value = getattr(result, field.name)
         if field.name not in excluded and keep(field.name) and isinstance(value, np.ndarray):
             columns[field.name] = value[rows]
+    # Historical diagnostics exist only on objects restored from old archives.
+    for name,value in getattr(result,'__dict__',{}).items():
+        if name not in excluded and keep(name) and isinstance(value,np.ndarray):
+            if value.ndim and len(value)==len(result.mach):columns[name]=value[rows]
     if _validation is not None:
         for field in fields(_validation):
             value = getattr(_validation, field.name)
@@ -210,7 +214,7 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
     metadata = {
         'profile': profile, 'index_dtype': index_dtype,
         'mach_estimator': getattr(result,'mach_estimator','temperature_jump'),
-        'gamma': result.gamma, 'temperature_floor': result.temperature_floor,
+        'gamma': result.gamma,
         'mean_molecular_weight': getattr(result,'mean_molecular_weight',.59),
         'position_unit': result.position_unit, 'endpoint_index_space': 'input_table',
         'group_index_space': 'snapshot_front_id',
@@ -235,4 +239,6 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
             'velocity': 'km/s', 'shock_speed_mass':'km/s', 'shock_speed_pressure':'km/s',
             'center_sensitivity':result.position_unit,'center_model_range':result.position_unit,
         }
+    if hasattr(result,'temperature_floor'):
+        metadata['temperature_floor']=result.temperature_floor  # Historical archive only.
     return ShockSamples(columns, groups, metadata, dict(timings or {}))

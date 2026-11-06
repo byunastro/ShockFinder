@@ -1,10 +1,8 @@
-"""Rankine--Hugoniot Mach estimators and cross-validation helpers.
+"""Standalone RH jump conversions and historical validation-bit definitions.
 
-Profile reconstruction adopts the pressure-jump Mach. Temperature and density
-jumps provide additional diagnostics for ideal, adiabatic,
-hydrodynamic shocks.  In particular, the density jump approaches the finite
-strong-shock compression ``(gamma + 1) / (gamma - 1)`` and is consequently a
-poor high-Mach estimator.
+These helpers are not called by the current profile detector. They remain for
+manual analysis and reading historical archives. Profile reconstruction stores
+physical density/velocity/conservation residuals instead of secondary Machs.
 """
 
 from __future__ import annotations

@@ -46,7 +46,7 @@ def make_mach_map(
     ``machmap = painter.make_mach_map(result, plane="xy")``.
     The default ``method="amr"`` paints each projected AMR cell footprint into
     the image. ``method="point"`` keeps the older center-binning behavior.
-    By default, ``result.mach_consistent`` is used as the validation mask when
+    For historical results, ``result.mach_consistent`` is used as the mask when
     it is available. Pass ``valid_mach`` explicitly to override that mask.
     Empty pixels are returned as NaN. Pass per-cell ``weights`` with
     ``statistic="mean"`` to make an area- and weight-averaged Mach map, for
@@ -113,7 +113,7 @@ def make_disspE_map(
     produced by ``pyShockFinder.compute_dissipation``. The default
     ``method="amr"`` paints each projected AMR shock-cell footprint into the
     image. ``method="point"`` keeps the older center-binning behavior. By
-    default, ``result.mach_consistent`` is used as the validation mask when it
+    default, historical ``result.mach_consistent`` is used as the mask when it
     exists; pass ``valid_mach`` explicitly to override it. ``fill_gaps`` has
     the same conservative, display-only meaning as in :func:`make_mach_map`.
     ``backend`` selects the same automatic Fortran/Python rasterizer.

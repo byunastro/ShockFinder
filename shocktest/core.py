@@ -22,13 +22,26 @@ _VALIDATION_BITS = {
 }
 
 
+# Read/resave historical pickles without allocating these arrays in new results.
+_LEGACY_RESULT_FIELDS = (
+    'mach_temperature', 'mach_pressure', 'mach_density', 'temperature_ratio',
+    'pressure_ratio', 'density_ratio', 'pressure_check_valid', 'pressure_consistent',
+    'density_check_valid', 'density_consistent', 'density_check_applicable',
+    'mach_consistent', 'mach_validation_status', 'temperature_floor',
+)
+
+
+class _HistoricalResultState:
+    __slots__ = ('__dict__',)
+
+
 @dataclass(slots=True)
-class ShockResult:
+class ShockResult(_HistoricalResultState):
     """One row per retained AMR cell.
 
     ``mach`` is the adopted pressure-jump Mach from profile reconstruction.
     ``pos`` retains leaf centers; ``center_position`` holds fitted shock centers.
-    Temperature- and density-jump Mach numbers are diagnostic estimates.
+    New results contain the adopted Mach and sparse physical quality diagnostics.
     """
 
     mach: np.ndarray
@@ -43,22 +56,7 @@ class ShockResult:
     level: np.ndarray | None = None
     zone_width: np.ndarray | None = None
     diagnostics: dict[str, int] | None = None
-    mach_temperature: np.ndarray | None = None
-    mach_pressure: np.ndarray | None = None
-    mach_density: np.ndarray | None = None
-    temperature_ratio: np.ndarray | None = None
-    pressure_ratio: np.ndarray | None = None
-    density_ratio: np.ndarray | None = None
-    pressure_check_valid: np.ndarray | None = None
-    pressure_consistent: np.ndarray | None = None
-    density_check_valid: np.ndarray | None = None
-    density_consistent: np.ndarray | None = None
-    density_check_applicable: np.ndarray | None = None
-    mach_consistent: np.ndarray | None = None
-    mach_validation_status: np.ndarray | None = None
-
     gamma: float = 5.0 / 3.0
-    temperature_floor: float = 0.0
     position_unit: str = "km"
     temperature_unit: str = "K"
     density_unit: str = "Msol/kpc3"
@@ -81,6 +79,7 @@ class ShockResult:
         """
         state = {f.name: getattr(self, f.name) for f in fields(self)
                  if hasattr(self, f.name)}
+        state.update(vars(self))
         status = state.get('mach_validation_status')
         if isinstance(status, np.ndarray) and status.ndim == 1:
             for name, bit in _VALIDATION_BITS.items():
@@ -110,6 +109,8 @@ class ShockResult:
             self.density_unit = 'Msol/kpc3'
         if 'sampling_tolerance' not in values:
             self.sampling_tolerance = 0.01
+        if not any(name in values for name in _LEGACY_RESULT_FIELDS):
+            return
         status = values.get('mach_validation_status')
         for name, bit in _VALIDATION_BITS.items():
             if name not in values:
@@ -142,19 +143,7 @@ class ShockResult:
         self.level = None
         self.zone_width = None
         self.diagnostics = None
-        self.mach_temperature = None
-        self.mach_pressure = None
-        self.mach_density = None
-        self.temperature_ratio = None
-        self.pressure_ratio = None
-        self.density_ratio = None
-        self.pressure_check_valid = None
-        self.pressure_consistent = None
-        self.density_check_valid = None
-        self.density_consistent = None
-        self.density_check_applicable = None
-        self.mach_consistent = None
-        self.mach_validation_status = None
+        self.__dict__.clear()
         self.sampling = None
         self.center_position = None
         gc.collect()
@@ -167,7 +156,6 @@ class ShockFinder:
         self.maxlevel = 20
         self.minlevel = 0
         self.gamma = 5.0 / 3.0
-        self.temperature_floor = 0.0
         self.min_temperature = None
         self.min_density = None
         self.max_density = None
@@ -186,15 +174,6 @@ class ShockFinder:
         self.boundary = "open"
         self.neighbor_backend = "fortran"
         self.neighbor_cache_dir: str | None = None
-        self.validate_mach = True
-        self.filter_inconsistent = False
-        self.consistency_factor = 1.5
-        self.density_check_max_mach = 3.0
-        self.density_saturation_rtol = 1.0e-6
-        # Controls the stored pressure/density Mach and jump-ratio arrays, and
-        # the arithmetic used to derive them. The adopted profile-pressure Mach
-        # remains float64; temperature Mach is an independent diagnostic.
-        self.mach_validation_dtype = np.float64
         # Exact integer narrowing is opt-in; floating-point physics is unchanged.
         self.index_dtype = "int64"
         # Set this to the exact mapping key (including a unit tuple, if used)
@@ -238,8 +217,7 @@ class ShockFinder:
         analysis_start = time.perf_counter()
         if compact_options is not None and not compact:
             raise ValueError("compact_options requires compact=True")
-        validation_sink = {} if compact else None
-        result, neighbor_tables, timings = self._find_internal(cell, validation_sink=validation_sink)
+        result, neighbor_tables, timings = self._find_internal(cell)
         # Catalogs use the same saved-geometry path, with or without analyze.
         del neighbor_tables
         dissipation = None
@@ -253,12 +231,9 @@ class ShockFinder:
                     "dissipation gamma must match finder.gamma for a physically "
                     "consistent single-pass analysis"
                 )
-            if "temperature_floor" in options and not np.isclose(
-                float(options["temperature_floor"]), float(self.temperature_floor)
-            ):
-                raise ValueError("dissipation temperature_floor must match finder.temperature_floor")
+            if "temperature_floor" in options:
+                raise ValueError("temperature_floor is removed; profile states are not floored")
             options["gamma"] = float(self.gamma)
-            options["temperature_floor"] = float(self.temperature_floor)
             dissipation = make_dissipation(
                 cell, result, _compact=compact, **options
             )
@@ -273,7 +248,6 @@ class ShockFinder:
             compact_start = time.perf_counter()
             samples = compact_shocks(
                 result, dissipation, timings=timings,
-                _validation=validation_sink.get("result"),
                 _compact_dissipation=True, **(compact_options or {}),
             )
             timings['compact'] = time.perf_counter() - compact_start
@@ -320,7 +294,7 @@ class ShockFinder:
         result, _, _ = self._find_internal(cell)
         return result
 
-    def _find_internal(self, cell: Any, *, validation_sink=None):
+    def _find_internal(self, cell: Any):
         total_start = time.perf_counter()
         timings: dict[str, float] = {}
         self._validate_settings()
@@ -382,246 +356,18 @@ class ShockFinder:
             sampling['background_model_count']=np.array([f['model_count'] for f in fits],dtype=np.int32)
             sampling['profile_quality_flags']=np.array([f['quality_flags'] for f in fits],dtype=np.uint16)
             sampling['quality_clear']=sampling['profile_quality_flags']==0
-        if pressure is not None:sampling['validation_pressure']=sampling['pressure']
         result=ShockResult(mach=mach,shock=shock,center_index=centers,upstream_index=up,
                            downstream_index=down,selected_indices=selected_indices,
                            pos=arrays['pos'],center_position=positions,dx=arrays['dx'],normal=normal,
                            level=arrays['level'],zone_width=zone,sampling=sampling,diagnostics=diagnostics)
-        result.gamma=float(self.gamma);result.temperature_floor=float(self.temperature_floor)
+        result.gamma=float(self.gamma)
         result.position_unit=self.position_unit;result.temperature_unit=self.temperature_unit
         result.density_unit=self.density_unit;result.sampling_tolerance=self.sampling_tolerance
         result.mach_estimator='profile_pressure'
         result.mean_molecular_weight=float(self.mean_molecular_weight)
-        if self.validate_mach:self._validate_result(cell,arrays,result,validation_sink)
         timings['scan']=time.perf_counter()-total_start-timings['input']
         timings['neighbors']=0.;timings['detection_total']=time.perf_counter()-total_start
         return result,(None,None,None),timings
-
-    def _validate_result(self, cell, arrays, result, validation_sink):
-        if validation_sink is None:
-            self._populate_mach_validation(cell, arrays, result)
-            return
-        # Internal validation has one row per detected center while endpoint
-        # indices still address the retained input mesh. Never expose this view
-        # as a dense ShockResult; compact_shocks consumes its diagnostic columns.
-        rows = np.flatnonzero(result.shock)
-        validation = ShockResult(
-            mach=result.mach[rows], shock=np.ones(rows.size, dtype=bool),
-            center_index=result.center_index[rows],
-            upstream_index=result.upstream_index[rows],
-            downstream_index=result.downstream_index[rows],
-            selected_indices=result.selected_indices,
-        )
-        if result.sampling is not None:
-            validation.sampling = dict(result.sampling)
-            validation.sampling["rows"] = np.arange(rows.size, dtype=np.int64)
-        self._populate_mach_validation(cell, arrays, validation)
-        if self.filter_inconsistent:
-            result.shock[rows] = validation.shock
-        validation_sink["result"] = validation
-
-    def _populate_mach_validation(
-        self,
-        cell: Any,
-        arrays: dict[str, np.ndarray],
-        result: ShockResult,
-    ) -> None:
-        """Attach jump estimators and consistency flags to ``result``.
-
-        Calculations are vectorized over detected centers only.  The full-size
-        output arrays make masks align with every other ``ShockResult`` field,
-        while non-shock rows remain NaN/False/zero.
-        """
-
-        from .mach_validation import (
-            MachValidationFlag,
-            density_saturation_mask,
-            jump_ratio,
-            mach_from_density_ratio,
-            mach_from_pressure_ratio,
-        )
-
-        n = result.mach.size
-        validation_dtype = np.dtype(self.mach_validation_dtype)
-        nan_values = lambda: np.full(n, np.nan, dtype=validation_dtype)
-        mach_pressure = nan_values()
-        mach_density = nan_values()
-        temperature_ratio = nan_values()
-        pressure_ratio = nan_values()
-        density_ratio = nan_values()
-        pressure_valid = np.zeros(n, dtype=bool)
-        pressure_consistent = np.zeros(n, dtype=bool)
-        density_valid = np.zeros(n, dtype=bool)
-        density_consistent = np.zeros(n, dtype=bool)
-        density_applicable = np.zeros(n, dtype=bool)
-        mach_consistent = np.zeros(n, dtype=bool)
-        status = np.zeros(n, dtype=np.uint16)
-
-        rows = np.nonzero(result.shock)[0]
-        if rows.size:
-            upstream = result.upstream_index[rows]
-            downstream = result.downstream_index[rows]
-            endpoints_ok = (
-                (upstream >= 0)
-                & (upstream < arrays["temp"].size)
-                & (downstream >= 0)
-                & (downstream < arrays["temp"].size)
-            )
-            bad_rows = rows[~endpoints_ok]
-            status[bad_rows] |= np.uint16(MachValidationFlag.ENDPOINT_INVALID)
-            valid_rows = rows[endpoints_ok]
-            up = upstream[endpoints_ok]
-            down = downstream[endpoints_ok]
-
-            if valid_rows.size:
-                sampling = result.sampling
-                if sampling is not None:
-                    slots = np.searchsorted(sampling["rows"], valid_rows)
-                    if (np.any(slots >= len(sampling["rows"]))
-                            or not np.array_equal(sampling["rows"][slots], valid_rows)):
-                        raise ValueError("sampled states are missing detected centers")
-                    temp1_raw = sampling["temperature"][slots, 0]
-                    temp2 = sampling["temperature"][slots, 1]
-                    rho1 = sampling["density"][slots, 0]
-                    rho2 = sampling["density"][slots, 1]
-                    pressure_from_rho_t = "validation_pressure" not in sampling
-                    sampled_pressure = sampling.get("validation_pressure", sampling["pressure"])[slots]
-                    pressure_ratio[valid_rows] = jump_ratio(
-                        sampled_pressure[:, 0], sampled_pressure[:, 1], dtype=validation_dtype,
-                    )
-                else:
-                    # Legacy/supplied results still refer directly to cell values.
-                    temp1_raw = arrays["temp"][up]
-                    temp2 = arrays["temp"][down]
-                    rho1 = arrays["rho"][up]
-                    rho2 = arrays["rho"][down]
-                    pressure, pressure_from_rho_t = self._thermal_pressure_values(
-                        cell, result.selected_indices, arrays, dtype=validation_dtype,
-                        endpoint_rows=np.concatenate((up, down)),
-                    )
-                    if pressure is None:
-                        pressure_ratio[valid_rows] = jump_ratio(
-                            rho1 * temp1_raw, rho2 * temp2, dtype=validation_dtype,
-                        )
-                    else:
-                        pressure_ratio[valid_rows] = jump_ratio(
-                            pressure[:up.size], pressure[up.size:], dtype=validation_dtype,
-                        )
-                temp1 = np.maximum(temp1_raw, float(self.temperature_floor))
-                temperature_ratio[valid_rows] = jump_ratio(temp1, temp2, dtype=validation_dtype)
-                density_ratio[valid_rows] = jump_ratio(rho1, rho2, dtype=validation_dtype)
-
-                mach_pressure[valid_rows] = mach_from_pressure_ratio(
-                    pressure_ratio[valid_rows],
-                    self.gamma,
-                    dtype=validation_dtype,
-                )
-                mach_density[valid_rows] = mach_from_density_ratio(
-                    density_ratio[valid_rows],
-                    self.gamma,
-                    saturation_rtol=self.density_saturation_rtol,
-                    dtype=validation_dtype,
-                )
-
-                mt = result.mach[valid_rows]
-                mp = mach_pressure[valid_rows]
-                md = mach_density[valid_rows]
-                p_valid = np.isfinite(mp) & (mp > 1.0)
-                d_valid = np.isfinite(md) & (md > 1.0)
-                saturated = density_saturation_mask(
-                    density_ratio[valid_rows],
-                    self.gamma,
-                    saturation_rtol=self.density_saturation_rtol,
-                    dtype=validation_dtype,
-                )
-                factor = float(self.consistency_factor)
-                p_consistent = (
-                    p_valid & (mp >= mt / factor) & (mp <= mt * factor)
-                )
-                # A saturated density estimate is explicitly not applicable.
-                # Other invalid low-Mach density jumps remain applicable and
-                # fail, rather than being silently promoted to trusted shocks.
-                d_applicable = ~saturated & np.where(
-                    d_valid,
-                    np.minimum(mt, md) < float(self.density_check_max_mach),
-                    mt < float(self.density_check_max_mach),
-                )
-                d_consistent = (
-                    d_applicable
-                    & d_valid
-                    & (md >= mt / factor)
-                    & (md <= mt * factor)
-                )
-                overall = p_valid & p_consistent & (
-                    ~d_applicable | (d_valid & d_consistent)
-                )
-
-                pressure_valid[valid_rows] = p_valid
-                pressure_consistent[valid_rows] = p_consistent
-                density_valid[valid_rows] = d_valid
-                density_applicable[valid_rows] = d_applicable
-                density_consistent[valid_rows] = d_consistent
-                mach_consistent[valid_rows] = overall
-                self._set_validation_flag(
-                    status, valid_rows[p_valid], MachValidationFlag.PRESSURE_VALID
-                )
-                self._set_validation_flag(
-                    status,
-                    valid_rows[p_consistent],
-                    MachValidationFlag.PRESSURE_CONSISTENT,
-                )
-                if pressure_from_rho_t:
-                    self._set_validation_flag(
-                        status,
-                        valid_rows,
-                        MachValidationFlag.PRESSURE_FROM_RHO_T,
-                    )
-                self._set_validation_flag(
-                    status, valid_rows[d_valid], MachValidationFlag.DENSITY_VALID
-                )
-                self._set_validation_flag(
-                    status,
-                    valid_rows[d_applicable],
-                    MachValidationFlag.DENSITY_APPLICABLE,
-                )
-                self._set_validation_flag(
-                    status,
-                    valid_rows[d_consistent],
-                    MachValidationFlag.DENSITY_CONSISTENT,
-                )
-                self._set_validation_flag(
-                    status,
-                    valid_rows[saturated],
-                    MachValidationFlag.DENSITY_SATURATED,
-                )
-                self._set_validation_flag(
-                    status,
-                    valid_rows[overall],
-                    MachValidationFlag.MACH_CONSISTENT,
-                )
-
-        from .mach_validation import mach_from_temperature_ratio
-        result.mach_temperature = mach_from_temperature_ratio(temperature_ratio,self.gamma,dtype=validation_dtype)
-        result.mach_pressure = mach_pressure
-        result.mach_density = mach_density
-        result.temperature_ratio = temperature_ratio
-        result.pressure_ratio = pressure_ratio
-        result.density_ratio = density_ratio
-        result.pressure_check_valid = pressure_valid
-        result.pressure_consistent = pressure_consistent
-        result.density_check_valid = density_valid
-        result.density_consistent = density_consistent
-        result.density_check_applicable = density_applicable
-        result.mach_consistent = mach_consistent
-        result.mach_validation_status = status
-
-        if self.filter_inconsistent:
-            result.shock &= mach_consistent
-
-    @staticmethod
-    def _set_validation_flag(status, rows, flag) -> None:
-        if rows.size:
-            status[rows] |= np.uint16(flag)
 
     def _thermal_pressure_values(
         self,
@@ -731,8 +477,6 @@ class ShockFinder:
             raise ValueError("index_dtype must be 'int64' or 'auto'")
         if not np.isfinite(self.gamma) or self.gamma <= 1.0:
             raise ValueError("gamma must be finite and greater than 1")
-        if not np.isfinite(self.temperature_floor) or self.temperature_floor != 0.0:
-            raise ValueError("temperature_floor must be zero for profile-pressure reconstruction")
         if not np.isfinite(self.min_mach) or self.min_mach < 1.0:
             raise ValueError("min_mach must be finite and at least 1")
         if not np.isfinite(self.mean_molecular_weight) or self.mean_molecular_weight<=0:
@@ -741,44 +485,14 @@ class ShockFinder:
             raise ValueError('profile_batch_size must be a positive integer')
         for name in ('center_normal_cosine','center_plateau_tolerance','max_center_steps','max_steps','method'):
             if hasattr(self,name):raise ValueError(f'{name} is removed: Profile reconstruction is the only estimator')
+        for name in ('temperature_floor','validate_mach','filter_inconsistent','consistency_factor',
+                     'density_check_max_mach','density_saturation_rtol','mach_validation_dtype'):
+            if hasattr(self,name):
+                raise ValueError(f'{name} is removed: use unfloored profile states and profile quality diagnostics')
         if int(self.minlevel) > int(self.maxlevel):
             raise ValueError("minlevel must not exceed maxlevel")
         if self.neighbor_backend not in {"fortran", "numpy"}:
             raise ValueError("neighbor_backend must be 'fortran' or 'numpy'")
-        if not isinstance(self.validate_mach, (bool, np.bool_)):
-            raise ValueError("validate_mach must be boolean")
-        if not isinstance(self.filter_inconsistent, (bool, np.bool_)):
-            raise ValueError("filter_inconsistent must be boolean")
-        if self.filter_inconsistent and not self.validate_mach:
-            raise ValueError("filter_inconsistent requires validate_mach=True")
-        if (
-            not np.isfinite(self.consistency_factor)
-            or self.consistency_factor < 1.0
-        ):
-            raise ValueError("consistency_factor must be finite and at least 1")
-        if (
-            not np.isfinite(self.density_check_max_mach)
-            or self.density_check_max_mach <= 1.0
-        ):
-            raise ValueError(
-                "density_check_max_mach must be finite and greater than 1"
-            )
-        if (
-            not np.isfinite(self.density_saturation_rtol)
-            or not 0.0 <= self.density_saturation_rtol < 1.0
-        ):
-            raise ValueError(
-                "density_saturation_rtol must be finite and in [0, 1)"
-            )
-        try:
-            validation_dtype = np.dtype(self.mach_validation_dtype)
-        except TypeError as exc:
-            raise ValueError(
-                "mach_validation_dtype must be float32 or float64"
-            ) from exc
-        if validation_dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
-            raise ValueError("mach_validation_dtype must be float32 or float64")
-
     def _extract_amr_arrays(self, cell: Any) -> dict[str, np.ndarray]:
         x = self._field(cell, (("x", self.position_unit), "x"))
         y = self._field(cell, (("y", self.position_unit), "y"))

@@ -1,6 +1,6 @@
 import sys as _sys
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 from ._native import load_extension as _load_extension
 

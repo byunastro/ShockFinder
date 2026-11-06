@@ -73,7 +73,6 @@ finder.minlevel = 0                  # Lowest retained AMR level.
 finder.maxlevel = 20                 # Highest retained AMR level.
 
 # Thermodynamics and candidate selection.
-finder.temperature_floor = 0.0       # Must remain zero for profile reconstruction.
 finder.mean_molecular_weight = 0.59   # EOS and sound-speed mean molecular weight.
 finder.min_temperature = None        # Optional seed-cell lower T cut [K]; None disables it.
 finder.min_density = None            # Optional seed-cell lower density cut [Msol/kpc3].
@@ -90,12 +89,6 @@ finder.density_unit = "Msol/kpc3"     # Gas mass density.
 finder.thermal_pressure_field = None # Infer thermal pressure from rho, T, and mu if absent.
 finder.thermal_pressure_unit = "erg/cm3"  # Unit of an explicitly supplied thermal pressure.
 
-# Saved diagnostic Mach estimates and optional post-filtering.
-finder.validate_mach = True          # Attach temperature/density estimates and jump diagnostics.
-finder.filter_inconsistent = False   # True removes failed checks from result.shock only.
-finder.consistency_factor = 1.5      # Diagnostic comparison to adopted Mach within a factor f.
-finder.density_check_max_mach = 3.0   # Restrict density consistency checks to weak shocks.
-
 # Memory and progress controls.
 finder.profile_batch_size = 32       # Limit temporary profile-sampling arrays.
 finder.show_progress = False         # Print input and profile-batch progress.
@@ -105,13 +98,12 @@ print("Detected centers:", result.shock.sum())
 ```
 
 The adopted Mach number comes from reconstructed **thermal pressure** states,
-with `result.mach_estimator == 'profile_pressure'`. Temperature Mach is a separate
-diagnostic, not an alias of `result.mach`. The pressure consistency flag reuses
-the adopted pressure jump and is **not an independent validation**. With
-`filter_inconsistent=False`, saved consistency diagnostics do not alter the
-shock mask; the profile's entropy and velocity-closure tests still apply.
-With filtering enabled, Mach values and support indices remain
-available for auditing rejected centers: always select using `result.shock`.
+with `result.mach_estimator == 'profile_pressure'`. The finder checks positive
+entropy production and the normal velocity jump internally. Density, momentum,
+and energy residuals and background sensitivity remain in `result.sampling`.
+It does not calculate secondary temperature/density Mach numbers or apply the
+old Mach-consistency post-filter. Always select using `result.shock` and state
+any additional profile-quality selection explicitly.
 
 Level cuts change the retained mesh, so overly restrictive cuts can remove
 needed neighbors. Temperature/density cuts affect only detection seeds: other
@@ -158,7 +150,11 @@ The detector does not use a velocity-divergence minimum as its final center,
 an intercell normal-dot-product gate, a two/four-crossing switch, or a
 temperature floor. Setting the removed `center_normal_cosine`,
 `center_plateau_tolerance`, `max_center_steps`, `max_steps`, or `method`
-attributes raises an error. Positive `temperature_floor` values also raise an error.
+attributes raises an error. `temperature_floor` is removed, including a zero
+assignment: reconstructed states are used without a floor. The removed
+`validate_mach`, `filter_inconsistent`, `consistency_factor`,
+`density_check_max_mach`, `density_saturation_rtol`, and `mach_validation_dtype`
+settings also raise migration errors when assigned.
 
 `finder.analyze` combines detection, optional dissipation, and optional catalog
 construction. Set `compute_dissipation` and `build_catalog` independently.
@@ -211,7 +207,7 @@ Catalog options
 | `connectivity` | `'touch'` | Faces/edges/corners; `'face'` requires positive face overlap |
 | `gap_factor` | 0 | Optional extra reach in units of larger cell width; disabled by default |
 | `min_mach` | 1 | Finite Mach must be strictly greater than this threshold |
-| `require_mach_consistent` | False | Require saved Mach-consistency diagnostics |
+| `require_mach_consistent` | False | Historical archives only; new results do not contain these diagnostics |
 | `return_labels` | False | Return `(catalog, labels)` instead of only the catalog |
 | `atol`, `rtol` | 1e-9 kpc, 1e-7 | Absolute/relative spatial contact tolerances |
 | `normal_tolerance` | 1e-6 | Minimum mean-normal resultant before normalization |
@@ -277,10 +273,10 @@ pressure should describe the same gas; total MHD/CR pressure is not a substitute
 | `zone_width` | Distance between background support positions, in position units |
 | `sampling` | Sparse one-sided fitted states, support geometry, and fit diagnostics, aligned through `sampling['rows']` |
 | `diagnostics` | Counts of seeds, rejected profiles, duplicate leaf models, and accepted centers |
-| `gamma`, `mean_molecular_weight`, `temperature_floor`, `position_unit`, `temperature_unit`, `density_unit`, `pressure_unit` | Measurement settings and units; reconstructed pressure is in erg/cm3 |
+| `gamma`, `mean_molecular_weight`, `position_unit`, `temperature_unit`, `density_unit`, `pressure_unit` | Measurement settings and units; reconstructed pressure is in erg/cm3 |
 
-Mach and normals are zero outside detected centers. Filtering inconsistent
-centers changes the mask, not their stored measurements. For position accuracy,
+Mach and normals are zero outside detected centers. Additional analysis masks
+do not change the stored measurements. For position accuracy,
 use `center_position`, not `pos`: the latter remains the containing leaf center.
 `zone_width` is a background support span, not a measured physical shock thickness.
 
@@ -324,15 +320,15 @@ Cosmological inputs require verified physical coordinates, velocity conventions,
 thermal pressure/EOS, and source masks. A quality-clear flag alone does not
 establish completeness or the presence of a physical shock.
 
-With validation enabled, additional fields include separately computed `mach_temperature`,
-`mach_pressure` (the same pressure-jump estimate as adopted `mach`), `mach_density`, the three jump ratios,
-`pressure_check_valid`, `pressure_consistent`, `density_check_valid`,
-`density_consistent`, `density_check_applicable`, `mach_consistent`, and
-`mach_validation_status`. The latter is a bit mask described by
-`shocktest.MachValidationFlag`. Loading reconstructs
-`pressure_check_valid`, `pressure_consistent`, `density_check_valid`,
-`density_check_applicable`, `density_consistent`, and `mach_consistent` from bits
-0, 1, 3, 4, 5, and 7 respectively.
+New results and NPZ exports do not contain `mach_temperature`, `mach_density`,
+`mach_pressure`, duplicate jump-ratio arrays, or the old Mach-consistency flags.
+The measured `sampling['temperature']`, `['density']`, `['pressure']`,
+`['velocity']`, and `['profile_quality_flags']` remain available for research.
+Standalone jump-conversion functions remain available for manual analysis.
+Historical pickles retain their stored fields when loaded/resaved; this
+compatibility path does not allocate or compute diagnostics in new results.
+A stored temperature floor is honored only when reproducing dissipation from
+historical temperature-jump results, not for current profile reconstruction.
 
 | `DissipationResult` field | Meaning | Unit |
 | --- | --- | --- |
@@ -418,10 +414,11 @@ finder.min_mach = 1.5
 analysis = finder.analyze(cell, build_catalog=False)
 result, dissipation = analysis.result, analysis.dissipation
 
-# Use the same selection for both maps. This is also the painter's default policy.
+# Use the same explicit selection for both maps. New results default to all detections.
 valid = result.shock.copy()
-if result.mach_consistent is not None:
-    valid &= result.mach_consistent
+# Optional: choose a profile-quality subset explicitly, then use it for both maps.
+# s = result.sampling
+# valid[s['rows'][~s['quality_clear']]] = False
 
 extent = painter.map_extent_from_result(result, plane="xy")  # Physical km.
 map_options = dict(
