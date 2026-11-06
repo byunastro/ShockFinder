@@ -1247,7 +1247,8 @@ contains
          gamma, max_center_steps, center_normal_cosine, center_plateau_tolerance, show_progress, &
          progress_interval, n, nfine, center_mask, center_diagnostics)
     ns = count(center_mask > 0)
-    allocate(centers(ns), accepted(ns), up(ns), down(ns), m(ns), normals(ns, 3), states(ns, 2, 3), distances(ns, 2), convergence(ns, 4))
+    allocate(centers(ns), accepted(ns), up(ns), down(ns), m(ns), normals(ns, 3), &
+         states(ns, 2, 3), distances(ns, 2), convergence(ns, 4))
     j = 0
     do i = 1, n
       if (center_mask(i) == 0) cycle
