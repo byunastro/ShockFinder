@@ -65,7 +65,8 @@ contains
     real(8),intent(in)::points(ns,3),origin(3),widths(nw)
     integer,intent(out)::ids(ns)
     integer::i
-    !$omp parallel do private(i) schedule(static)
+    ! Tiny final-center lookups do not amortize an OpenMP team launch.
+    !$omp parallel do private(i) schedule(static) if(ns>=512)
     do i=1,ns
       ids(i)=locate_one(points(i,:),origin,widths,q,levels,table,n,nw,nt)
     enddo
@@ -136,6 +137,87 @@ contains
     !$omp end parallel do
   end subroutine
 
+  subroutine sample_batch_cached(points,h,origin,widths,dx,q,levels,table,values, &
+                                 n,nw,nt,nv,ns,out,nunique,nreference)
+    ! Reuse exact virtual-cell evaluations within one bounded sampling batch.
+    ! Index creation is serial; evaluation and interpolation have disjoint writes.
+    ! Keep the original corner/restriction accumulation order and boundary rules.
+    integer,intent(in)::n,nw,nt,nv,ns,levels(n),table(nt)
+    integer(8),intent(in)::q(n,3)
+    real(8),intent(in)::points(ns,3),h(ns),origin(3),widths(nw),dx(n),values(n,nv)
+    real(8),intent(out)::out(ns,nv)
+    integer,intent(out)::nunique,nreference
+    integer,allocatable::lookup(:),refs(:,:)
+    integer(8),allocatable::keys(:,:)
+    real(8),allocatable::nodes(:,:),scales(:),weights(:,:),cached(:,:)
+    real(8)::coordinate(3),near(3),low(3),fraction(3),w(3),weight
+    integer(8)::key(4),mask,hkey,hash
+    integer::i,a,b,c,bit(3),id,k,j,corner,capacity
+    nunique=0;nreference=0;out=0d0
+    if(ns==0)return
+    capacity=1
+    do while(capacity<16*ns)
+      capacity=capacity*2
+    enddo
+    mask=int(capacity-1,8)
+    allocate(lookup(capacity),refs(8,ns),keys(4,8*ns),nodes(3,8*ns), &
+             scales(8*ns),weights(8,ns),cached(nv,8*ns))
+    lookup=0;refs=0;weights=0d0
+    do i=1,ns
+      if(.not.all(ieee_is_finite(points(i,:))))cycle
+      coordinate=(points(i,:)-origin)/h(i)-.5d0;near=anint(coordinate)
+      where(abs(coordinate-near)<2d-12)coordinate=near
+      low=real(floor(coordinate,kind=8),8);fraction=coordinate-low
+      corner=0
+      do a=0,1
+        do b=0,1
+          do c=0,1
+            corner=corner+1;bit=[a,b,c];w=1d0-fraction
+            where(bit==1)w=fraction
+            weight=(w(1)*w(2))*w(3)
+            if(weight<=1d-14)cycle
+            key(1:3)=int(low,8)+int(bit,8);key(4)=transfer(h(i),key(4))
+            hkey=ieor(key(4),ieor(ishft(key(4),-32),ishft(key(4),-48)))
+            hash=iand(key(1),mask)*73856093_8+iand(key(2),mask)*19349663_8 &
+                +iand(key(3),mask)*83492791_8+iand(hkey,mask)*104729_8
+            k=int(iand(hash,mask))+1
+            do
+              j=lookup(k)
+              if(j==0)then
+                nunique=nunique+1;j=nunique;lookup(k)=j;keys(:,j)=key
+                nodes(:,j)=origin+(low+real(bit,8)+.5d0)*h(i);scales(j)=h(i)
+                exit
+              endif
+              if(all(keys(:,j)==key))exit
+              k=mod(k,capacity)+1
+            enddo
+            refs(corner,i)=j;weights(corner,i)=weight;nreference=nreference+1
+          enddo
+        enddo
+      enddo
+    enddo
+    !$omp parallel do private(j) schedule(static) if(nunique>=256)
+    do j=1,nunique
+      call virtual_one(nodes(:,j),scales(j),origin,widths,dx,q,levels,table,values, &
+                       n,nw,nt,nv,0,cached(:,j))
+    enddo
+    !$omp end parallel do
+    !$omp parallel do private(i,corner,j,id) schedule(static) if(ns>=1024)
+    do i=1,ns
+      if(.not.all(ieee_is_finite(points(i,:))))then
+        out(i,:)=ieee_value(0d0,ieee_quiet_nan);cycle
+      endif
+      do corner=1,8
+        j=refs(corner,i)
+        if(j/=0)out(i,:)=out(i,:)+weights(corner,i)*cached(:,j)
+      enddo
+      id=locate_one(points(i,:),origin,widths,q,levels,table,n,nw,nt)
+      if(id==0)out(i,:)=ieee_value(0d0,ieee_quiet_nan)
+    enddo
+    !$omp end parallel do
+    deallocate(lookup,refs,keys,nodes,scales,weights,cached)
+  end subroutine
+
   subroutine derivatives(pos,dx,temperature,velocity,pressure,origin,widths,q,levels,table, &
                          n,nw,nt,div,gt,gp)
     integer,intent(in)::n,nw,nt,levels(n),table(nt)
@@ -189,7 +271,8 @@ contains
     real(8)::sides(2,6),summed(6),probe(3),distance
     integer::i,j,axis,t1,t2,side,sign,a,b,id,count
     div=0d0;gt=0d0;gp=0d0
-    !$omp parallel do private(i,j,axis,t1,t2,side,sign,a,b,id,count,sides,summed,probe,distance) schedule(static)
+    !$omp parallel do private(i,j,axis,t1,t2,side,sign,a,b,id,count,sides,summed,probe,distance) &
+    !$omp schedule(static) if(ns>=128)
     do j=1,ns
       i=indices(j)
       do axis=1,3
@@ -233,6 +316,121 @@ module profile_model_kernel
   use, intrinsic :: ieee_arithmetic
   implicit none
 contains
+  recursive real(8) function pairwise_sum(a,n) result(v)
+    ! Match NumPy's float64 contiguous pairwise reduction, including tail order.
+    integer,intent(in)::n
+    real(8),intent(in)::a(n)
+    real(8)::r(8)
+    integer::i,k,m
+    if(n<8)then
+      v=-0d0
+      do i=1,n
+        v=v+a(i)
+      enddo
+    else if(n<=128)then
+      r=a(1:8);i=9
+      do while(i<=n-mod(n,8))
+        do k=1,8
+          r(k)=r(k)+a(i+k-1)
+        enddo
+        i=i+8
+      enddo
+      v=((r(1)+r(2))+(r(3)+r(4)))+((r(5)+r(6))+(r(7)+r(8)))
+      do while(i<=n)
+        v=v+a(i);i=i+1
+      enddo
+    else
+      m=n/2;m=m-mod(m,8)
+      v=pairwise_sum(a(:m),m)+pairwise_sum(a(m+1:),n-m)
+    endif
+  end function
+
+  real(8) function polynomial(c,x) result(v)
+    real(8),intent(in)::c(3),x
+    v=c(1)+x*c(2)+x*x*c(3)
+  end function
+
+  subroutine screen_one(s,states,u,widths,derivative,peak,slope,tol,seed,gamma,closure,pinv,xg,wg,n, &
+                        coeff,vel,orders,errors,bounds,counts,roots,possible)
+    ! This kernel is deliberately a conservative rejection screen. Python
+    ! repeats all original physical checks and selection for possible models.
+    integer,intent(in)::n,peak
+    real(8),intent(in)::s(n),states(n,2),u(n),widths(n),derivative(n),slope,tol,seed,gamma,closure
+    real(8),intent(in)::pinv(4,n,n,3),xg(8),wg(8)
+    real(8),intent(out)::coeff(3,2,6,2),vel(3,6,2),errors(6,2),roots(6,6)
+    integer,intent(out)::orders(2,6,2),bounds(2,6,2),counts(2),possible(6,6)
+    real(8)::terms(n-1),total,center,a,b,up(2),down(2),ratio,rp,ent,m,re,sound,jump,vl,vr,dv,margin
+    real(8),parameter::guard=1d-10
+    integer::l,r,i,lo,hi,status
+    coeff=0;vel=0;errors=0;roots=0;orders=0;bounds=0;counts=0;possible=0
+    if(peak<1.or.peak>n)return
+    call fit_windows(s,states,u,widths,peak,-1,slope,tol,seed,pinv,n, &
+                     coeff(:,:,:,1),vel(:,:,1),orders(:,:,1),errors(:,1),bounds(:,:,1),counts(1))
+    call fit_windows(s,states,u,widths,peak,1,slope,tol,seed,pinv,n, &
+                     coeff(:,:,:,2),vel(:,:,2),orders(:,:,2),errors(:,2),bounds(:,:,2),counts(2))
+    do i=1,n-1
+      terms(i)=(s(i+1)-s(i))*(states(i+1,1)+states(i,1))/2d0
+    enddo
+    do l=1,counts(1)
+      do r=1,counts(2)
+        lo=bounds(2,l,1);hi=bounds(1,r,2)
+        if(maxval(derivative(bounds(1,l,1):bounds(2,r,2)))>derivative(peak)*(1d0+1d-10))cycle
+        a=s(lo);b=s(hi);total=pairwise_sum(terms(lo:hi-1),hi-lo)
+        call mass_root(coeff(:,1,l,1),coeff(:,1,r,2),a,b,total,seed,xg,wg,center,status)
+        if(status/=0)cycle
+        if(abs(center-s(peak))>2d0*max(widths(peak),seed))cycle
+        roots(l,r)=center
+        ! Keep borderline/nonfinite arithmetic for the reference checks.
+        possible(l,r)=1
+        up=[exp(max(-700d0,min(700d0,polynomial(coeff(:,1,l,1),center)))), &
+            polynomial(coeff(:,2,l,1),center)]
+        down=[exp(max(-700d0,min(700d0,polynomial(coeff(:,1,r,2),center)))), &
+              polynomial(coeff(:,2,r,2),center)]
+        if(.not.all(ieee_is_finite(up)).or..not.all(ieee_is_finite(down)))cycle
+        if(minval(up)<=0d0.or.minval(down)<=0d0)then
+          possible(l,r)=0;cycle
+        endif
+        ratio=down(1)/up(1);rp=down(2)/up(2)
+        if(ratio<1d0-guard.or.rp<1d0-guard)then
+          possible(l,r)=0;cycle
+        endif
+        ent=rp/ratio**gamma
+        if(.not.ieee_is_finite(ent).or.ent<=0d0)cycle
+        if(log(ent)<1d-10-guard)then
+          possible(l,r)=0;cycle
+        endif
+        m=sqrt(max(((gamma-1d0)+(gamma+1d0)*rp)/(2d0*gamma),1d0))
+        re=(gamma+1d0)*m*m/((gamma-1d0)*m*m+2d0)
+        sound=sqrt(gamma*up(2)/up(1));jump=m*sound*(1d0-1d0/re)
+        vl=polynomial(vel(:,l,1),center);vr=polynomial(vel(:,r,2),center)
+        margin=guard*max(abs(vl),abs(vr),sound,1d-300)
+        if(vl<vr-margin)then
+          possible(l,r)=0;cycle
+        endif
+        dv=abs((vl-vr)-jump)/max(abs(jump),1d-12*sound)
+        if(dv>closure+margin/max(abs(jump),1d-12*sound)+guard)possible(l,r)=0
+      enddo
+    enddo
+  end subroutine
+
+  subroutine screen_batch(s,states,u,widths,derivative,peaks,slopes,tol,seed,gamma,closure,pinv,xg,wg,n,nb, &
+                          coeff,vel,orders,errors,bounds,counts,roots,possible)
+    integer,intent(in)::n,nb,peaks(nb)
+    real(8),intent(in)::s(n),states(n,2,nb),u(n,nb),widths(n,nb),derivative(n,nb),slopes(nb)
+    real(8),intent(in)::tol,seed,gamma,closure,pinv(4,n,n,3),xg(8),wg(8)
+    real(8),intent(out)::coeff(3,2,6,2,nb),vel(3,6,2,nb),errors(6,2,nb),roots(6,6,nb)
+    integer,intent(out)::orders(2,6,2,nb),bounds(2,6,2,nb),counts(2,nb),possible(6,6,nb)
+    integer::j
+    ! Keep tiny batches serial; larger batches use the configured OpenMP team.
+    !$omp parallel do private(j) schedule(dynamic,1) if(nb>=8)
+    do j=1,nb
+      call screen_one(s,states(:,:,j),u(:,j),widths(:,j),derivative(:,j),peaks(j),slopes(j), &
+          tol,seed,gamma,closure,pinv,xg,wg,n,coeff(:,:,:,:,j),vel(:,:,:,j),orders(:,:,:,j), &
+          errors(:,:,j),bounds(:,:,:,j),counts(:,j),roots(:,:,j),possible(:,:,j))
+    enddo
+    !$omp end parallel do
+  end subroutine
+
   subroutine physical(c,ctr,scale,out)
     real(8),intent(in)::c(3),ctr,scale
     real(8),intent(out)::out(3)

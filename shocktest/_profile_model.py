@@ -46,6 +46,16 @@ def density(coeff, x):
     return np.exp(np.clip(value(coeff, x), -700, 700))
 
 
+def density_at(coeff, x):
+    """Scalar evaluation with the same clamp and NaN behavior as density."""
+    exponent = value(coeff, x)
+    if exponent < -700:
+        exponent = -700
+    elif exponent > 700:
+        exponent = 700
+    return np.exp(exponent)
+
+
 def integrate_density(coeff, a, b):
     x = (a + b) / 2 + (b - a) / 2 * XG
     return (b - a) / 2 * np.dot(WG, density(coeff, x))
@@ -53,6 +63,59 @@ def integrate_density(coeff, a, b):
 
 def pressure_mach(ratio, gamma=GAMMA):
     return np.sqrt(np.maximum(((gamma - 1) + (gamma + 1) * ratio) / (2 * gamma), 1))
+
+
+def reconstruct_batch(s, states, velocities, widths, normals, tolerance=0.01,
+                      closure_tolerance=0.15, gamma=GAMMA):
+    """Batch native work; preserve reference selection and difficult-profile fallback."""
+    result = [None] * len(states)
+    full = (np.isfinite(states).all(axis=(1,2)) & (states > 0).all(axis=(1,2))
+            & np.isfinite(velocities).all(axis=1) & np.isfinite(widths).all(axis=1))
+    if NATIVE_MODEL is None or not hasattr(NATIVE_MODEL, 'screen_batch'):
+        full[:] = False
+    for j in np.flatnonzero(~full):
+        result[j] = reconstruct(s,states[j],velocities[j],widths[j],np.zeros(3),
+                                normals[j],1.0,tolerance,closure_tolerance,gamma=gamma)
+    rows = np.flatnonzero(full)
+    if not len(rows):
+        return result
+    pressure = states[rows,:,1]
+    derivative = np.gradient(gaussian_filter1d(np.log(pressure),1,axis=1,mode='nearest'),s,axis=1)
+    pressure_gradient = np.gradient(pressure,s,axis=1)
+    peaks = np.full(len(rows),-1,dtype=np.int32)
+    slopes = np.zeros(len(rows))
+    for j in range(len(rows)):
+        candidates,_ = find_peaks(derivative[j],prominence=max(derivative[j].max()*1e-3,1e-12))
+        if not len(candidates):
+            fail('no_pressure_peak');continue
+        local = candidates[abs(s[candidates])<=4]
+        if not len(local):
+            fail('no_local_pressure_peak');continue
+        peak = local[np.argmax(derivative[j,local])]
+        if derivative[j,peak]<=0:
+            fail('negative_peak');continue
+        peaks[j]=peak
+        slopes[j]=pressure_gradient[j,abs(s-s[peak])<=2*max(1.0,widths[rows[j],peak])].max()
+    use=np.flatnonzero(peaks>=0)
+    if not len(use):
+        return result
+    selected=rows[use]
+    native = NATIVE_MODEL.screen_batch(
+        s,np.asfortranarray(states[selected].transpose(1,2,0)),
+        np.asfortranarray(velocities[selected].T),np.asfortranarray(widths[selected].T),
+        np.asfortranarray(derivative[use].T),peaks[use]+1,slopes[use],tolerance,1.0,
+        gamma,closure_tolerance,native_basis(len(s)),XG,WG)
+    for k,j in enumerate(use):
+        item=tuple(a[...,k] for a in native)
+        if not item[5].all():
+            fail('no_resolved_background');continue
+        if not item[7].any():
+            fail('no_conservative_jump_model');continue
+        original=int(rows[j])
+        result[original]=reconstruct(s,states[original],velocities[original],widths[original],
+            np.zeros(3),normals[original],1.0,tolerance,closure_tolerance,gamma=gamma,
+            _prepared=(derivative[j],int(peaks[j]),float(slopes[j]),item))
+    return result
 
 
 def reconstruct(
@@ -67,6 +130,7 @@ def reconstruct(
     closure_tolerance=0.15,
     fixed_center=None,
     gamma=GAMMA,
+    _prepared=None,
 ):
     good = (
         np.isfinite(states).all(axis=1) & np.isfinite(velocities) & np.isfinite(widths)
@@ -91,20 +155,27 @@ def reconstruct(
         return fail("nonpositive")
     step = s[1] - s[0]
     rho, p = states.T
-    derivative = np.gradient(gaussian_filter1d(np.log(p), 1, mode="nearest"), s)
-    peaks, _ = find_peaks(
-        derivative, prominence=max(derivative.max() * 1e-3, 1e-12 / seed_width)
-    )
-    if not len(peaks):
-        return fail("no_pressure_peak")
-    local_peaks = peaks[abs(s[peaks]) <= 4 * seed_width]
-    if not len(local_peaks):
-        return fail("no_local_pressure_peak")
-    peak = local_peaks[np.argmax(derivative[local_peaks])]
-    if derivative[peak] <= 0:
-        return fail("negative_peak")
-    local = abs(s - s[peak]) <= 2 * max(seed_width, widths[peak])
-    pressure_slope = np.max(np.gradient(p, s)[local])
+    if _prepared is None:
+        # Reuse trapezoid terms, not cumulative sums: each candidate interval keeps
+        # the original NumPy reduction order and therefore its rounding behavior.
+        mass_terms = np.diff(s) * (rho[1:] + rho[:-1]) / 2.0
+        derivative = np.gradient(gaussian_filter1d(np.log(p), 1, mode="nearest"), s)
+        peaks, _ = find_peaks(
+            derivative, prominence=max(derivative.max() * 1e-3, 1e-12 / seed_width)
+        )
+        if not len(peaks):
+            return fail("no_pressure_peak")
+        local_peaks = peaks[abs(s[peaks]) <= 4 * seed_width]
+        if not len(local_peaks):
+            return fail("no_local_pressure_peak")
+        peak = local_peaks[np.argmax(derivative[local_peaks])]
+        if derivative[peak] <= 0:
+            return fail("negative_peak")
+        local = abs(s - s[peak]) <= 2 * max(seed_width, widths[peak])
+        pressure_slope = np.max(np.gradient(p, s)[local])
+    else:
+        derivative, peak, pressure_slope, native = _prepared
+        mass_terms = None
 
     def physical(beta, center, scale):
         b = np.zeros(3)
@@ -202,9 +273,14 @@ def reconstruct(
 
     if NATIVE_MODEL is not None:
         def native_windows(side):
-            coeff,vel,orders,errors,bounds,count = NATIVE_MODEL.fit_windows(
-                s, states, velocities, widths, int(peak)+1, side, pressure_slope,
-                tolerance, seed_width, native_basis(len(s)))
+            if _prepared is None:
+                coeff,vel,orders,errors,bounds,count = NATIVE_MODEL.fit_windows(
+                    s, states, velocities, widths, int(peak)+1, side, pressure_slope,
+                    tolerance, seed_width, native_basis(len(s)))
+            else:
+                k = 0 if side < 0 else 1
+                coeff,vel,orders,errors,bounds = [a[...,k] for a in native[:5]]
+                count = native[5][k]
             return [(np.arange(bounds[0,k]-1,bounds[1,k]),
                      [coeff[:,0,k],coeff[:,1,k]],vel[:,k],orders[:,k],float(errors[k]))
                     for k in range(count)]
@@ -213,24 +289,31 @@ def reconstruct(
         left, right = windows(-1), windows(1)
     if not left or not right:
         return fail("no_resolved_background")
+    left = [(*f,i) for i,f in enumerate(left)]
+    right = [(*f,i) for i,f in enumerate(right)]
     candidates = []
-    pairs = [(l, r) for l in left for r in right]
-    flat_pairs = [(l, r) for l, r in pairs if not l[3].any() and not r[3].any()]
-    other_pairs = [(l, r) for l, r in pairs if l[3].any() or r[3].any()]
+    flat_pairs, other_pairs = [], []
+    left_flat = [not r[3].any() for r in left]
+    right_flat = [not r[3].any() for r in right]
+    for i, l in enumerate(left):
+        for j, r in enumerate(right):
+            (flat_pairs if left_flat[i] and right_flat[j] else other_pairs).append((l, r))
     # The original selection always prefers valid constant/constant models.
     # Evaluate those first; discarded nonconstant models cannot affect the result.
-    for pair_index, ((il, cl, ul, ol, errl), (ir, cr, ur, orr, errr)) in enumerate(
+    for pair_index, ((il, cl, ul, ol, errl, li), (ir, cr, ur, orr, errr, ri)) in enumerate(
         flat_pairs + other_pairs
     ):
         if pair_index == len(flat_pairs) and candidates:
             break
+        if _prepared is not None and not native[7][li,ri]:
+            continue
         # A weak secondary ripple must not borrow the jump of a different,
         # stronger pressure peak included in its background-fit interval.
-        if np.max(derivative[il[0] : ir[-1] + 1]) > derivative[peak] * (1 + 1e-10):
+        if derivative[il[0] : ir[-1] + 1].max() > derivative[peak] * (1 + 1e-10):
             continue
         a = s[il[-1]]
         b = s[ir[0]]
-        integral = np.trapezoid(rho[il[-1] : ir[0] + 1], s[il[-1] : ir[0] + 1])
+        integral = mass_terms[il[-1] : ir[0]].sum() if _prepared is None else 0.0
 
         def mass(c):
             return (
@@ -239,7 +322,9 @@ def reconstruct(
                 - integral
             )
 
-        if NATIVE_MODEL is not None:
+        if _prepared is not None:
+            center = native[6][li,ri]
+        elif NATIVE_MODEL is not None:
             center,status = NATIVE_MODEL.mass_root(cl[0],cr[0],a,b,integral,seed_width,XG,WG)
             if status:
                 continue
@@ -258,8 +343,8 @@ def reconstruct(
             center = float(fixed_center)
         if abs(center - s[peak]) > 2 * max(widths[peak], seed_width):
             continue
-        up = np.array([density(cl[0], center), value(cl[1], center)])
-        down = np.array([density(cr[0], center), value(cr[1], center)])
+        up = np.array([density_at(cl[0], center), value(cl[1], center)])
+        down = np.array([density_at(cr[0], center), value(cr[1], center)])
         if np.min([*up, *down]) <= 0:
             continue
         r = down[0] / up[0]

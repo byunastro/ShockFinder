@@ -1,6 +1,7 @@
 """The single production shock estimator: local profile reconstruction."""
 
 from collections import Counter
+import time
 import numpy as np
 from .profile_geometry import make_geometry
 from ._profile_model import reconstruct
@@ -93,11 +94,16 @@ def detect(arrays, finder, pressure=None):
     diagnostics = Counter(
         seed_cells=len(seeds), geometry_native=int(getattr(geometry, "native", False))
     )
+    diagnostics['geometry_cache_native'] = int(
+        hasattr(getattr(geometry, 'kernel', None), 'sample_batch_cached'))
     # All components are volume-averaged together. Momentum is divided by the
     # sampled density only AFTER conservative restriction/CIC and tube averaging.
     values = np.asfortranarray(np.column_stack((r, pr, r[:, None] * v)))
     offsets = np.arange(-12, 12.001, 0.25)
-    finished = []
+    # Keep only the current winner for each output leaf, rather than retaining
+    # every converged seed model until the entire snapshot has been scanned.
+    best = {}
+    accepted_models = 0
 
     def profiles(ids, anchors, directions):
         h = dx[ids].copy()
@@ -150,6 +156,10 @@ def detect(arrays, finder, pressure=None):
         return h, average[:, :, :2], u, covered, vector_velocity, complete
 
     batch = int(finder.profile_batch_size)
+    progress_step = (int(finder.progress_interval) if finder.progress_interval and finder.progress_interval > 0
+                     else max(1, (len(seeds) + 19) // 20))
+    next_progress = progress_step
+    progress_start = last_progress = time.monotonic()
     for start in range(0, len(seeds), batch):
         ids = seeds[start : start + batch]
         anchors = p[ids].copy()
@@ -159,20 +169,12 @@ def detect(arrays, finder, pressure=None):
             if not len(ids):
                 break
             h, states, u, covering, vector_velocity, complete = profiles(ids, anchors, direction)
+            batch_fits = profile_model.reconstruct_batch(
+                offsets, states, u, covering, direction, finder.sampling_tolerance,
+                0.15, gamma=finder.gamma)
             again = []
             for j in range(len(ids)):
-                fit = reconstruct(
-                    offsets,
-                    states[j],
-                    u[j],
-                    covering[j],
-                    np.zeros(3),
-                    direction[j],
-                    1.0,
-                    finder.sampling_tolerance,
-                    0.15,
-                    gamma=finder.gamma,
-                )
+                fit = batch_fits[j]
                 if fit is None:
                     diagnostics["profile_rejected"] += 1
                     continue
@@ -217,6 +219,9 @@ def detect(arrays, finder, pressure=None):
                     if np.any(endpoints < 0):
                         diagnostics["support_missing"] += 1
                         continue
+                    accepted_models += 1
+                    if int(cell) in best and not fit['quality'] < best[int(cell)]['quality']:
+                        continue
                     fit.update(
                         cell=int(cell),
                         point=point.copy(),
@@ -258,7 +263,7 @@ def detect(arrays, finder, pressure=None):
                     fit['quality_flags']=quality_flags(fit,bool(complete[j,active].all()))
                     fit['shock_speed_mass']*=speed_scale
                     fit['shock_speed_pressure']*=speed_scale
-                    finished.append(fit)
+                    best[int(cell)] = fit
                 else:
                     again.append((cell, point, initial[j]))
             ids = np.array([x[0] for x in again], dtype=np.int64)
@@ -266,18 +271,20 @@ def detect(arrays, finder, pressure=None):
             initial = np.array([x[2] for x in again], dtype=np.int64)
             direction = normals[ids]
         if finder.show_progress:
-            finder._progress(
-                f"Profile reconstruction: {min(start+batch,len(seeds)):,}/{len(seeds):,} seeds"
-            )
-    # Dense result compatibility: retain one best model per associated leaf.
-    best = {}
-    for fit in finished:
-        key = fit["cell"]
-        if key not in best or fit["quality"] < best[key]["quality"]:
-            best[key] = fit
-    diagnostics["duplicate_leaf_models"] = len(finished) - len(best)
+            done = min(start + batch, len(seeds))
+            now = time.monotonic()
+            if done >= next_progress or done == len(seeds) or now - last_progress >= 60:
+                elapsed = max(now - progress_start, 1e-12)
+                finder._progress(
+                    f"Profile reconstruction: {done:,}/{len(seeds):,} seeds "
+                    f"({done/elapsed:.1f} seeds/s; {len(best):,} unique centers)"
+                )
+                next_progress = done + progress_step
+                last_progress = now
+    diagnostics["duplicate_leaf_models"] = accepted_models - len(best)
     diagnostics["accepted_centers"] = len(best)
     diagnostics['quality_clear_centers']=sum(f['quality_flags']==0 for f in best.values())
     diagnostics['model_native']=int(profile_model.NATIVE_MODEL is not None)
+    diagnostics['model_batch_native']=int(hasattr(profile_model.NATIVE_MODEL,'screen_batch'))
     diagnostics['derivative_cells']=int(known.sum())
     return [best[k] for k in sorted(best)], dict(diagnostics)

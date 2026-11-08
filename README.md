@@ -146,6 +146,50 @@ selecting a scientific sample. They are diagnostics, not calibrated confidence
 levels or ground-truth shock labels. Derivatives are computed for eligible seeds
 and lazily for newly located center leaves; sampling always retains all leaves.
 
+Version 0.4.1 reuses identical virtual-cell evaluations within each native
+sampling batch. Cache keys include lattice coordinates and the exact sampling
+width; the cache is discarded after the batch, so fields cannot become stale.
+Restriction, interpolation order, profile fitting, and physical checks remain
+the same. Small lookup/derivative batches run serially to avoid OpenMP team
+overhead. This is a computational optimization for every shock orientation.
+Temporary caching is bounded to 32,768 sample points per call and can use tens
+of MiB of additional memory; it does not cache the full simulation.
+
+Rebuild after updating with `python tools/build_profile_geometry.py` and restart
+the Python process. `result.diagnostics['geometry_cache_native'] == 1` confirms
+the new native entry point is available. Older binaries remain usable through
+the original sampling kernel, but do not provide the new cache acceleration.
+
+Version 0.4.2 retains only the best converged model per output leaf during the
+scan. It preserves the original quality ranking and tie order while avoiding
+storage and export-field calculation for losing duplicate models. The number
+of seeded profiles and the physical measurement rules remain unchanged. Each
+profile also reuses its trapezoid terms across background pairs; interval sums
+retain their original reduction order, without cumulative-sum subtraction.
+Scalar density evaluation and background-order classification avoid repeated
+NumPy dispatch without changing the model selection rules. Progress
+output respects `progress_interval` (seed count), defaults to approximately 5%
+increments, and also reports after 60 seconds at the next batch boundary. It
+includes processed seeds per second and the current number of unique centers;
+it no longer prints and flushes a line for every 32-seed batch.
+
+Version 0.4.3 batches profile preprocessing and runs background fitting, mass
+roots, and conservative physical rejection in an OpenMP Fortran batch kernel.
+Borderline models and surviving candidates still pass the original Python
+physical checks, quality ranking, and diagnostic calculation. Incomplete
+profiles and fixed-center retries use the scalar path. No seeds, rays, background
+models, or physical acceptance conditions are removed. The batch kernel uses
+the same pseudoinverse tables and pairwise integral summation as the reference.
+`profile_batch_size` continues to control temporary working memory; the default
+remains 32. This is an execution change, not a selectable scientific estimator.
+
+After rebuilding and restarting Python,
+`result.diagnostics['model_batch_native'] == 1` indicates that the new native
+batch entry point is available. Older binaries automatically retain scalar
+model evaluation and do not provide this acceleration. Model-only speedups are
+not the same as end-to-end speedups: AMR sampling, input preparation and final
+result assembly remain part of a complete detection run.
+
 The detector does not use a velocity-divergence minimum as its final center,
 an intercell normal-dot-product gate, a two/four-crossing switch, or a
 temperature floor. Setting the removed `center_normal_cosine`,

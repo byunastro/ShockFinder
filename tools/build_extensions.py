@@ -95,10 +95,12 @@ def main() -> None:
                     "build_index",
                     "locate_batch",
                     "sample_batch",
+                    "sample_batch_cached",
                     "derivatives",
                     "derivatives_at",
                     "fit_windows",
                     "mass_root",
+                    "screen_batch",
                     ":",
                 ]
             if openmp_library:

@@ -218,6 +218,20 @@ class NativeLeafGeometry(LeafGeometry):
         scale = np.asfortranarray(np.broadcast_to(h, len(p)), dtype=np.float64)
         if not np.all(np.isfinite(scale) & (scale > 0)):
             raise ValueError("Sampling widths must be finite and positive")
+        # Bound the temporary cache independently of input mesh size. Old native
+        # binaries remain usable until rebuilt; they use the original kernel.
+        cached = getattr(self.kernel, 'sample_batch_cached', None)
+        if cached is not None and len(p) >= 256:
+            values = np.asfortranarray(values, dtype=np.float64)
+            # Preserve the f2py output layout: downstream reductions must keep
+            # the same floating-point accumulation path as the original kernel.
+            result = np.empty((len(p), values.shape[1]), order='F')
+            for start in range(0, len(p), 32768):
+                stop = min(start + 32768, len(p))
+                result[start:stop], _, _ = cached(
+                    p[start:stop], scale[start:stop], self.origin, self.widths,
+                    self.dx, self.q, self.levels, self.table, values)
+            return result
         return self.kernel.sample_batch(
             p,
             scale,

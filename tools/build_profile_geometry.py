@@ -32,10 +32,12 @@ cmd = [
     "build_index",
     "locate_batch",
     "sample_batch",
+    "sample_batch_cached",
     "derivatives",
     "derivatives_at",
     "fit_windows",
     "mass_root",
+    "screen_batch",
     ":",
 ]
 library = os.environ.get("SHOCKFINDER_OPENMP_LIB", "gomp")
