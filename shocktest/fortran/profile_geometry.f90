@@ -217,6 +217,116 @@ contains
     !$omp end parallel do
     deallocate(lookup,refs,keys,nodes,scales,weights,cached)
   end subroutine
+  subroutine sample_batch_reuse(points,h,origin,widths,dx,q,levels,table,values, &
+                                 cache_keys,cache_valid,cache_values,nc, &
+                                 n,nw,nt,nv,ns,out,nunique,nreference,nhit)
+    ! Persist exact virtual cells across batches in a caller-owned bounded cache.
+    ! Index creation is serial; evaluation and interpolation have disjoint writes.
+    ! Keep the original corner/restriction accumulation order and boundary rules.
+    integer,intent(in)::n,nw,nt,nv,ns,levels(n),table(nt)
+    integer(8),intent(in)::q(n,3)
+    real(8),intent(in)::points(ns,3),h(ns),origin(3),widths(nw),dx(n),values(n,nv)
+    real(8),intent(out)::out(ns,nv)
+    integer,intent(out)::nunique,nreference,nhit
+    integer,intent(in)::nc
+    integer(8),intent(inout)::cache_keys(4,nc)
+    integer,intent(inout)::cache_valid(nc)
+    real(8),intent(inout)::cache_values(nv,nc)
+    integer,allocatable::persistent_slots(:)
+    logical,allocatable::hit(:)
+    integer(8)::pmask
+    integer::pk
+    integer,allocatable::lookup(:),refs(:,:)
+    integer(8),allocatable::keys(:,:)
+    real(8),allocatable::nodes(:,:),scales(:),weights(:,:),cached(:,:)
+    real(8)::coordinate(3),near(3),low(3),fraction(3),w(3),weight
+    integer(8)::key(4),mask,hkey,hash
+    integer::i,a,b,c,bit(3),id,k,j,corner,capacity
+    nunique=0;nreference=0;nhit=0;out=0d0
+    if(ns==0)return
+    capacity=1
+    do while(capacity<16*ns)
+      capacity=capacity*2
+    enddo
+    mask=int(capacity-1,8)
+    allocate(lookup(capacity),refs(8,ns),keys(4,8*ns),nodes(3,8*ns), &
+             scales(8*ns),weights(8,ns),cached(nv,8*ns))
+    lookup=0;refs=0;weights=0d0
+    do i=1,ns
+      if(.not.all(ieee_is_finite(points(i,:))))cycle
+      coordinate=(points(i,:)-origin)/h(i)-.5d0;near=anint(coordinate)
+      where(abs(coordinate-near)<2d-12)coordinate=near
+      low=real(floor(coordinate,kind=8),8);fraction=coordinate-low
+      corner=0
+      do a=0,1
+        do b=0,1
+          do c=0,1
+            corner=corner+1;bit=[a,b,c];w=1d0-fraction
+            where(bit==1)w=fraction
+            weight=(w(1)*w(2))*w(3)
+            if(weight<=1d-14)cycle
+            key(1:3)=int(low,8)+int(bit,8);key(4)=transfer(h(i),key(4))
+            hkey=ieor(key(4),ieor(ishft(key(4),-32),ishft(key(4),-48)))
+            hash=iand(key(1),mask)*73856093_8+iand(key(2),mask)*19349663_8 &
+                +iand(key(3),mask)*83492791_8+iand(hkey,mask)*104729_8
+            k=int(iand(hash,mask))+1
+            do
+              j=lookup(k)
+              if(j==0)then
+                nunique=nunique+1;j=nunique;lookup(k)=j;keys(:,j)=key
+                nodes(:,j)=origin+(low+real(bit,8)+.5d0)*h(i);scales(j)=h(i)
+                exit
+              endif
+              if(all(keys(:,j)==key))exit
+              k=mod(k,capacity)+1
+            enddo
+            refs(corner,i)=j;weights(corner,i)=weight;nreference=nreference+1
+          enddo
+        enddo
+      enddo
+    enddo
+    allocate(persistent_slots(nunique),hit(nunique))
+    pmask=int(nc-1,8)
+    do j=1,nunique
+      key=keys(:,j)
+      hkey=ieor(key(4),ieor(ishft(key(4),-32),ishft(key(4),-48)))
+      hash=iand(key(1),pmask)*73856093_8+iand(key(2),pmask)*19349663_8 &
+          +iand(key(3),pmask)*83492791_8+iand(hkey,pmask)*104729_8
+      pk=int(iand(hash,pmask))+1;persistent_slots(j)=pk
+      hit(j)=cache_valid(pk)/=0
+      if(hit(j))hit(j)=all(cache_keys(:,pk)==key)
+      if(hit(j))then
+        cached(:,j)=cache_values(:,pk);nhit=nhit+1
+      endif
+    enddo
+    !$omp parallel do private(j) schedule(static) if(nunique>=256)
+    do j=1,nunique
+      if(hit(j))cycle
+      call virtual_one(nodes(:,j),scales(j),origin,widths,dx,q,levels,table,values, &
+                       n,nw,nt,nv,0,cached(:,j))
+    enddo
+    !$omp end parallel do
+    ! Commit only after the parallel reads; direct-map collisions cannot race.
+    do j=1,nunique
+      pk=persistent_slots(j)
+      cache_keys(:,pk)=keys(:,j);cache_values(:,pk)=cached(:,j);cache_valid(pk)=1
+    enddo
+    deallocate(persistent_slots,hit)
+    !$omp parallel do private(i,corner,j,id) schedule(static) if(ns>=1024)
+    do i=1,ns
+      if(.not.all(ieee_is_finite(points(i,:))))then
+        out(i,:)=ieee_value(0d0,ieee_quiet_nan);cycle
+      endif
+      do corner=1,8
+        j=refs(corner,i)
+        if(j/=0)out(i,:)=out(i,:)+weights(corner,i)*cached(:,j)
+      enddo
+      id=locate_one(points(i,:),origin,widths,q,levels,table,n,nw,nt)
+      if(id==0)out(i,:)=ieee_value(0d0,ieee_quiet_nan)
+    enddo
+    !$omp end parallel do
+    deallocate(lookup,refs,keys,nodes,scales,weights,cached)
+  end subroutine
 
   subroutine derivatives(pos,dx,temperature,velocity,pressure,origin,widths,q,levels,table, &
                          n,nw,nt,div,gt,gp)

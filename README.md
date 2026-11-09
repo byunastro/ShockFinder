@@ -7,55 +7,69 @@ The current detector uses **local profile reconstruction only**: it reconstructs
 a subcell shock surface from column mass and adopts a pressure-jump Mach number.
 There is no selector for the earlier center-search methods.
 
-## 1. Install
+## 1. Install and configure
 
 Requirements: Python >= 3.10, NumPy >= 2.0, and SciPy >= 1.13.
-From the repository root:
+For native execution, GNU Fortran, a C compiler, Meson and Ninja are required.
+Use the exact Python executable of your intended environment, especially when
+cluster modules change `PATH`.
 
 ```bash
-python -m pip install -e .
-# Include Matplotlib, JupyterLab, and notebook tools:
-python -m pip install -e '.[notebook]'
+git clone https://github.com/byunastro/ShockFinder.git
+cd ShockFinder
+# Replace this with the absolute path of your Python environment.
+RUN_PYTHON=/path/to/environment/bin/python
+"$RUN_PYTHON" -m pip install -e '.[native]'
+cp build_config.example.json build_config.json
 ```
 
-Profile reconstruction also runs without a Fortran build. For faster AMR
-lookup, derivatives, and virtual-cell sampling, build its optional kernel:
+Edit `build_config.json` to select `python`, `cc`, `fc`, and (for MPI) the MPI
+launcher, `mpicc`, library directories and mpi4py paths. The per-machine file
+is ignored by Git. The generic example defaults to an OpenMP build without MPI.
 
 ```bash
-python -m pip install -e '.[native]'
-python tools/build_profile_geometry.py
+"$RUN_PYTHON" build.py --config build_config.json --mode omp
+"$RUN_PYTHON" -m shocktest.launch check
 ```
 
-Restart an already running Python/Jupyter kernel after building. The finder
-automatically uses the compiled geometry when available and keeps the same
-Profile reconstruction algorithm. Check `result.diagnostics['geometry_native']`
-(`1` for Fortran, `0` for Python), and `diagnostics['model_native']` for fitting.
-The native build also accelerates background-window fitting, density quadrature,
-and conservative mass roots. Candidate peak detection and model selection use
-Python/SciPy. `OMP_NUM_THREADS` controls parallel mesh queries; short background
-fits are serial Fortran. The default connected
-catalog and Python map rendering do not require native extensions.
-
-### Optional native utilities
-
-The Fortran utilities also include a map rasterizer and neighbor helpers.
-To use them, install a Fortran compiler such as GNU Fortran. NumPy releases
-using the Meson F2PY backend also require Meson and Ninja.
-
-Build the extensions with **the same Python
-executable that runs the analysis**:
+To enable all execution modes, set the MPI section for your system and build
+with `--mode hybrid`. To compile without OpenMP flags or libraries, choose
+`--mode mpi`. This uses serial Fortran inside each MPI rank. These choices
+configure execution; the shock estimator is the same.
 
 ```bash
-conda activate my-environment
-RUN_PYTHON="$CONDA_PREFIX/bin/python"
-PYTHON="$RUN_PYTHON" ./f2py.sh
-# Use "$RUN_PYTHON" for the analysis job too.
-
-# Optional settings for native OpenMP utilities.
-export OMP_NUM_THREADS=8
-export OMP_PROC_BIND=spread
-export OMP_PLACES=cores
+"$RUN_PYTHON" build.py --config build_config.json --mode hybrid
+# Inspect the resolved compilers, paths and commands without compiling:
+"$RUN_PYTHON" build.py --config build_config.json --mode hybrid --dry-run
 ```
+
+Builds record a `build_manifest.json` beside the environment-specific native
+extensions. The launcher uses its Python and MPI configuration. Compilation
+never starts an MPI job. Run MPI checks and calculations inside your scheduler's
+allocation; submit the launch command in a PBS/Slurm script if appropriate.
+
+```bash
+# After preparing a shared workspace, choose the allocated resources:
+"$RUN_PYTHON" -m shocktest.launch run --mode omp --threads 48 \
+    --workspace /shared/prepared --output result_omp.pkl
+"$RUN_PYTHON" -m shocktest.launch run --mode hybrid --ranks 12 --threads 8 \
+    --workspace /shared/prepared --output result_hybrid.pkl
+"$RUN_PYTHON" -m shocktest.launch run --mode mpi --ranks 96 --threads 1 \
+    --workspace /shared/prepared --output result_mpi.pkl
+```
+
+A hybrid build supports all three runtime modes. An MPI-only build supports
+one thread per rank and does not link OpenMP in its native modules. MPI and
+hybrid execution use rank zero as coordinator. Rank/thread placement must
+match the scheduler allocation. These examples describe separate allocations,
+not three jobs that share the same resources. See [BUILDING.md](BUILDING.md) for
+the configuration fields, MPI wheel/source choices, CPU binding and PBS usage.
+
+`python tools/build_extensions.py`, `PYTHON=... ./f2py.sh`, and
+`python tools/build_profile_geometry.py` remain compatibility entry points;
+they now use the same configuration driver. Restart Python after rebuilding.
+For pure Python use, `pip install -e .` and `finder.find(cell)` remain available;
+shared-workspace parallel execution requires the native geometry kernel.
 
 ## 2. Use
 
@@ -189,6 +203,91 @@ batch entry point is available. Older binaries automatically retain scalar
 model evaluation and do not provide this acceleration. Model-only speedups are
 not the same as end-to-end speedups: AMR sampling, input preparation and final
 result assembly remain part of a complete detection run.
+
+### Shared-memory and MPI execution (0.5.0)
+
+Large scans can prepare the complete retained background once and distribute
+**all original seed batches**. The scientific estimator remains unchanged.
+Workers map the same read-only NPY files, so processes on a node share their
+physical file pages. Each node must still accommodate the background working
+set: this is seed-work distribution, not distributed storage of the AMR mesh.
+Every worker can sample across any assigned task boundary, including after
+coarse/fine changes or recentering. There is no finite halo cutoff. Physical
+input edges and user level cuts retain their existing meaning.
+
+Prepare on one process using the same `cell` and configured `finder` as above:
+
+```python
+from shocktest.distributed import prepare_workspace
+
+# Use a new directory on a filesystem visible at the same path on every node.
+prepare_workspace(cell, finder, "/shared/shock_work/output_00785", task_batches=64)
+```
+
+Preparation writes physical fields, global normalization, geometry/index,
+normals, and original batch IDs. It fails if the directory already exists.
+Keep this workspace immutable during a run; prepare again after changing the
+measurement implementation, input, or finder settings. `manifest.json` reports its disk size and seed count.
+Budget space for both the workspace and final products, and memory for the
+preparation input/temporaries and the root's final result. File-backed memory
+sharing does not remove shared-filesystem I/O or NUMA bandwidth limits.
+
+For configured execution use `shocktest.launch` as shown in section 1.
+The following low-level API examples remain available for custom job wrappers.
+Single-node execution (set thread counts before starting Python):
+
+```bash
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+python -m shocktest.distributed run --workers 6 \
+    --workspace /shared/shock_work/output_00785 --output result_00785.pkl
+```
+
+For multiple nodes, install `mpi4py` against the MPI used by the job launcher
+and rebuild the native extensions. The optional `mpi` dependency is available
+as `pip install -e '.[native,mpi]'`; cluster module installations may require
+building mpi4py from source with their `MPICC`. Run inside the scheduler's
+allocation and use its supported MPI launch/binding options:
+
+```bash
+# Example only: the scheduler must allocate these ranks and their OpenMP cores.
+mpirun -np 12 python -m shocktest.distributed run --mpi \
+    --workspace /shared/shock_work/output_00785 --output result_00785.pkl
+```
+
+Rank zero schedules tasks and merges sparse models; the other ranks compute.
+Only rank zero assembles and writes the dense result. The reducer preserves
+the original numerical batches and quality ties, independent of task completion
+order. Ordinary worker exceptions are propagated to all ranks; incomplete or
+duplicate tasks cannot silently produce a partial result. Do not launch the
+original single-process runner under `mpirun` without this distributed entry.
+
+Workers retain an exact, bounded Fortran virtual-cell cache across batches.
+Spatial ordering groups nearby batches, while keys retain exact coordinates
+and sampling widths. The default `--cache-entries 262144` uses about 19 MiB per
+worker for persistent cache arrays; `0` disables persistence for comparisons.
+This adds to temporary sampling arrays. No seed thinning, fewer rays, or
+relaxed physical checks are introduced. Cache hits and queries are recorded in
+`result.diagnostics`; speedup must be measured at fixed allocated core count.
+
+The Python APIs are `find_parallel(workspace, workers=...)` and the collective
+`find_mpi(workspace, comm=...)`. MPI returns `None` on non-root ranks. A completed
+profile result contains the states needed for post-processing without the input
+table:
+
+```python
+analysis = finder.analyze_result(result, compute_dissipation=True,
+                                 build_catalog=False)
+```
+
+The CLI accepts `--analysis-options options.json`, containing these keyword
+options, to save a `ShockAnalysis` (or `ShockSamples` with `compact=true`) instead
+of a `ShockResult`. Existing result fields and analysis consumers are unchanged.
+Keep ordinary Python multiprocessing entry points under `if __name__ == "__main__":`.
+Input preparation, final assembly, dissipation, and catalog creation are not
+MPI-distributed in this release. Completed workspaces are reusable, but
+interrupted scans do not yet resume partially completed seed tasks.
 
 The detector does not use a velocity-divergence minimum as its final center,
 an intercell normal-dot-product gate, a two/four-crossing switch, or a
@@ -586,3 +685,9 @@ Area weights based on cell width and normal direction are detection-area
 proxies. Accuracy distributions conditioned on detected centers do not measure
 complete shock-surface coverage. Analytic references, when used for evaluation,
 must not enter the detector.
+
+Prepared workspaces use uncompressed binary `.npy` arrays directly for
+read-only mmap sharing. No node-local decompression cache is required.
+Released v0.5.0 NPY workspaces are accepted when their verified measurement
+implementation matches; user input files and manifests are never rewritten.
+Legacy compressed workspaces remain readable through the optional staging path.

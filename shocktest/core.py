@@ -208,18 +208,36 @@ class ShockFinder:
         Defaults and grouping are identical to a separate call on those products.
         """
 
-        from .analysis import ShockAnalysis
-        from .fronts import shock_front_catalog
-        from .pyShockFinder import compute_dissipation as make_dissipation
-
         if catalog_options is not None and not build_catalog:
             raise ValueError('catalog_options requires build_catalog=True')
-        analysis_start = time.perf_counter()
         if compact_options is not None and not compact:
             raise ValueError("compact_options requires compact=True")
         result, neighbor_tables, timings = self._find_internal(cell)
-        # Catalogs use the same saved-geometry path, with or without analyze.
         del neighbor_tables
+        return self.analyze_result(result, cell=cell,
+            compute_dissipation=compute_dissipation, build_catalog=build_catalog,
+            catalog_options=catalog_options, dissipation_options=dissipation_options,
+            compact=compact, compact_options=compact_options, timings=timings)
+
+    def analyze_result(self, result, *, cell=None, compute_dissipation=True,
+                       build_catalog=True, catalog_options=None,
+                       dissipation_options=None, compact=False,
+                       compact_options=None, timings=None):
+        """Post-process a completed profile result without rerunning detection.
+
+        New profile results contain all states needed by dissipation and catalogs;
+        ``cell`` is needed only for historical result formats.
+        """
+        from .analysis import ShockAnalysis
+        from .fronts import shock_front_catalog
+        from .pyShockFinder import compute_dissipation as make_dissipation
+        if catalog_options is not None and not build_catalog:
+            raise ValueError('catalog_options requires build_catalog=True')
+        if compact_options is not None and not compact:
+            raise ValueError('compact_options requires compact=True')
+        timings = {} if timings is None else dict(timings)
+        analysis_start = time.perf_counter() - timings.get('detection_total', 0.)
+        # Catalogs use the same saved-geometry path, with or without analyze.
         dissipation = None
         catalog = None
         labels = None
@@ -318,6 +336,14 @@ class ShockFinder:
             fits,diagnostics=detect(arrays,self,pressure)
         else:
             pressure=None
+        result = self._assemble_result(arrays, selected_indices, fits, diagnostics)
+        timings['scan']=time.perf_counter()-total_start-timings['input']
+        timings['neighbors']=0.;timings['detection_total']=time.perf_counter()-total_start
+        return result,(None,None,None),timings
+
+    def _assemble_result(self, arrays, selected_indices, fits, diagnostics):
+        """Assemble once after serial or distributed profile reduction."""
+        n = len(arrays['dx'])
         rows=np.array([f['cell'] for f in fits],dtype=np.int64)
         mach=np.zeros(n);shock=np.zeros(n,dtype=bool);normal=np.zeros((n,3));zone=np.zeros(n)
         index_type=np.int32 if self.index_dtype=='auto' and n<=np.iinfo(np.int32).max else np.int64
@@ -365,9 +391,7 @@ class ShockFinder:
         result.density_unit=self.density_unit;result.sampling_tolerance=self.sampling_tolerance
         result.mach_estimator='profile_pressure'
         result.mean_molecular_weight=float(self.mean_molecular_weight)
-        timings['scan']=time.perf_counter()-total_start-timings['input']
-        timings['neighbors']=0.;timings['detection_total']=time.perf_counter()-total_start
-        return result,(None,None,None),timings
+        return result
 
     def _thermal_pressure_values(
         self,

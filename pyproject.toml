@@ -4,18 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shocktest"
-version = "0.4.3"
+version = "0.6.0"
 description = "AMR shock detection with conservative local profile reconstruction."
 requires-python = ">=3.10"
 dependencies = ["numpy>=2.0", "scipy>=1.13"]
 
 [project.optional-dependencies]
 native = ["meson>=1.2", "ninja"]
+mpi = ["mpi4py>=4.0"]
 notebook = ["matplotlib>=3.7", "jupyterlab>=4", "ipykernel>=6", "nbformat>=5", "nbclient>=0.8"]
 test = ["pytest>=7"]
+
+[project.scripts]
+shockfinder = "shocktest.launch:main"
 
 [tool.setuptools]
 packages = ["shocktest"]
 
 [tool.setuptools.package-data]
-shocktest = ["fortran/*.f90"]
+shocktest = ["fortran/*.f90", "workspace_compatibility.json"]

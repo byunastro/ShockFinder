@@ -31,3 +31,6 @@ dist/
 /shockTree/local_check/
 
 .DS_Store
+
+# Per-machine compiler/MPI choices; the generic example is public.
+/build_config.json

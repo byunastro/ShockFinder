@@ -6,4 +6,4 @@ set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 python_bin="${PYTHON:-python3}"
-exec "$python_bin" "${project_dir}/tools/build_extensions.py"
+exec "$python_bin" "${project_dir}/tools/build_extensions.py" "$@"

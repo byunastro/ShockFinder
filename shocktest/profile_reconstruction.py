@@ -35,13 +35,8 @@ def density_cgs(unit):
     return factors[unit]
 
 
-def detect(arrays, finder, pressure=None):
-    """Return measured fits indexed by their final associated input leaves.
-
-    Seed every locally compressing, pressure/temperature-aligned leaf. Unlike
-    benchmark projection charts this has no global ray grid or geometry ROI.
-    The profile model, tube, covering scale, and final-normal tests are fixed.
-    """
+def prepare(arrays, finder, pressure=None):
+    """Prepare one global mesh; partitioning must never change normalization."""
     p = arrays["pos"]
     dx = arrays["dx"]
     rho = arrays["rho"]
@@ -80,11 +75,6 @@ def detect(arrays, finder, pressure=None):
     div, grad, gradp = geometry.derivatives_at(temperature, v, pr, eligible)
     normals=np.zeros((len(p),3));known=np.zeros(len(p),bool)
     normals[eligible]=normalize(grad);known[eligible]=True
-    def ensure_normals(rows):
-        missing=np.unique(np.asarray(rows)[~known[rows]])
-        if len(missing):
-            _,g,_=geometry.derivatives_at(temperature,v,pr,missing)
-            normals[missing]=normalize(g);known[missing]=True
     mask = (
         (div < 0)
         & (np.linalg.norm(grad, axis=1) > 0)
@@ -99,10 +89,48 @@ def detect(arrays, finder, pressure=None):
     # All components are volume-averaged together. Momentum is divided by the
     # sampled density only AFTER conservative restriction/CIC and tube averaging.
     values = np.asfortranarray(np.column_stack((r, pr, r[:, None] * v)))
+    return dict(pos=geometry.pos, dx=geometry.dx, temperature=temperature,
+                velocity=np.asfortranarray(v), pressure=pr, normals=normals,
+                known=known, values=values, seeds=seeds, geometry=geometry,
+                density_scale=density_scale, speed_scale=speed_scale,
+                qfactor=qfactor, diagnostics=diagnostics)
+
+
+def fit_precedes(fit, old):
+    """Preserve serial quality and traversal ties after arbitrary task ordering."""
+    return (fit['quality'], fit['_order']) < (old['quality'], old['_order'])
+
+
+def scan(context, finder, batch_starts=None, *, best=None, normal_cache=None):
+    """Scan original numerical batches against the complete immutable mesh.
+
+    Workers own their sparse result and lazy-normal dictionaries. No shared
+    array is written, including normals of centers outside the seed selection.
+    """
+    p, dx = context['pos'], context['dx']
+    geometry, seeds = context['geometry'], context['seeds']
+    temperature, v, pr = context['temperature'], context['velocity'], context['pressure']
+    normals, known, values = context['normals'], context['known'], context['values']
+    density_scale, speed_scale, qfactor = (context[k] for k in
+        ('density_scale', 'speed_scale', 'qfactor'))
+    normal_cache = {} if normal_cache is None else normal_cache
+    def normal_at(rows):
+        rows = np.asarray(rows, dtype=np.int64)
+        missing = np.array([int(i) for i in np.unique(rows[~known[rows]])
+                            if int(i) not in normal_cache], dtype=np.int64)
+        if len(missing):
+            _, g, _ = geometry.derivatives_at(temperature, v, pr, missing)
+            normal_cache.update(zip(map(int, missing), normalize(g)))
+        out = normals[rows].copy()
+        for j in np.flatnonzero(~known[rows]):
+            out[j] = normal_cache[int(rows[j])]
+        return out
+
     offsets = np.arange(-12, 12.001, 0.25)
     # Keep only the current winner for each output leaf, rather than retaining
     # every converged seed model until the entire snapshot has been scanned.
-    best = {}
+    best = {} if best is None else best
+    diagnostics = Counter()
     accepted_models = 0
 
     def profiles(ids, anchors, directions):
@@ -159,11 +187,18 @@ def detect(arrays, finder, pressure=None):
     progress_step = (int(finder.progress_interval) if finder.progress_interval and finder.progress_interval > 0
                      else max(1, (len(seeds) + 19) // 20))
     next_progress = progress_step
+    processed = 0
     progress_start = last_progress = time.monotonic()
-    for start in range(0, len(seeds), batch):
+    if batch_starts is None:
+        batch_starts = range(0, len(seeds), batch)
+    for start in batch_starts:
+        start = int(start)
+        if start < 0 or start >= len(seeds) or start % batch:
+            raise ValueError('Task offsets must identify original complete seed batches')
         ids = seeds[start : start + batch]
+        processed += len(ids)
         anchors = p[ids].copy()
-        direction = normals[ids]
+        direction = normal_at(ids)
         initial = ids.copy()
         for iteration in range(6):
             if not len(ids):
@@ -180,12 +215,12 @@ def detect(arrays, finder, pressure=None):
                     continue
                 point = anchors[j] + fit["offset"] * h[j] * direction[j]
                 cell = geometry.locate(point[None, :])[0]
-                if cell>=0:ensure_normals(np.array([cell]))
-                if cell < 0 or not np.any(normals[cell]):
+                final_normal = normal_at([cell])[0] if cell >= 0 else np.zeros(3)
+                if cell < 0 or not np.any(final_normal):
                     diagnostics["center_outside_or_undefined"] += 1
                     continue
                 consistent = np.allclose(
-                    normals[cell], direction[j], rtol=1e-12, atol=1e-12
+                    final_normal, direction[j], rtol=1e-12, atol=1e-12
                 )
                 if iteration == 5 and not consistent:
                     fit = reconstruct(
@@ -206,13 +241,14 @@ def detect(arrays, finder, pressure=None):
                         continue
                     point = anchors[j]
                     cell = int(ids[j])
+                    final_normal = normal_at([cell])[0]
                     consistent = True
                 if iteration >= 1 and consistent:
                     if fit["mach"] <= finder.min_mach:
                         diagnostics["mach_rejected"] += 1
                         continue
                     np.testing.assert_allclose(
-                        normals[cell], direction[j], rtol=1e-12, atol=1e-12
+                        final_normal, direction[j], rtol=1e-12, atol=1e-12
                     )
                     support = anchors[j] + fit["window"][:, None] * h[j] * direction[j]
                     endpoints = geometry.locate(support)
@@ -220,12 +256,13 @@ def detect(arrays, finder, pressure=None):
                         diagnostics["support_missing"] += 1
                         continue
                     accepted_models += 1
-                    if int(cell) in best and not fit['quality'] < best[int(cell)]['quality']:
+                    fit['_order'] = (start, iteration, int(initial[j]))
+                    if int(cell) in best and not fit_precedes(fit, best[int(cell)]):
                         continue
                     fit.update(
                         cell=int(cell),
                         point=point.copy(),
-                        normal=normals[cell].copy(),
+                        normal=final_normal.copy(),
                         seed=int(initial[j]),
                         passes=iteration + 1,
                         reference_width=float(h[j]),
@@ -269,9 +306,9 @@ def detect(arrays, finder, pressure=None):
             ids = np.array([x[0] for x in again], dtype=np.int64)
             anchors = np.array([x[1] for x in again]).reshape(-1, 3)
             initial = np.array([x[2] for x in again], dtype=np.int64)
-            direction = normals[ids]
+            direction = normal_at(ids)
         if finder.show_progress:
-            done = min(start + batch, len(seeds))
+            done = processed
             now = time.monotonic()
             if done >= next_progress or done == len(seeds) or now - last_progress >= 60:
                 elapsed = max(now - progress_start, 1e-12)
@@ -281,10 +318,27 @@ def detect(arrays, finder, pressure=None):
                 )
                 next_progress = done + progress_step
                 last_progress = now
-    diagnostics["duplicate_leaf_models"] = accepted_models - len(best)
+    diagnostics['processed_seeds'] = processed
+    diagnostics['accepted_models'] = accepted_models
+    return best, diagnostics, normal_cache
+
+
+def finish(context, best, counts, derivative_cells):
+    diagnostics = Counter(context['diagnostics'])
+    diagnostics.update(counts)
+    diagnostics["duplicate_leaf_models"] = diagnostics.pop('accepted_models', 0) - len(best)
     diagnostics["accepted_centers"] = len(best)
     diagnostics['quality_clear_centers']=sum(f['quality_flags']==0 for f in best.values())
     diagnostics['model_native']=int(profile_model.NATIVE_MODEL is not None)
     diagnostics['model_batch_native']=int(hasattr(profile_model.NATIVE_MODEL,'screen_batch'))
-    diagnostics['derivative_cells']=int(known.sum())
+    diagnostics['derivative_cells'] = int(derivative_cells)
+    for fit in best.values():
+        fit.pop('_order', None)
     return [best[k] for k in sorted(best)], dict(diagnostics)
+
+
+def detect(arrays, finder, pressure=None):
+    """The fixed production estimator; every selected candidate is scanned."""
+    context = prepare(arrays, finder, pressure)
+    best, counts, lazy = scan(context, finder)
+    return finish(context, best, counts, context['known'].sum() + len(lazy))

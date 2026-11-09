@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "python": "",
+  "mode": "omp",
+  "cc": "cc",
+  "fc": "gfortran",
+  "backend": "meson",
+  "fortran_flags": ["-O3"],
+  "precision_flags": ["-ffp-contract=off"],
+  "free_line_length_flag": "-ffree-line-length-none",
+  "openmp": {
+    "flags": ["-fopenmp"],
+    "libraries": ["gomp"]
+  },
+  "mpi": {
+    "flavor": "auto",
+    "mpicc": "mpicc",
+    "launcher": "mpirun",
+    "launcher_args": [],
+    "python_paths": [],
+    "library_dirs": [],
+    "install": "none",
+    "requirement": "mpi4py>=4.0"
+  },
+  "environment": {}
+}

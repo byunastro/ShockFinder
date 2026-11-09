@@ -168,6 +168,28 @@ class NativeLeafGeometry(LeafGeometry):
 
     native = True
 
+    def bind_sample_cache(self, values, entries=262144):
+        """Cache immutable virtual cells for this geometry and value array only.
+
+        Cache arrays belong to one worker, never to an MPI shared window.
+        Rebinding clears them even when the new values have the same shape.
+        """
+        if (isinstance(entries, (bool, np.bool_)) or not isinstance(entries, (int, np.integer))
+                or entries < 0 or (entries and entries & (entries - 1))):
+            raise ValueError('Cache entries must be zero or a power of two')
+        self._sample_cache = None
+        self.cache_hits = self.cache_queries = 0
+        if not entries:
+            return
+        if not hasattr(self.kernel, 'sample_batch_reuse'):
+            raise RuntimeError('Rebuild profile geometry to use persistent sample reuse')
+        if values.flags.writeable or not values.flags.f_contiguous:
+            raise ValueError('Cached values must be immutable and Fortran contiguous')
+        self._sample_cache = (values,
+            np.zeros((4, entries), dtype=np.int64, order='F'),
+            np.zeros(entries, dtype=np.int32),
+            np.zeros((values.shape[1], entries), order='F'))
+
     def __init__(self, pos, dx):
         self.pos = np.asfortranarray(pos, dtype=np.float64)
         self.dx = np.asfortranarray(dx, dtype=np.float64)
@@ -218,6 +240,22 @@ class NativeLeafGeometry(LeafGeometry):
         scale = np.asfortranarray(np.broadcast_to(h, len(p)), dtype=np.float64)
         if not np.all(np.isfinite(scale) & (scale > 0)):
             raise ValueError("Sampling widths must be finite and positive")
+        persistent = getattr(self, '_sample_cache', None)
+        if persistent is not None:
+            bound, cache_keys, cache_valid, cache_values = persistent
+            if values is not bound:
+                raise ValueError('Rebind the sample cache before sampling another field')
+            result = np.empty((len(p), values.shape[1]), order='F')
+            for start in range(0, len(p), 32768):
+                stop = min(start + 32768, len(p))
+                out, unique, _, hits = self.kernel.sample_batch_reuse(
+                    p[start:stop], scale[start:stop], self.origin, self.widths,
+                    self.dx, self.q, self.levels, self.table, values,
+                    cache_keys, cache_valid, cache_values)
+                result[start:stop] = out
+                self.cache_queries += unique
+                self.cache_hits += hits
+            return result
         # Bound the temporary cache independently of input mesh size. Old native
         # binaries remain usable until rebuilt; they use the original kernel.
         cached = getattr(self.kernel, 'sample_batch_cached', None)
