@@ -31,7 +31,7 @@ def save_profiles(path, result, metadata=None):
         "background_orders",
     ):
         data[name] = s[name]
-    for name in ('velocity','entropy_margin','center_sensitivity','momentum_residual','energy_residual',
+    for name in ('upstream_state_error','velocity','entropy_margin','center_sensitivity','momentum_residual','energy_residual',
                  'shock_speed_mass','shock_speed_pressure','mach_model_range','center_model_range',
                  'background_model_count','profile_quality_flags','quality_clear'):
         if name in s:data[name]=s[name]

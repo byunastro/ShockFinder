@@ -88,6 +88,23 @@ def runtime_environment(config, base=None):
                        ('LD_LIBRARY_PATH', config['mpi']['library_dirs'])):
         if paths:
             env[key] = os.pathsep.join(paths + ([env[key]] if env.get(key) else []))
+    # mpi4py wheels search Python/Conda prefixes before the generic loader
+    # path. LD_LIBRARY_PATH alone cannot select the intended MPI ABI.
+    if config.get('mode') in ('mpi', 'hybrid'):
+        flavor = config['mpi']['flavor']
+        if flavor in ('openmpi', 'mpich'):
+            env['MPI4PY_MPIABI'] = flavor
+            explicit = config.get('environment', {}).get('MPI4PY_LIBMPI')
+            names = (('libmpi.so.40', 'libmpi.40.dylib', 'libmpi.so', 'libmpi.dylib')
+                     if flavor == 'openmpi' else
+                     ('libmpi.so.12', 'libmpi.12.dylib', 'libmpi.so', 'libmpi.dylib'))
+            found = next((str(Path(directory) / name)
+                          for directory in config['mpi']['library_dirs'] for name in names
+                          if (Path(directory) / name).is_file()), None)
+            if explicit or found:
+                env['MPI4PY_LIBMPI'] = explicit or found
+            else:
+                env.pop('MPI4PY_LIBMPI', None)
     return env
 
 

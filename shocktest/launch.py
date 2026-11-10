@@ -55,6 +55,7 @@ def execution_plan(path, manifest, args):
             # PBS starts remote ranks in a fresh shell; export the selected
             # Python/MPI paths explicitly rather than relying on activation.
             names = ('PYTHONPATH', 'PYTHONNOUSERSITE', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH',
+                     'MPI4PY_MPIABI', 'MPI4PY_LIBMPI',
                      'OMP_NUM_THREADS', 'OMP_DYNAMIC', 'OMP_PROC_BIND', 'OMP_PLACES',
                      'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'SHOCKFINDER_BUILD_MANIFEST',
                      'SHOCKFINDER_EXPECT_RANKS', 'SHOCKFINDER_EXPECT_MPI')
@@ -90,6 +91,8 @@ def main():
                 'assert _profile_geometry is not None; '
                 'assert hasattr(_profile_geometry.profile_geometry_kernel,"sample_batch_reuse"); '
                 'assert hasattr(_profile_geometry.profile_model_kernel,"screen_batch"); '
+                'assert hasattr(_profile_geometry.profile_model_kernel,"upstream_state_errors"), '
+                '"Rebuild the v0.6.1 native profile extension"; '
                 'print("Native kernels OK")')
         if args.mpi:
             if not manifest['mpi']:

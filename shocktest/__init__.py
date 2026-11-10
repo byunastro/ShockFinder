@@ -1,6 +1,6 @@
 import sys as _sys
 
-__version__ = '0.6.0'
+__version__ = '0.6.1'
 
 from ._native import load_extension as _load_extension
 
@@ -22,6 +22,7 @@ from .exposure import (
 )
 from .compact import ShockSamples, compact_shocks
 from .profile_quality import ProfileQualityFlag, galaxy_pressure
+from .selection import valid_shock_rows, shock_valid_mask, filter_shocks
 from .core import ShockFinder, ShockResult
 from .fronts import (
     shock_front_catalog, front_dtype, QUALITY_OK, QUALITY_NO_AREA,
@@ -47,6 +48,7 @@ from .catalog_io import (
 from .catalog_qa import plot_catalog_quality, summarize_catalog_quality
 
 __all__ = [
+    "valid_shock_rows", "shock_valid_mask", "filter_shocks",
     "ProfileQualityFlag", "galaxy_pressure",
     "shock_front_catalog", "front_dtype", "QUALITY_OK", "QUALITY_NO_AREA",
     "QUALITY_NO_DISS_RATE", "QUALITY_UNDEFINED_NORMAL", "QUALITY_APPROX_CONNECTIVITY",

@@ -129,7 +129,8 @@ def main(argv=None) -> None:
         if source == 'profile_geometry':
             command += ['only:', 'build_index', 'locate_batch', 'sample_batch',
                         'sample_batch_cached', 'sample_batch_reuse', 'derivatives',
-                        'derivatives_at', 'fit_windows', 'mass_root', 'screen_batch', ':']
+                        'derivatives_at', 'fit_windows', 'mass_root', 'screen_batch',
+                        'upstream_state_errors', ':']
         libraries = config['openmp']['libraries'] if config['mode'] != 'mpi' else []
         if config_path is None and 'SHOCKFINDER_OPENMP_LIB' in os.environ and config['mode'] != 'mpi':
             libraries = [os.environ['SHOCKFINDER_OPENMP_LIB']] if os.environ['SHOCKFINDER_OPENMP_LIB'] else []
@@ -185,6 +186,8 @@ def main(argv=None) -> None:
               'assert pathlib.Path(shocktest.__file__).resolve().parent == root / "shocktest"; '
               'modules=[getattr(shocktest, "_"+name) for name in sys.argv[2:]]; '
               'assert all(m is not None for m in modules); '
+              'assert "profile_geometry" not in sys.argv[2:] or '
+              'hasattr(shocktest._profile_geometry.profile_model_kernel,"upstream_state_errors"); '
               'print("Import verified:", *[m.__file__ for m in modules])')
     subprocess.run([sys.executable, '-c', verify, str(ROOT), *args.modules],
                    cwd=ROOT, check=True, env=env)

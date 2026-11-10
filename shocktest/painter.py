@@ -46,8 +46,12 @@ def make_mach_map(
     ``machmap = painter.make_mach_map(result, plane="xy")``.
     The default ``method="amr"`` paints each projected AMR cell footprint into
     the image. ``method="point"`` keeps the older center-binning behavior.
-    For historical results, ``result.mach_consistent`` is used as the mask when
-    it is available. Pass ``valid_mach`` explicitly to override that mask.
+    Profile results automatically use :func:`shocktest.valid_shock_rows`:
+    entropy_margin >1, velocity residual <=0.15, density/momentum/energy
+    residuals <=0.15 for Mach <=3, and saved upstream-state errors <=
+    sampling_tolerance when available. Historical results retain
+    their saved Mach-consistency selection. Pass ``valid_mach`` explicitly
+    to override this display selection; ``result.shock`` shows all detections.
     Empty pixels are returned as NaN. Pass per-cell ``weights`` with
     ``statistic="mean"`` to make an area- and weight-averaged Mach map, for
     example using shock dissipation energy as the weight. ``fill_gaps`` can be
@@ -56,6 +60,13 @@ def make_mach_map(
     map remains suitable for quantitative work.
     ``backend="auto"`` uses the compiled Fortran rasterizer when the installed
     extension contains it, otherwise it falls back to the Python reference.
+
+    For an AMR mean, each contribution is ``Mach * weight * pixel_overlap``;
+    the denominator sums ``weight * pixel_overlap``. If the desired weight is
+    a cell-integrated power distributed over its projected footprint, supply
+    ``power / result.dx**2``. Supplying power itself also weights by the cell's
+    overlap area. In a pixel containing only one detection, any positive weight
+    gives that detection's Mach, regardless of how small its power is.
     """
 
     x, y, normal, dx = _project_result_geometry(result, plane)
@@ -113,8 +124,9 @@ def make_disspE_map(
     produced by ``pyShockFinder.compute_dissipation``. The default
     ``method="amr"`` paints each projected AMR shock-cell footprint into the
     image. ``method="point"`` keeps the older center-binning behavior. By
-    default, historical ``result.mach_consistent`` is used as the mask when it
-    exists; pass ``valid_mach`` explicitly to override it. ``fill_gaps`` has
+    default, the shared profile/legacy selection described in
+    :func:`make_mach_map` is used; pass ``valid_mach`` explicitly to override it.
+    ``fill_gaps`` has
     the same conservative, display-only meaning as in :func:`make_mach_map`.
     ``backend`` selects the same automatic Fortran/Python rasterizer.
     """
@@ -434,19 +446,17 @@ def _project_result_geometry(result, plane: Plane):
 
 
 def _shock_draw_mask(result, *, min_mach: float, valid_mach=None):
+    if valid_mach is None:
+        from .selection import shock_valid_mask
+        return shock_valid_mask(result, min_mach=min_mach)
     mach = np.asarray(result.mach, dtype=np.float64)
     shock = np.asarray(result.shock, dtype=bool)
     if shock.shape != mach.shape:
         raise ValueError("result.shock must have the same shape as result.mach")
 
-    if valid_mach is None:
-        valid_mach = getattr(result, "mach_consistent", None)
-    if valid_mach is None:
-        valid = np.ones(mach.shape, dtype=bool)
-    else:
-        valid = np.asarray(valid_mach, dtype=bool)
-        if valid.shape != mach.shape:
-            raise ValueError("valid_mach must have the same shape as result.mach")
+    valid = np.asarray(valid_mach, dtype=bool)
+    if valid.shape != mach.shape:
+        raise ValueError("valid_mach must have the same shape as result.mach")
     return shock & valid & np.isfinite(mach) & (mach >= min_mach)
 
 

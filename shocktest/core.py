@@ -71,6 +71,12 @@ class ShockResult(_HistoricalResultState):
     # leaves only; the measured states/positions can differ from leaf centers.
     sampling: dict[str, Any] | None = None
 
+    @property
+    def valid_shock(self):
+        """Map/analysis selection; computed on demand, never stored densely."""
+        from .selection import shock_valid_mask
+        return shock_valid_mask(self)
+
     def __getstate__(self):
         """Omit redundant flags from pickle, preserving independently edited flags.
 
@@ -365,6 +371,7 @@ class ShockFinder:
             'reference_width':np.array([f['reference_width'] for f in fits]),
             'density_residual':np.array([f['density_residual'] for f in fits]),
             'velocity_residual':np.array([f['velocity_residual'] for f in fits]),
+            'upstream_state_error':np.array([f['upstream_state_error'] for f in fits]).reshape(-1,2),
             'center_constraint_active':np.array([f['center_constraint_active'] for f in fits],dtype=bool),
             'mass_surface_displacement':np.array([f['mass_surface_displacement']*f['reference_width'] for f in fits]),
             'profile_passes':np.array([f['passes'] for f in fits],dtype=np.int32),

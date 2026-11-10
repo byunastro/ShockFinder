@@ -460,6 +460,66 @@ contains
     v=c(1)+x*c(2)+x*x*c(3)
   end function
 
+  subroutine upstream_state_errors(s,states,first,last,orders,center,up,pinv,n,error)
+    ! Sensitivity at the adopted surface, in log rho and relative P.
+    ! L1 interpolation weights propagate a bounded measured window residual;
+    ! the next polynomial order tests extrapolation beyond the fitted window.
+    integer,intent(in)::n,first,last,orders(2)
+    real(8),intent(in)::s(n),states(n,2),center,up(2),pinv(4,n,n,3)
+    real(8),intent(out)::error(2)
+    real(8)::raw(n),y(n),beta(4),higher(4),ctr,scale,target,t,avg
+    real(8)::pred,res,weight,amplification,alternative,adopted,absolute,roundoff
+    integer::nn,var,d,j,k
+    nn=last-first+1
+    error=ieee_value(0d0,ieee_positive_inf)
+    if(nn<5.or.first<1.or.last>n.or.minval(up)<=0d0)return
+    ctr=sum(s(first:last))/nn;scale=(s(last)-s(first))/2d0
+    if(scale<=0d0)return
+    target=(center-ctr)/scale
+    do var=1,2
+      raw(1:nn)=states(first:last,var);avg=sum(raw(1:nn))/nn
+      d=orders(var)
+      if(d==0)then
+        error(var)=(maxval(raw(1:nn))-minval(raw(1:nn)))/avg
+        cycle
+      endif
+      if(d<1.or.d>2)return
+      y(1:nn)=raw(1:nn)
+      if(var==1)y(1:nn)=log(raw(1:nn))
+      beta=0;higher=0
+      do k=1,d+1
+        do j=1,nn
+          beta(k)=beta(k)+pinv(k,j,nn,d)*y(j)
+        enddo
+      enddo
+      do k=1,d+2
+        do j=1,nn
+          higher(k)=higher(k)+pinv(k,j,nn,d+1)*y(j)
+        enddo
+      enddo
+      res=0;amplification=0
+      do j=1,nn
+        t=(s(first+j-1)-ctr)/scale;pred=0;weight=0
+        do k=1,d+1
+          pred=pred+beta(k)*t**(k-1)
+          weight=weight+target**(k-1)*pinv(k,j,nn,d)
+        enddo
+        res=max(res,abs(y(j)-pred));amplification=amplification+abs(weight)
+      enddo
+      alternative=0
+      do k=1,d+2
+        alternative=alternative+higher(k)*target**(k-1)
+      enddo
+      adopted=up(var)
+      if(var==1)adopted=log(up(var))
+      roundoff=32d0*epsilon(1d0)*max(maxval(abs(y(1:nn))),abs(adopted),tiny(1d0)) &
+               *max(amplification,1d0)
+      absolute=max(abs(alternative-adopted),res*amplification)+roundoff
+      error(var)=absolute
+      if(var==2)error(var)=absolute/up(var)
+    enddo
+  end subroutine
+
   subroutine screen_one(s,states,u,widths,derivative,peak,slope,tol,seed,gamma,closure,pinv,xg,wg,n, &
                         coeff,vel,orders,errors,bounds,counts,roots,possible)
     ! This kernel is deliberately a conservative rejection screen. Python
@@ -469,7 +529,7 @@ contains
     real(8),intent(in)::pinv(4,n,n,3),xg(8),wg(8)
     real(8),intent(out)::coeff(3,2,6,2),vel(3,6,2),errors(6,2),roots(6,6)
     integer,intent(out)::orders(2,6,2),bounds(2,6,2),counts(2),possible(6,6)
-    real(8)::terms(n-1),total,center,a,b,up(2),down(2),ratio,rp,ent,m,re,sound,jump,vl,vr,dv,margin
+    real(8)::terms(n-1),total,center,a,b,up(2),down(2),support(2),ratio,rp,ent,m,re,sound,jump,vl,vr,dv,margin
     real(8),parameter::guard=1d-10
     integer::l,r,i,lo,hi,status
     coeff=0;vel=0;errors=0;roots=0;orders=0;bounds=0;counts=0;possible=0
@@ -498,6 +558,12 @@ contains
               polynomial(coeff(:,2,r,2),center)]
         if(.not.all(ieee_is_finite(up)).or..not.all(ieee_is_finite(down)))cycle
         if(minval(up)<=0d0.or.minval(down)<=0d0)then
+          possible(l,r)=0;cycle
+        endif
+        call upstream_state_errors(s,states,bounds(1,l,1),bounds(2,l,1), &
+                                   orders(:,l,1),center,up,pinv,n,support)
+        ! Borderline values remain for the authoritative surface checks.
+        if(all(ieee_is_finite(support)).and.any(support>tol+guard))then
           possible(l,r)=0;cycle
         endif
         ratio=down(1)/up(1);rp=down(2)/up(2)

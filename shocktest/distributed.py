@@ -80,7 +80,11 @@ def _metadata(directory):
     directory = Path(directory)
     meta = json.loads((directory / 'manifest.json').read_text())
     compatible = meta.get('measurement_digest') == _measurement_digest()
-    legacy = json.loads((Path(__file__).parent / 'workspace_compatibility.json').read_text())['implementations']
+    registry = json.loads((Path(__file__).parent / 'workspace_compatibility.json').read_text())
+    legacy = registry['implementations']
+    # A change to acceptance need not invalidate the unchanged prepared mesh.
+    # Only explicitly audited preparation-compatible measurements are accepted.
+    compatible |= registry.get('measurements', {}).get(meta.get('measurement_digest')) == _measurement_digest()
     compatible |= legacy.get(meta.get('implementation_digest')) == _measurement_digest()
     if meta['schema'] != SCHEMA or not (compatible or meta.get('implementation_digest') == _digest()):
         raise ValueError('Prepared workspace does not match this implementation; prepare a new workspace')
@@ -422,7 +426,8 @@ def main():
         comm = MPI.COMM_WORLD
         expected = os.environ.get('SHOCKFINDER_EXPECT_RANKS')
         if expected and comm.Get_size() != int(expected):
-            raise RuntimeError('MPI communicator size does not match the launcher; check mpi4py/MPI compatibility')
+            raise RuntimeError(f'MPI communicator size {comm.Get_size()} != launcher size {expected}; '
+                               f'mpi4py extension={MPI.__file__}; runtime={MPI.Get_library_version()}')
         flavor = os.environ.get('SHOCKFINDER_EXPECT_MPI', 'auto')
         runtime = MPI.Get_library_version().lower()
         if flavor != 'auto' and not ((flavor == 'openmpi' and 'open mpi' in runtime) or

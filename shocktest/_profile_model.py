@@ -65,6 +65,47 @@ def pressure_mach(ratio, gamma=GAMMA):
     return np.sqrt(np.maximum(((gamma - 1) + (gamma + 1) * ratio) / (2 * gamma), 1))
 
 
+def upstream_state_errors(s, states, first, last, orders, center, upstream):
+    """Bound upstream model sensitivity at the adopted surface, using fit data.
+
+    Returns an error in log density and a relative pressure error. These are
+    deterministic sensitivity bounds, not statistical confidence intervals.
+    The alternative polynomial and the amplification of the measured fitting
+    residual both matter: a small residual far from the surface is insufficient.
+    No additional mesh samples or extra nonlinear fits are needed.
+    """
+    if hasattr(NATIVE_MODEL, 'upstream_state_errors'):
+        return NATIVE_MODEL.upstream_state_errors(
+            s, states, int(first)+1, int(last)+1, orders, center, upstream,
+            native_basis(len(s)))
+    x = s[first:last+1]
+    scale = np.ptp(x)/2
+    t = (x-x.mean())/scale
+    target = (center-x.mean())/scale
+    errors = np.empty(2)
+    for var, degree in enumerate(orders):
+        degree = int(degree)
+        raw = states[first:last+1, var]
+        if degree == 0:
+            errors[var] = np.ptp(raw)/raw.mean()
+            continue
+        y = np.log(raw) if var == 0 else raw
+        inverse = basis(len(x), degree)
+        beta = inverse @ y
+        higher = basis(len(x), degree+1) @ y
+        powers = target**np.arange(degree+1)
+        weights = powers @ inverse
+        amplification = np.sum(abs(weights))
+        residual = np.max(abs(y-sum(beta[k]*t**k for k in range(degree+1))))
+        alternative = np.dot(higher, target**np.arange(degree+2))
+        adopted = np.log(upstream[var]) if var == 0 else upstream[var]
+        error = max(abs(alternative-adopted), residual*amplification)
+        error += (32*np.finfo(float).eps * max(np.max(abs(y)), abs(adopted),
+                  np.finfo(float).tiny) * max(amplification, 1.0))
+        errors[var] = error if var == 0 else error/upstream[var]
+    return errors
+
+
 def reconstruct_batch(s, states, velocities, widths, normals, tolerance=0.01,
                       closure_tolerance=0.15, gamma=GAMMA):
     """Batch native work; preserve reference selection and difficult-profile fallback."""
@@ -347,6 +388,10 @@ def reconstruct(
         down = np.array([density_at(cr[0], center), value(cr[1], center)])
         if np.min([*up, *down]) <= 0:
             continue
+        support_error = upstream_state_errors(
+            s, states, int(il[0]), int(il[-1]), ol, center, up)
+        if not np.isfinite(support_error).all() or np.any(support_error > tolerance):
+            continue
         r = down[0] / up[0]
         rp = down[1] / up[1]
         if r <= 1 or rp <= 1:
@@ -378,6 +423,7 @@ def reconstruct(
                 peak_offset=float(s[peak]),
                 density_residual=float(dr),
                 velocity_residual=float(dv),
+                upstream_state_error=support_error,
                 entropy_ratio=float(entropy),
                 entropy_margin=float(np.log(entropy) / max((1+gamma)*(errl+errr),1e-30)),
                 normal_velocity=np.array([vl,vr]),

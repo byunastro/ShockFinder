@@ -1,11 +1,9 @@
 # ShockFinder
 
 ShockFinder is a Python framework for detecting shocks on AMR leaf meshes,
-measuring Mach numbers and thermal dissipation, grouping shock structures,
-and supporting galaxy matching and time-resolved exposure measurements.
-The current detector uses **local profile reconstruction only**: it reconstructs
+measuring Mach numbers and thermal dissipation, grouping shock structures.
+The current detector uses **local profile reconstruction**: it reconstructs
 a subcell shock surface from column mass and adopts a pressure-jump Mach number.
-There is no selector for the earlier center-search methods.
 
 ## 1. Install and configure
 
@@ -113,45 +111,13 @@ print("Detected centers:", result.shock.sum())
 
 The adopted Mach number comes from reconstructed **thermal pressure** states,
 with `result.mach_estimator == 'profile_pressure'`. The finder checks positive
-entropy production and the normal velocity jump internally. Density, momentum,
-and energy residuals and background sensitivity remain in `result.sampling`.
-It does not calculate secondary temperature/density Mach numbers or apply the
-old Mach-consistency post-filter. Always select using `result.shock` and state
-any additional profile-quality selection explicitly.
+entropy production and the normal velocity jump internally.
 
 Level cuts change the retained mesh, so overly restrictive cuts can remove
 needed neighbors. Temperature/density cuts affect only detection seeds: other
 retained cells remain available to reconstructed profiles. `seed_bounds` also
 restricts only starting seeds, in `position_unit`; it does not crop the mesh.
-Use all available leaf levels when possible. Inputs have open boundaries;
-periodic wrapping is not performed.
-
-### Profile reconstruction
-
-1. Seed locally compressing cells with nonzero temperature gradient and
-   `grad(T) · grad(P) > 0`. The normal is `grad(T) / |grad(T)|`, directed from
-   upstream to downstream.
-2. Sample density, thermal pressure, and momentum conservatively on a common
-   virtual AMR mesh. The reference width `h` is the coarsest covering leaf at
-   preliminary offsets `0, ±4, ±8, ±12` local cell widths. Sample from `-12h` to
-   `+12h` at spacing `h/4`, averaging a central ray and four transverse rays.
-   If the transverse stencil is incomplete, use the central ray.
-3. Fit resolved upstream/downstream backgrounds in `ln(rho)`, pressure, and
-   normal velocity. Locate a subcell surface where the joined density
-   backgrounds preserve the measured column mass across the transition.
-4. Recompute the normal in the containing leaf and repeat, using two to six
-   passes. The accepted profile uses the final leaf's normal. A last-pass
-   bounded solution is allowed only if the free mass surface is within `h/4`
-   of the current surface; it is explicitly flagged. Retain the best fit per
-   containing leaf.
-5. Evaluate one-sided states at the reconstructed surface and adopt
-
-   $$\mathcal{M}_P = \left[\frac{(\gamma+1)P_{\rm down}/P_{\rm up}+\gamma-1}{2\gamma}\right]^{1/2}.$$
-
-   Require positive pressure/density jumps, positive entropy production,
-   normal velocity-jump agreement within 15% of
-   the RH prediction, and `M_P > min_mach`. Density-jump agreement contributes
-   to fit ranking rather than imposing a hard rejection inside reconstruction.
+Use all available leaf levels when possible.
 
 An entropy signal smaller than estimated background-model sensitivity is now
 retained with `ENTROPY_UNCERTAIN`, rather than silently removed. `result.shock`
@@ -159,145 +125,6 @@ includes these tentative measurements. Use and report the quality flags when
 selecting a scientific sample. They are diagnostics, not calibrated confidence
 levels or ground-truth shock labels. Derivatives are computed for eligible seeds
 and lazily for newly located center leaves; sampling always retains all leaves.
-
-Version 0.4.1 reuses identical virtual-cell evaluations within each native
-sampling batch. Cache keys include lattice coordinates and the exact sampling
-width; the cache is discarded after the batch, so fields cannot become stale.
-Restriction, interpolation order, profile fitting, and physical checks remain
-the same. Small lookup/derivative batches run serially to avoid OpenMP team
-overhead. This is a computational optimization for every shock orientation.
-Temporary caching is bounded to 32,768 sample points per call and can use tens
-of MiB of additional memory; it does not cache the full simulation.
-
-Rebuild after updating with `python tools/build_profile_geometry.py` and restart
-the Python process. `result.diagnostics['geometry_cache_native'] == 1` confirms
-the new native entry point is available. Older binaries remain usable through
-the original sampling kernel, but do not provide the new cache acceleration.
-
-Version 0.4.2 retains only the best converged model per output leaf during the
-scan. It preserves the original quality ranking and tie order while avoiding
-storage and export-field calculation for losing duplicate models. The number
-of seeded profiles and the physical measurement rules remain unchanged. Each
-profile also reuses its trapezoid terms across background pairs; interval sums
-retain their original reduction order, without cumulative-sum subtraction.
-Scalar density evaluation and background-order classification avoid repeated
-NumPy dispatch without changing the model selection rules. Progress
-output respects `progress_interval` (seed count), defaults to approximately 5%
-increments, and also reports after 60 seconds at the next batch boundary. It
-includes processed seeds per second and the current number of unique centers;
-it no longer prints and flushes a line for every 32-seed batch.
-
-Version 0.4.3 batches profile preprocessing and runs background fitting, mass
-roots, and conservative physical rejection in an OpenMP Fortran batch kernel.
-Borderline models and surviving candidates still pass the original Python
-physical checks, quality ranking, and diagnostic calculation. Incomplete
-profiles and fixed-center retries use the scalar path. No seeds, rays, background
-models, or physical acceptance conditions are removed. The batch kernel uses
-the same pseudoinverse tables and pairwise integral summation as the reference.
-`profile_batch_size` continues to control temporary working memory; the default
-remains 32. This is an execution change, not a selectable scientific estimator.
-
-After rebuilding and restarting Python,
-`result.diagnostics['model_batch_native'] == 1` indicates that the new native
-batch entry point is available. Older binaries automatically retain scalar
-model evaluation and do not provide this acceleration. Model-only speedups are
-not the same as end-to-end speedups: AMR sampling, input preparation and final
-result assembly remain part of a complete detection run.
-
-### Shared-memory and MPI execution (0.5.0)
-
-Large scans can prepare the complete retained background once and distribute
-**all original seed batches**. The scientific estimator remains unchanged.
-Workers map the same read-only NPY files, so processes on a node share their
-physical file pages. Each node must still accommodate the background working
-set: this is seed-work distribution, not distributed storage of the AMR mesh.
-Every worker can sample across any assigned task boundary, including after
-coarse/fine changes or recentering. There is no finite halo cutoff. Physical
-input edges and user level cuts retain their existing meaning.
-
-Prepare on one process using the same `cell` and configured `finder` as above:
-
-```python
-from shocktest.distributed import prepare_workspace
-
-# Use a new directory on a filesystem visible at the same path on every node.
-prepare_workspace(cell, finder, "/shared/shock_work/output_00785", task_batches=64)
-```
-
-Preparation writes physical fields, global normalization, geometry/index,
-normals, and original batch IDs. It fails if the directory already exists.
-Keep this workspace immutable during a run; prepare again after changing the
-measurement implementation, input, or finder settings. `manifest.json` reports its disk size and seed count.
-Budget space for both the workspace and final products, and memory for the
-preparation input/temporaries and the root's final result. File-backed memory
-sharing does not remove shared-filesystem I/O or NUMA bandwidth limits.
-
-For configured execution use `shocktest.launch` as shown in section 1.
-The following low-level API examples remain available for custom job wrappers.
-Single-node execution (set thread counts before starting Python):
-
-```bash
-export OMP_NUM_THREADS=8
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-python -m shocktest.distributed run --workers 6 \
-    --workspace /shared/shock_work/output_00785 --output result_00785.pkl
-```
-
-For multiple nodes, install `mpi4py` against the MPI used by the job launcher
-and rebuild the native extensions. The optional `mpi` dependency is available
-as `pip install -e '.[native,mpi]'`; cluster module installations may require
-building mpi4py from source with their `MPICC`. Run inside the scheduler's
-allocation and use its supported MPI launch/binding options:
-
-```bash
-# Example only: the scheduler must allocate these ranks and their OpenMP cores.
-mpirun -np 12 python -m shocktest.distributed run --mpi \
-    --workspace /shared/shock_work/output_00785 --output result_00785.pkl
-```
-
-Rank zero schedules tasks and merges sparse models; the other ranks compute.
-Only rank zero assembles and writes the dense result. The reducer preserves
-the original numerical batches and quality ties, independent of task completion
-order. Ordinary worker exceptions are propagated to all ranks; incomplete or
-duplicate tasks cannot silently produce a partial result. Do not launch the
-original single-process runner under `mpirun` without this distributed entry.
-
-Workers retain an exact, bounded Fortran virtual-cell cache across batches.
-Spatial ordering groups nearby batches, while keys retain exact coordinates
-and sampling widths. The default `--cache-entries 262144` uses about 19 MiB per
-worker for persistent cache arrays; `0` disables persistence for comparisons.
-This adds to temporary sampling arrays. No seed thinning, fewer rays, or
-relaxed physical checks are introduced. Cache hits and queries are recorded in
-`result.diagnostics`; speedup must be measured at fixed allocated core count.
-
-The Python APIs are `find_parallel(workspace, workers=...)` and the collective
-`find_mpi(workspace, comm=...)`. MPI returns `None` on non-root ranks. A completed
-profile result contains the states needed for post-processing without the input
-table:
-
-```python
-analysis = finder.analyze_result(result, compute_dissipation=True,
-                                 build_catalog=False)
-```
-
-The CLI accepts `--analysis-options options.json`, containing these keyword
-options, to save a `ShockAnalysis` (or `ShockSamples` with `compact=true`) instead
-of a `ShockResult`. Existing result fields and analysis consumers are unchanged.
-Keep ordinary Python multiprocessing entry points under `if __name__ == "__main__":`.
-Input preparation, final assembly, dissipation, and catalog creation are not
-MPI-distributed in this release. Completed workspaces are reusable, but
-interrupted scans do not yet resume partially completed seed tasks.
-
-The detector does not use a velocity-divergence minimum as its final center,
-an intercell normal-dot-product gate, a two/four-crossing switch, or a
-temperature floor. Setting the removed `center_normal_cosine`,
-`center_plateau_tolerance`, `max_center_steps`, `max_steps`, or `method`
-attributes raises an error. `temperature_floor` is removed, including a zero
-assignment: reconstructed states are used without a floor. The removed
-`validate_mach`, `filter_inconsistent`, `consistency_factor`,
-`density_check_max_mach`, `density_saturation_rtol`, and `mach_validation_dtype`
-settings also raise migration errors when assigned.
 
 `finder.analyze` combines detection, optional dissipation, and optional catalog
 construction. Set `compute_dissipation` and `build_catalog` independently.
@@ -449,6 +276,27 @@ constant/nonconstant family; they are not statistical confidence intervals.
 no listed diagnostic fired. It does not certify an ideal-gas EOS, physical
 coordinate conversion, completeness, or a galaxy crossing.
 
+Upstream states must also satisfy a hard support check at the adopted surface.
+For each nonconstant upstream background, the estimator compares the fitted
+polynomial to the next polynomial degree and propagates the measured fitting
+residual through the absolute extrapolation weights. The larger error, including
+a floating-point roundoff allowance, must not exceed `sampling_tolerance` in
+log density or relative pressure. This prevents a well-fitted distant window
+from assigning a nearly zero upstream pressure with an unconstrained Mach.
+Constant backgrounds use their measured relative spread. The check reuses
+existing samples and cached polynomial bases; the native rejection screen
+and final checks use the same rule. No new mesh sampling pass is added.
+`sampling['upstream_state_error']` has shape `(K,2)`, with log-density sensitivity
+in column 0 (relative spread for a constant density model) and relative-pressure
+sensitivity in column 1. These are model
+sensitivity bounds, not statistical confidence intervals or proof of a shock.
+The field is also retained in compact products and profile NPZ exports.
+
+This acceptance update can reuse prepared v0.6.0 workspaces whose mesh,
+normalization, and candidate definitions are unchanged. Rerun detection to
+obtain updated centers and states: filtering an old result cannot recover
+alternative background models or previously rejected seed fits.
+
 ```python
 from shocktest import ProfileQualityFlag, galaxy_pressure
 s = result.sampling
@@ -557,11 +405,7 @@ finder.min_mach = 1.5
 analysis = finder.analyze(cell, build_catalog=False)
 result, dissipation = analysis.result, analysis.dissipation
 
-# Use the same explicit selection for both maps. New results default to all detections.
-valid = result.shock.copy()
-# Optional: choose a profile-quality subset explicitly, then use it for both maps.
-# s = result.sampling
-# valid[s['rows'][~s['quality_clear']]] = False
+# Both maps automatically use the same physical-consistency selection.
 
 extent = painter.map_extent_from_result(result, plane="xy")  # Physical km.
 map_options = dict(
@@ -571,7 +415,7 @@ map_options = dict(
     method="amr",                   # Paint cell footprints, not just cell centers.
     statistic="max",                # Strongest value in each pixel; "mean" is also available.
     min_mach=1.5,
-    valid_mach=valid,
+    valid_mach=None,                # Automatic profile/legacy consistency selection.
     z_center=None, z_width=None,     # Set both in km to select a line-of-sight slab.
     fill_gaps=0,                     # Leave pixels with no measured contribution empty.
 )
@@ -598,6 +442,60 @@ plane. AMR `mean` uses overlap-area weighting; `sum` is an overlap-weighted
 projected quantity divided by pixel area, not total dissipated energy.
 An empty selection produces empty/NaN map pixels. To include all detected
 centers regardless of consistency, pass `valid_mach=result.shock` explicitly.
+
+For profile results, the automatic selection requires `entropy_margin > 1`
+(entropy production larger than the estimated background-model sensitivity,
+not a statistical significance), finite nonnegative jump residuals and a
+normal-velocity residual no larger than 0.15. Density, momentum and energy
+residuals must also be <=0.15 for Mach <=3. Strong-shock downstream density
+peaks can be unresolved even when the pressure Mach is accurate; applying
+these three vetoes at every Mach removed known coarse Sedov shocks in tests.
+Their values remain available as diagnostics at higher Mach.
+Saved `upstream_state_error` values must also be finite, nonnegative, and no
+larger than `result.sampling_tolerance`. Earlier v0.6.0 results lack the latter
+field: only their saved residuals can be checked without rerunning detection.
+Historical temperature-jump results retain their saved Mach-consistency mask.
+Center/model sensitivity, bounded-normal, incomplete-tube and single-background
+flags are not automatically treated as vetoes.
+This is a consistent-measurement subset, not a guarantee of a physical shock
+or a complete census of shocks; coarse or curved real shocks may fail.
+
+The maps do not modify the raw result, dissipation arrays, catalog, or labels.
+Use the same selection explicitly for research statistics:
+
+```python
+rows = shocktest.valid_shock_rows(result)  # Retained result rows, not input IDs.
+mach_selected = result.mach[rows]
+power_selected = dissipation.total[rows].sum()
+slots = np.searchsorted(result.sampling['rows'], rows)
+upstream_temperature = result.sampling['temperature'][slots, 0]
+```
+
+`result.valid_shock` or `shocktest.shock_valid_mask(result)` returns the
+equivalent dense boolean mask on demand. Prefer the sparse row helper for
+large datasets. No additional full-mesh validity array is stored in the result.
+For a different residual tolerance, pass an explicit mask to both maps, e.g.
+`valid_mach=shocktest.shock_valid_mask(result, closure_tolerance=0.3)`, and use
+the same tolerance in `valid_shock_rows` for matching statistics.
+For strict density/momentum/energy checks at all Mach numbers, set
+`closure_max_mach=None` in these helpers. The default is `3.0`.
+
+To apply this selection before rebuilding a catalog without rerunning detection:
+
+```python
+selected = shocktest.filter_shocks(result)
+selected_analysis = finder.analyze_result(
+    selected, compute_dissipation=True, build_catalog=True,
+    catalog_options={"min_group_size": 3},
+)
+```
+
+`filter_shocks` creates a new shock mask and aligned sparse sampling fields;
+dense measurements are shared, so do not edit them in-place. The original
+catalog describes the original detections and must not be reused as a filtered
+catalog. This selection cannot recover alternative backgrounds rejected by an
+earlier detector. Rebuild native extensions and rerun detection for the v0.6.1
+upstream-reconstruction change; unchanged prepared v0.6.0 meshes remain reusable.
 
 ### 5-2. Build a shock catalog and retrieve its members
 
@@ -642,52 +540,3 @@ to no retained front. Membership must stay paired with the same result row order
 
 For historical results without `center_position`, use `result.pos` and label
 those measurements as cell-center positions.
-
-## 6. Reading RAMSES outputs and exporting results
-
-The single-rank RAMSES reader supports the current idealized simulations:
-3D, five pure-hydro variables, and gamma=5/3, on either uniform or AMR meshes.
-It checks the output layout and converts `unit_l`, `unit_t`, and `unit_d` to
-physical units. Multi-rank, RT, and MHD output layouts are not supported by this
-reader. OpenMP runs with one MPI rank satisfy the single-rank requirement.
-
-Run detection in a Python script and export the measurements for later analysis:
-
-```python
-from shocktest.ramses import load_snapshot, snapshot_finder
-from shocktest.profile_analysis import save_profiles, save_slice
-
-cell, meta = load_snapshot("/path/to/run/output_00003")
-finder = snapshot_finder(meta)
-result = finder.find(cell)
-save_profiles("results/profiles.npz", result, meta)
-save_slice("results/slice_z.npz", cell, axis="z")
-```
-
-The saved NPZ files can be read without the original snapshot or another
-detection run. For example, use the following in an analysis notebook:
-
-```python
-import numpy as np
-import matplotlib.pyplot as plt
-from shocktest.profile_analysis import plot_saved_slice
-
-with np.load("results/profiles.npz", allow_pickle=False) as saved:
-    mach = saved["mach"].copy()
-    quality_clear = saved["quality_clear"].copy()
-
-fig, ax = plot_saved_slice("results/slice_z.npz", field="temperature",
-                           profiles="results/profiles.npz")
-plt.show()
-```
-
-Area weights based on cell width and normal direction are detection-area
-proxies. Accuracy distributions conditioned on detected centers do not measure
-complete shock-surface coverage. Analytic references, when used for evaluation,
-must not enter the detector.
-
-Prepared workspaces use uncompressed binary `.npy` arrays directly for
-read-only mmap sharing. No node-local decompression cache is required.
-Released v0.5.0 NPY workspaces are accepted when their verified measurement
-implementation matches; user input files and manifests are never rewritten.
-Legacy compressed workspaces remain readable through the optional staging path.
