@@ -340,7 +340,7 @@ def find_mpi(directory, *, comm=None, cache_entries=262144, show_progress=True):
     try:
         meta = _metadata(directory)
         worker = _Worker(directory, cache_entries) if rank else None
-        identity = (meta['workspace_id'], meta['implementation_digest'])
+        identity = (meta['workspace_id'], meta['implementation_digest'], _measurement_digest())
     except Exception:
         error = traceback.format_exc()
         identity = None

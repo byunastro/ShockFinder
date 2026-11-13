@@ -426,6 +426,10 @@ module profile_model_kernel
   use, intrinsic :: ieee_arithmetic
   implicit none
 contains
+  integer function upstream_policy_version() result(version)
+    version=2
+  end function
+
   recursive real(8) function pairwise_sum(a,n) result(v)
     ! Match NumPy's float64 contiguous pairwise reduction, including tail order.
     integer,intent(in)::n
@@ -563,7 +567,7 @@ contains
         call upstream_state_errors(s,states,bounds(1,l,1),bounds(2,l,1), &
                                    orders(:,l,1),center,up,pinv,n,support)
         ! Borderline values remain for the authoritative surface checks.
-        if(all(ieee_is_finite(support)).and.any(support>tol+guard))then
+        if(all(ieee_is_finite(support)).and.support(2)>1d0+guard)then
           possible(l,r)=0;cycle
         endif
         ratio=down(1)/up(1);rp=down(2)/up(2)
@@ -622,7 +626,9 @@ contains
     integer,intent(out)::orders(2,6),bounds(2,6),nfit
     real(8)::cs(3,2,n),us(3,n),errs(n),y(n),t(n),raw(n),beta(4),higher(4),b(3)
     real(8)::ctr,scale,target,den,avg,spread,res,unc,at,nxt,pred,e(2),last,step
+    real(8)::up(2),support(2),score(n)
     integer::os(2,n),ib(2,n),edge,first,final,nn,k,j,d,var,count,flat,idx,m,chosen(6),nc
+    integer::unstable(n),degree(n),best,attempt
     logical::ok,accepted,have_last,duplicate
     coeff=0;vel=0;errors=0;orders=0;bounds=0;nfit=0
     count=0;flat=0;have_last=.false.;step=s(2)-s(1)
@@ -639,7 +645,7 @@ contains
       endif
       if(first<1.or.final>n)goto 90
       if(s(final)-s(first)+step/2d0<2d0*maxval(widths(first:final)))goto 90
-      if(count>=4)then
+      if(side>0.and.count>=4)then
         do var=1,2
           if((maxval(states(first:final,var))-minval(states(first:final,var))) &
               /(sum(states(first:final,var))/nn)>tol)goto 90
@@ -694,7 +700,7 @@ contains
             nxt=nxt+higher(k)*target**(k-1)
           enddo
           unc=abs(nxt-at)/den
-          if(res<=tol.and.(unc<=tol.or.d==2))then
+          if(res<=tol.and.(side<0.or.unc<=tol.or.d==2))then
             call physical(beta(1:3),ctr,scale,cs(:,var,count+1))
             os(var,count+1)=d;e(var)=min(max(res,unc),1d0)
             accepted=.true.;exit
@@ -723,16 +729,52 @@ contains
     do j=1,nc
       chosen(j)=j
     enddo
-    flat=0
-    do j=1,count
-      if(any(os(:,j)/=0))cycle
-      flat=flat+1
-      duplicate=any(chosen(1:nc)==j)
-      if(.not.duplicate)then
-        nc=nc+1;chosen(nc)=j
-      endif
-      if(flat==2)exit
-    enddo
+    if(side<0)then
+      ! Rank already sampled alternatives by admissibility, then simplicity
+      ! and extrapolation sensitivity. Retain two beyond the nearest four.
+      do j=5,count
+        degree(j)=maxval(os(:,j));unstable(j)=1;score(j)=huge(1d0)
+        up=[exp(max(-700d0,min(700d0,polynomial(cs(:,1,j),s(peak))))), &
+            polynomial(cs(:,2,j),s(peak))]
+        if(all(ieee_is_finite(up)).and.minval(up)>0d0)then
+          call upstream_state_errors(s,states,ib(1,j),ib(2,j),os(:,j),s(peak),up,pinv,n,support)
+          if(all(ieee_is_finite(support)))then
+            score(j)=sum(support)
+            if(minval(support)>=0d0.and.support(2)<1d0)unstable(j)=0
+          endif
+        endif
+      enddo
+      do attempt=1,2
+        best=0
+        do j=5,count
+          if(any(chosen(1:nc)==j))cycle
+          if(best==0)then
+            best=j
+          else if(unstable(j)<unstable(best))then
+            best=j
+          else if(unstable(j)==unstable(best))then
+            if(degree(j)<degree(best))then
+              best=j
+            else if(degree(j)==degree(best).and.score(j)<score(best))then
+              best=j
+            endif
+          endif
+        enddo
+        if(best==0)exit
+        nc=nc+1;chosen(nc)=best
+      enddo
+    else
+      flat=0
+      do j=1,count
+        if(any(os(:,j)/=0))cycle
+        flat=flat+1
+        duplicate=any(chosen(1:nc)==j)
+        if(.not.duplicate)then
+          nc=nc+1;chosen(nc)=j
+        endif
+        if(flat==2)exit
+      enddo
+    endif
     nfit=nc
     do m=1,nc
       idx=chosen(m);coeff(:,:,m)=cs(:,:,idx);vel(:,m)=us(:,idx)

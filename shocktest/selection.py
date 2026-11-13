@@ -9,7 +9,7 @@ import numpy as np
 
 
 def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
-                     closure_max_mach=3.0):
+                     closure_max_mach=3.0, require_upstream_reliable=False):
     """Return selected retained-row indices, in ascending order.
 
     Profile results require a resolved positive entropy signal (entropy_margin
@@ -17,8 +17,12 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
     Density/momentum/energy residuals must also be <=0.15 for Mach <=3;
     unresolved strong-shock downstream peaks can fail these diagnostics even
     with an accurate pressure Mach. Set closure_max_mach=None to enforce them
-    at every Mach. When saved upstream-state errors are available, both must
-    also be <= result.sampling_tolerance. Earlier
+    at every Mach. Saved upstream-state errors must be finite and nonnegative;
+    relative pressure sensitivity must be <1 (no pressure cancellation).
+    A 1% upstream precision target is not a default shock-existence veto.
+    require_upstream_reliable=True additionally applies the stored fitting
+    tolerance to both upstream sensitivities for an explicit quality subset.
+    Earlier
     profile archives without those errors receive the residual checks only;
     their upstream extrapolation cannot be validated retroactively here.
 
@@ -34,6 +38,8 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
         raise ValueError('mach and boolean shock must be aligned one-dimensional arrays')
     if not np.isfinite(min_mach):
         raise ValueError('min_mach must be finite')
+    if not isinstance(require_upstream_reliable, (bool, np.bool_)):
+        raise ValueError('require_upstream_reliable must be boolean')
     if not np.isfinite(closure_tolerance) or closure_tolerance < 0:
         raise ValueError('closure_tolerance must be nonnegative and finite')
     if closure_max_mach is not None and (not np.isfinite(closure_max_mach) or closure_max_mach < 1):
@@ -70,13 +76,19 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
             error = np.asarray(sampling['upstream_state_error'])
             if error.shape != (len(rows), 2):
                 raise ValueError('upstream_state_error must have shape (K, 2)')
-            tolerance = float(getattr(result, 'sampling_tolerance', 0.01))
-            if not np.isfinite(tolerance) or tolerance <= 0:
-                raise ValueError('sampling_tolerance must be positive and finite')
             keep &= (np.isfinite(error).all(axis=1) & (error >= 0).all(axis=1)
-                     & (error <= tolerance).all(axis=1))
+                     & (error[:, 1] < 1))
+            if require_upstream_reliable:
+                tolerance = float(getattr(result, 'sampling_tolerance', 0.01))
+                if not np.isfinite(tolerance) or tolerance < 0:
+                    raise ValueError('sampling_tolerance must be nonnegative and finite')
+                keep &= (error <= tolerance).all(axis=1)
+        elif require_upstream_reliable:
+            raise ValueError('Upstream quality selection requires saved upstream_state_error')
         return rows[keep]
 
+    if require_upstream_reliable:
+        raise ValueError('Upstream quality selection requires profile sampling diagnostics')
     # Restrict work to detected rows; never expand historical status into six
     # additional full-mesh boolean arrays merely to select a plot.
     rows = np.flatnonzero(shock)
@@ -98,20 +110,21 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
 
 
 def shock_valid_mask(result, *, min_mach=1.0, closure_tolerance=0.15,
-                     closure_max_mach=3.0):
+                     closure_max_mach=3.0, require_upstream_reliable=False):
     """Dense equivalent of valid_shock_rows; allocates one bool per result row.
 
     Prefer valid_shock_rows for large datasets when a dense mask is unnecessary.
     """
     rows = valid_shock_rows(result, min_mach=min_mach, closure_tolerance=closure_tolerance,
-                           closure_max_mach=closure_max_mach)
+                           closure_max_mach=closure_max_mach,
+                           require_upstream_reliable=require_upstream_reliable)
     mask = np.zeros(np.shape(result.mach), dtype=bool)
     mask[rows] = True
     return mask
 
 
 def filter_shocks(result, *, min_mach=1.0, closure_tolerance=0.15,
-                  closure_max_mach=3.0):
+                  closure_max_mach=3.0, require_upstream_reliable=False):
     """Create a selected result for catalog/analysis without rerunning detection.
 
     Dense fields are shared; a new shock mask and selected sparse diagnostics
@@ -122,7 +135,8 @@ def filter_shocks(result, *, min_mach=1.0, closure_tolerance=0.15,
     selected = copy.copy(result)
     selected.shock = shock_valid_mask(result, min_mach=min_mach,
                                      closure_tolerance=closure_tolerance,
-                                     closure_max_mach=closure_max_mach)
+                                     closure_max_mach=closure_max_mach,
+                                     require_upstream_reliable=require_upstream_reliable)
     sampling = getattr(result, 'sampling', None)
     if sampling is not None:
         rows = np.asarray(sampling['rows'])

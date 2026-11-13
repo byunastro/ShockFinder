@@ -98,7 +98,8 @@ def prepare(arrays, finder, pressure=None):
 
 def fit_precedes(fit, old):
     """Preserve serial quality and traversal ties after arbitrary task ordering."""
-    return (fit['quality'], fit['_order']) < (old['quality'], old['_order'])
+    return (not fit.get('upstream_reliable', True), fit['quality'], fit['_order']) < (
+        not old.get('upstream_reliable', True), old['quality'], old['_order'])
 
 
 def scan(context, finder, batch_starts=None, *, best=None, normal_cache=None):
@@ -329,6 +330,8 @@ def finish(context, best, counts, derivative_cells):
     diagnostics["duplicate_leaf_models"] = diagnostics.pop('accepted_models', 0) - len(best)
     diagnostics["accepted_centers"] = len(best)
     diagnostics['quality_clear_centers']=sum(f['quality_flags']==0 for f in best.values())
+    diagnostics['upstream_sensitive_centers']=sum(not f['upstream_reliable'] for f in best.values())
+    diagnostics['upstream_alternative_centers']=sum(f['upstream_alternative'] for f in best.values())
     diagnostics['model_native']=int(profile_model.NATIVE_MODEL is not None)
     diagnostics['model_batch_native']=int(hasattr(profile_model.NATIVE_MODEL,'screen_batch'))
     diagnostics['derivative_cells'] = int(derivative_cells)

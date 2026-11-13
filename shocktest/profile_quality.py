@@ -14,6 +14,7 @@ class ProfileQualityFlag(IntFlag):
     NORMAL_BOUNDED = 64
     INCOMPLETE_TUBE = 128
     SINGLE_BACKGROUND = 256
+    UPSTREAM_SENSITIVE = 512
 
 
 def quality_flags(fit, full_tube=True):
@@ -28,6 +29,7 @@ def quality_flags(fit, full_tube=True):
     if fit['center_constraint_active']: flag |= ProfileQualityFlag.NORMAL_BOUNDED
     if not full_tube: flag |= ProfileQualityFlag.INCOMPLETE_TUBE
     if fit['model_count'] < 2: flag |= ProfileQualityFlag.SINGLE_BACKGROUND
+    if not fit.get('upstream_reliable', True): flag |= ProfileQualityFlag.UPSTREAM_SENSITIVE
     return int(flag)
 
 

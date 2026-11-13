@@ -270,38 +270,50 @@ and `shock_speed_pressure` in km/s, `momentum_residual`, `energy_residual`,
 `entropy_margin`, `background_model_count`, `mach_model_range`, and
 `center_model_range` (two displacements from the adopted center, position units).
 `center_sensitivity` estimates the amplification of background-model errors by
-small density contrast. The ranges describe valid models in the selected
-constant/nonconstant family; they are not statistical confidence intervals.
+small density contrast. The ranges describe admissible models after the
+constant/nonconstant and upstream-precision preferences; they are not
+statistical confidence intervals.
 `profile_quality_flags` is a `ProfileQualityFlag` bitmask; `quality_clear` means
 no listed diagnostic fired. It does not certify an ideal-gas EOS, physical
 coordinate conversion, completeness, or a galaxy crossing.
 
-Upstream states must also satisfy a hard support check at the adopted surface.
-For each nonconstant upstream background, the estimator compares the fitted
-polynomial to the next polynomial degree and propagates the measured fitting
-residual through the absolute extrapolation weights. The larger error, including
-a floating-point roundoff allowance, must not exceed `sampling_tolerance` in
-log density or relative pressure. This prevents a well-fitted distant window
-from assigning a nearly zero upstream pressure with an unconstrained Mach.
-Constant backgrounds use their measured relative spread. The check reuses
-existing samples and cached polynomial bases; the native rejection screen
-and final checks use the same rule. No new mesh sampling pass is added.
+Upstream reconstruction first uses a constant background when its spread is
+within `sampling_tolerance`, then a linear fit, and adds quadratic curvature
+only when needed to fit the sampled window. Four nearby windows and up to two
+stable alternative windows are retained, using the existing profile samples.
+For each nonconstant model, the estimator compares the fitted polynomial to
+the next degree and propagates measured fitting residuals through the absolute
+extrapolation weights. Constant models use their measured relative spread.
+At the adopted surface, the pressure must remain positive under this model
+perturbation: relative pressure sensitivity must be strictly below 1. This
+guards against cancellation to a nearly zero upstream pressure. The native
+screen and final checks use the same rule; no new mesh sampling pass is added.
+
+The fitting tolerance is a precision target, not a shock-existence condition.
+Models meeting it for both upstream sensitivities are preferred. If none do,
+an admissible fit may still identify a shock; it is retained with
+`ProfileQualityFlag.UPSTREAM_SENSITIVE` and `sampling['upstream_reliable']=False`.
+`sampling['upstream_alternative']` records use of an alternative window beyond
+the nearest four. These fields separate tentative detections from measurements
+meeting the upstream precision target. They do not prove shock origin or truth.
 `sampling['upstream_state_error']` has shape `(K,2)`, with log-density sensitivity
 in column 0 (relative spread for a constant density model) and relative-pressure
 sensitivity in column 1. These are model
 sensitivity bounds, not statistical confidence intervals or proof of a shock.
 The field is also retained in compact products and profile NPZ exports.
 
-This acceptance update can reuse prepared v0.6.0 workspaces whose mesh,
+This acceptance update can reuse prepared v0.6.0/v0.6.1 workspaces whose mesh,
 normalization, and candidate definitions are unchanged. Rerun detection to
 obtain updated centers and states: filtering an old result cannot recover
 alternative background models or previously rejected seed fits.
 
 ```python
-from shocktest import ProfileQualityFlag, galaxy_pressure
+from shocktest import ProfileQualityFlag, galaxy_pressure, valid_shock_rows
 s = result.sampling
 rows = s['rows']
 clear_rows = rows[s['quality_clear']]  # Conservative diagnostic subset.
+upstream_sensitive_rows = rows[~s['upstream_reliable']]
+precision_rows = valid_shock_rows(result, require_upstream_reliable=True)
 uncertain = (s['profile_quality_flags'] & int(ProfileQualityFlag.ENTROPY_UNCERTAIN)) != 0
 # Gas and galaxy velocities MUST use the same physical frame and km/s.
 forcing = galaxy_pressure(s, galaxy_velocity, density_factor=1.0)  # g/cc input
@@ -451,9 +463,14 @@ residuals must also be <=0.15 for Mach <=3. Strong-shock downstream density
 peaks can be unresolved even when the pressure Mach is accurate; applying
 these three vetoes at every Mach removed known coarse Sedov shocks in tests.
 Their values remain available as diagnostics at higher Mach.
-Saved `upstream_state_error` values must also be finite, nonnegative, and no
-larger than `result.sampling_tolerance`. Earlier v0.6.0 results lack the latter
-field: only their saved residuals can be checked without rerunning detection.
+Saved `upstream_state_error` values must also be finite and nonnegative, with
+relative pressure sensitivity strictly below 1. Exceeding the upstream
+precision target does not automatically remove a detected shock. To require
+that precision explicitly, use
+`valid_shock_rows(result, require_upstream_reliable=True)` or pass the same
+keyword to `filter_shocks` / `shock_valid_mask`. Earlier v0.6.0 results lack
+the error field: their saved residuals can be checked, but upstream quality
+selection requires rerunning detection.
 Historical temperature-jump results retain their saved Mach-consistency mask.
 Center/model sensitivity, bounded-normal, incomplete-tube and single-background
 flags are not automatically treated as vetoes.
@@ -494,8 +511,8 @@ selected_analysis = finder.analyze_result(
 dense measurements are shared, so do not edit them in-place. The original
 catalog describes the original detections and must not be reused as a filtered
 catalog. This selection cannot recover alternative backgrounds rejected by an
-earlier detector. Rebuild native extensions and rerun detection for the v0.6.1
-upstream-reconstruction change; unchanged prepared v0.6.0 meshes remain reusable.
+earlier detector. Rebuild native extensions and rerun detection for the v0.6.2
+upstream-reconstruction change; unchanged prepared v0.6.0/v0.6.1 meshes remain reusable.
 
 ### 5-2. Build a shock catalog and retrieve its members
 

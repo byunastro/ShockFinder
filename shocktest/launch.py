@@ -91,8 +91,9 @@ def main():
                 'assert _profile_geometry is not None; '
                 'assert hasattr(_profile_geometry.profile_geometry_kernel,"sample_batch_reuse"); '
                 'assert hasattr(_profile_geometry.profile_model_kernel,"screen_batch"); '
-                'assert hasattr(_profile_geometry.profile_model_kernel,"upstream_state_errors"), '
-                '"Rebuild the v0.6.1 native profile extension"; '
+                'assert hasattr(_profile_geometry.profile_model_kernel,"upstream_policy_version"), '
+                '"Rebuild the v0.6.2 native profile extension"; '
+                'assert _profile_geometry.profile_model_kernel.upstream_policy_version()==2; '
                 'print("Native kernels OK")')
         if args.mpi:
             if not manifest['mpi']:

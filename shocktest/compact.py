@@ -181,6 +181,7 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
                 columns[endpoint + '_relative_temperature_change'] = (
                     raw_sampling['relative_temperature_change'][slots, side].copy())
         for name in ('support_pos','reference_width','density_residual','velocity_residual','upstream_state_error',
+                     'upstream_reliable','upstream_alternative',
                      'center_constraint_active','mass_surface_displacement','profile_passes',
                      'quality','background_orders','velocity','entropy_margin','center_sensitivity',
                      'momentum_residual','energy_residual','shock_speed_mass','shock_speed_pressure',

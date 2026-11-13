@@ -9,6 +9,10 @@ from functools import lru_cache
 from . import _profile_geometry
 
 NATIVE_MODEL = getattr(_profile_geometry, 'profile_model_kernel', None)
+if NATIVE_MODEL is not None and (
+        not hasattr(NATIVE_MODEL, 'upstream_policy_version') or
+        NATIVE_MODEL.upstream_policy_version() != 2):
+    raise RuntimeError('Rebuild the v0.6.2 native profile extension before running detection')
 
 DIAGNOSTICS = Counter()
 
@@ -104,6 +108,16 @@ def upstream_state_errors(s, states, first, last, orders, center, upstream):
                   np.finfo(float).tiny) * max(amplification, 1.0))
         errors[var] = error if var == 0 else error/upstream[var]
     return errors
+
+
+def upstream_admissible(error):
+    """Reject pressure cancellation; small model sensitivity is a quality flag.
+
+    A pressure prediction must stay positive under the measured residual and
+    next-order perturbation. These perturbations are not confidence intervals.
+    Log-density sensitivity is reported, not compared to a precision target.
+    """
+    return bool(np.isfinite(error).all() and (error >= 0).all() and error[1] < 1.)
 
 
 def reconstruct_batch(s, states, velocities, widths, normals, tolerance=0.01,
@@ -229,7 +243,7 @@ def reconstruct(
             ]
         )
 
-    def fit_background(ix):
+    def fit_background(ix, side):
         x = s[ix]
         center = x.mean()
         scale = (x[-1] - x[0]) / 2
@@ -258,7 +272,7 @@ def reconstruct(
                 at = sum(beta[k] * target**k for k in range(degree + 1))
                 next_at = sum(higher[k] * target**k for k in range(degree + 2))
                 uncertainty = abs(next_at - at) / denominator
-                if res <= tolerance and (uncertainty <= tolerance or degree == 2):
+                if res <= tolerance and (side < 0 or uncertainty <= tolerance or degree == 2):
                     choice = (
                         physical(beta, center, scale),
                         min(max(res, uncertainty), 1.0),
@@ -294,20 +308,31 @@ def reconstruct(
                 continue
             if s[ix[-1]] - s[ix[0]] + step / 2 < 2 * widths[ix].max():
                 continue
-            if len(result) >= 4 and np.any(
+            if side > 0 and len(result) >= 4 and np.any(
                 np.ptp(states[ix], axis=0) / states[ix].mean(axis=0) > tolerance
             ):
                 continue
-            fit = fit_background(ix)
+            fit = fit_background(ix, side)
             if fit is not None:
                 result.append((ix, *fit))
                 last = s[edge]
                 if sum(not r[3].any() for r in result) >= 2:
                     break
-        # Keep the nearest smooth models and the nearest resolved constant state.
+        # Keep four nearby models, plus two stable alternatives on existing
+        # samples. Lower-order upstream fits are tried before adding curvature.
         flat = [r for r in result if not r[3].any()]
         chosen = result[:4]
-        for r in flat[:2]:
+        alternatives = flat[:2]
+        if side < 0:
+            def rank(r):
+                ix, coeff, _, orders, _ = r
+                up = np.array([density_at(coeff[0], s[peak]), value(coeff[1], s[peak])])
+                error = upstream_state_errors(s, states, int(ix[0]), int(ix[-1]),
+                                              orders, s[peak], up) if (up > 0).all() else np.full(2, np.inf)
+                return (not upstream_admissible(error), int(max(orders)),
+                        float(np.sum(error)), -int(ix[0]))
+            alternatives = sorted((r for r in result[4:]), key=rank)[:2]
+        for r in alternatives:
             if all(r is not q for q in chosen):
                 chosen.append(r)
         return chosen
@@ -386,15 +411,15 @@ def reconstruct(
             continue
         up = np.array([density_at(cl[0], center), value(cl[1], center)])
         down = np.array([density_at(cr[0], center), value(cr[1], center)])
-        if np.min([*up, *down]) <= 0:
+        if not np.isfinite([*up, *down]).all() or np.min([*up, *down]) <= 0:
             continue
         support_error = upstream_state_errors(
             s, states, int(il[0]), int(il[-1]), ol, center, up)
-        if not np.isfinite(support_error).all() or np.any(support_error > tolerance):
+        if not upstream_admissible(support_error):
             continue
         r = down[0] / up[0]
         rp = down[1] / up[1]
-        if r <= 1 or rp <= 1:
+        if not np.isfinite([r, rp]).all() or r <= 1 or rp <= 1:
             continue
         entropy = rp / r**gamma
         # Positive entropy production remains a physical requirement. Background
@@ -410,6 +435,8 @@ def reconstruct(
         vr = value(ur, center)
         dr = abs(r - re) / max(abs(r - 1), 1e-12)
         dv = abs((vl - vr) - jump) / max(abs(jump), 1e-12 * sound)
+        if not np.isfinite([m, re, sound, jump, vl, vr, dr, dv]).all():
+            continue
         # Density is a QUALITY SCORE, not a hard veto on unresolved Sedov peaks.
         if vl <= vr or dv > closure_tolerance:
             continue
@@ -424,6 +451,8 @@ def reconstruct(
                 density_residual=float(dr),
                 velocity_residual=float(dv),
                 upstream_state_error=support_error,
+                upstream_reliable=bool(np.all(support_error <= tolerance)),
+                upstream_alternative=bool(li >= 4),
                 entropy_ratio=float(entropy),
                 entropy_margin=float(np.log(entropy) / max((1+gamma)*(errl+errr),1e-30)),
                 normal_velocity=np.array([vl,vr]),
@@ -442,6 +471,8 @@ def reconstruct(
         return fail("no_conservative_jump_model")
     flat = [r for r in candidates if not r["orders"].any()]
     family = flat or candidates
+    reliable = [r for r in family if r['upstream_reliable']]
+    family = reliable or family
     best = min(family, key=lambda r: r["quality"])
     # Ranges are conditional on the resolved, physically admissible background
     # family. They are sensitivity diagnostics, NEVER statistical intervals.
