@@ -1,0 +1,852 @@
+{
+  "input_dir": "/Users/byeongyeonghwan/NC_shock",
+  "snapshot_start": 605,
+  "snapshot_end": 785,
+  "selected_snapshots": [
+    783,
+    785
+  ],
+  "outside_range_not_loaded": [
+    787
+  ],
+  "snapshot_number_convention": "integer parsed from the sole digit group in each filename; selected snapshots sorted numerically",
+  "snapshots": [
+    {
+      "timestep": 783,
+      "files": {
+        "catalog": "/Users/byeongyeonghwan/NC_shock/catalog_00783.pkl",
+        "dissipation": "/Users/byeongyeonghwan/NC_shock/dissipation_00783.pkl",
+        "result": "/Users/byeongyeonghwan/NC_shock/result_00783.pkl"
+      },
+      "objects": {
+        "result": {
+          "type": "shocktest.core.ShockResult",
+          "file_bytes": 34920056242,
+          "fields": {
+            "mach": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 195
+            },
+            "shock": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288595489,
+              "payload_offset": 2308764196
+            },
+            "center_index": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 2597359779
+            },
+            "upstream_index": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 3751741797
+            },
+            "downstream_index": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 4906123817
+            },
+            "selected_indices": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 6060505837
+            },
+            "pos": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489,
+                3
+              ],
+              "dtype": "<f8",
+              "order": "F",
+              "payload_bytes": 6926291736,
+              "payload_offset": 7214887850
+            },
+            "dx": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 14141179636
+            },
+            "normal": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489,
+                3
+              ],
+              "dtype": "<f8",
+              "order": "F",
+              "payload_bytes": 6926291736,
+              "payload_offset": 16449943608
+            },
+            "level": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 23376235397
+            },
+            "zone_width": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 24530617411
+            },
+            "diagnostics": {
+              "type": "dict",
+              "value": {
+                "center_step_limit": 0,
+                "upstream_missing_neighbor": 77005,
+                "upstream_step_limit": 115,
+                "downstream_missing_neighbor": 41168,
+                "downstream_step_limit": 52,
+                "candidate_exit": 5267173,
+                "thermodynamic_exit": 43134116,
+                "nonconverging_exit": 21608901,
+                "invalid_jump": 23646645,
+                "mach_rejected": 9256515
+              }
+            },
+            "mach_temperature": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 195
+            },
+            "mach_pressure": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 26839381710
+            },
+            "mach_density": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 27993763726
+            },
+            "temperature_ratio": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 29148145747
+            },
+            "pressure_ratio": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 30302527765
+            },
+            "density_ratio": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1154381956,
+              "payload_offset": 31456909782
+            },
+            "pressure_check_valid": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288595489,
+              "payload_offset": 32611291806
+            },
+            "pressure_consistent": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288595489,
+              "payload_offset": 32899887362
+            },
+            "density_check_valid": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288595489,
+              "payload_offset": 33188482918
+            },
+            "density_consistent": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288595489,
+              "payload_offset": 33477078473
+            },
+            "density_check_applicable": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288595489,
+              "payload_offset": 33765674034
+            },
+            "mach_consistent": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288595489,
+              "payload_offset": 34054269586
+            },
+            "mach_validation_status": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<u2",
+              "order": "C",
+              "payload_bytes": 577190978,
+              "payload_offset": 34342865179
+            },
+            "gamma": {
+              "type": "float",
+              "value": 1.6666666666666667
+            },
+            "temperature_floor": {
+              "type": "float",
+              "value": 10000.0
+            },
+            "position_unit": {
+              "type": "str",
+              "value": "km"
+            }
+          },
+          "embedded_snapshot_present": false
+        },
+        "dissipation": {
+          "type": "shocktest.pyShockFinder.DissipationResult",
+          "file_bytes": 11543820010,
+          "fields": {
+            "flux": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 210
+            },
+            "total": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 2308764175
+            },
+            "area": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 4617528139
+            },
+            "efficiency": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 6926292109
+            },
+            "sound_speed": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288595489
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2308763912,
+              "payload_offset": 9235056080
+            }
+          },
+          "embedded_snapshot_present": false
+        },
+        "catalog": {
+          "type": "builtins.NoneType",
+          "file_bytes": 4,
+          "fields": {},
+          "embedded_snapshot_present": false
+        }
+      },
+      "retained_cells": 288595489,
+      "detected_shocks": 2081325,
+      "center_ids_equal_retained_row": true,
+      "center_ids_unique_within_snapshot": true,
+      "negative_center_ids": false,
+      "center_id_min": 10,
+      "center_id_max": 288593026,
+      "result_measurement_sample": {
+        "sample_count": 1024,
+        "sampling": "evenly spaced accepted-center IDs",
+        "sample_valid_geometry_mach_dx": 1024,
+        "sample_normal_norm_min": 0.9999999999999998,
+        "sample_normal_norm_max": 1.0000000000000002,
+        "sample_normals_unit_within_tolerance": 1024,
+        "sample_mach_min": 1.3008366148610384,
+        "sample_mach_max": 26.91502570954663,
+        "sample_dx_min": 2634250560043373.0,
+        "sample_dx_max": 1.6859203584277587e+17,
+        "sample_position_min": [
+          1.3766382686741864e+21,
+          1.3252176977421397e+21,
+          1.3533725677278834e+21
+        ],
+        "sample_position_max": [
+          1.468984556307067e+21,
+          1.415920213025553e+21,
+          1.4449180431905105e+21
+        ],
+        "sample_level_min": 14,
+        "sample_level_max": 20,
+        "sample_endpoint_orientation": {
+          "tested": 1024,
+          "positive_upstream_to_downstream_projection": 1024,
+          "negative_projection": 0,
+          "zero_projection": 0,
+          "periodic_unwrapping_applied": false
+        }
+      },
+      "position_unit": "km",
+      "aexp_field": null,
+      "physical_time_field": null,
+      "dissipation_identifier": "implicit dense retained-row ID, verified by the user-supplied analyze(...,compact=False) producer contract",
+      "catalog_interpretation": "None is expected from the user-verified build_catalog=False producer; no catalog records to join",
+      "dissipation_has_same_dense_row_count": true,
+      "dissipation_order_verified_by_producer_contract": true,
+      "dissipation_order_independently_serialized": false
+    },
+    {
+      "timestep": 785,
+      "files": {
+        "catalog": "/Users/byeongyeonghwan/NC_shock/catalog_00785.pkl",
+        "dissipation": "/Users/byeongyeonghwan/NC_shock/dissipation_00785.pkl",
+        "result": "/Users/byeongyeonghwan/NC_shock/result_00785.pkl"
+      },
+      "objects": {
+        "result": {
+          "type": "shocktest.core.ShockResult",
+          "file_bytes": 34945824281,
+          "fields": {
+            "mach": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 195
+            },
+            "shock": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288808448,
+              "payload_offset": 2310467868
+            },
+            "center_index": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 2599276410
+            },
+            "upstream_index": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 3754510264
+            },
+            "downstream_index": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 4909744120
+            },
+            "selected_indices": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 6064977976
+            },
+            "pos": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448,
+                3
+              ],
+              "dtype": "<f8",
+              "order": "F",
+              "payload_bytes": 6931402752,
+              "payload_offset": 7220211825
+            },
+            "dx": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 14151614627
+            },
+            "normal": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448,
+                3
+              ],
+              "dtype": "<f8",
+              "order": "F",
+              "payload_bytes": 6931402752,
+              "payload_offset": 16462082271
+            },
+            "level": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<i4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 23393485076
+            },
+            "zone_width": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 24548718926
+            },
+            "diagnostics": {
+              "type": "dict",
+              "value": {
+                "center_step_limit": 0,
+                "upstream_missing_neighbor": 74315,
+                "upstream_step_limit": 190,
+                "downstream_missing_neighbor": 41338,
+                "downstream_step_limit": 56,
+                "candidate_exit": 5158739,
+                "thermodynamic_exit": 43214450,
+                "nonconverging_exit": 21403939,
+                "invalid_jump": 23673985,
+                "mach_rejected": 9139087
+              }
+            },
+            "mach_temperature": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 195
+            },
+            "mach_pressure": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 26859186897
+            },
+            "mach_density": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 28014420749
+            },
+            "temperature_ratio": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 29169654606
+            },
+            "pressure_ratio": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 30324888460
+            },
+            "density_ratio": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f4",
+              "order": "C",
+              "payload_bytes": 1155233792,
+              "payload_offset": 31480122313
+            },
+            "pressure_check_valid": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288808448,
+              "payload_offset": 32635356173
+            },
+            "pressure_consistent": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288808448,
+              "payload_offset": 32924164688
+            },
+            "density_check_valid": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288808448,
+              "payload_offset": 33212973203
+            },
+            "density_consistent": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288808448,
+              "payload_offset": 33501781717
+            },
+            "density_check_applicable": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288808448,
+              "payload_offset": 33790590237
+            },
+            "mach_consistent": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "|b1",
+              "order": "C",
+              "payload_bytes": 288808448,
+              "payload_offset": 34079398748
+            },
+            "mach_validation_status": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<u2",
+              "order": "C",
+              "payload_bytes": 577616896,
+              "payload_offset": 34368207300
+            },
+            "gamma": {
+              "type": "float",
+              "value": 1.6666666666666667
+            },
+            "temperature_floor": {
+              "type": "float",
+              "value": 10000.0
+            },
+            "position_unit": {
+              "type": "str",
+              "value": "km"
+            }
+          },
+          "embedded_snapshot_present": false
+        },
+        "dissipation": {
+          "type": "shocktest.pyShockFinder.DissipationResult",
+          "file_bytes": 11552338370,
+          "fields": {
+            "flux": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 210
+            },
+            "total": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 2310467847
+            },
+            "area": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 4620935483
+            },
+            "efficiency": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 6931403125
+            },
+            "sound_speed": {
+              "type": "numpy.ndarray",
+              "shape": [
+                288808448
+              ],
+              "dtype": "<f8",
+              "order": "C",
+              "payload_bytes": 2310467584,
+              "payload_offset": 9241870768
+            }
+          },
+          "embedded_snapshot_present": false
+        },
+        "catalog": {
+          "type": "builtins.NoneType",
+          "file_bytes": 4,
+          "fields": {},
+          "embedded_snapshot_present": false
+        }
+      },
+      "retained_cells": 288808448,
+      "detected_shocks": 2054795,
+      "center_ids_equal_retained_row": true,
+      "center_ids_unique_within_snapshot": true,
+      "negative_center_ids": false,
+      "center_id_min": 0,
+      "center_id_max": 288761311,
+      "result_measurement_sample": {
+        "sample_count": 1024,
+        "sampling": "evenly spaced accepted-center IDs",
+        "sample_valid_geometry_mach_dx": 1024,
+        "sample_normal_norm_min": 0.9999999999999998,
+        "sample_normal_norm_max": 1.0000000000000002,
+        "sample_normals_unit_within_tolerance": 1024,
+        "sample_mach_min": 1.3000445803617726,
+        "sample_mach_max": 14.905504866076887,
+        "sample_dx_min": 2638104744894142.0,
+        "sample_dx_max": 1.688387036732251e+17,
+        "sample_position_min": [
+          1.3787790638714745e+21,
+          1.3291826946674645e+21,
+          1.3548039679498765e+21
+        ],
+        "sample_position_max": [
+          1.4711760444566468e+21,
+          1.417991852799581e+21,
+          1.4468632711277023e+21
+        ],
+        "sample_level_min": 14,
+        "sample_level_max": 20,
+        "sample_endpoint_orientation": {
+          "tested": 1024,
+          "positive_upstream_to_downstream_projection": 1024,
+          "negative_projection": 0,
+          "zero_projection": 0,
+          "periodic_unwrapping_applied": false
+        }
+      },
+      "position_unit": "km",
+      "aexp_field": null,
+      "physical_time_field": null,
+      "dissipation_identifier": "implicit dense retained-row ID, verified by the user-supplied analyze(...,compact=False) producer contract",
+      "catalog_interpretation": "None is expected from the user-verified build_catalog=False producer; no catalog records to join",
+      "dissipation_has_same_dense_row_count": true,
+      "dissipation_order_verified_by_producer_contract": true,
+      "dissipation_order_independently_serialized": false
+    }
+  ],
+  "id_collisions": [
+    {
+      "snapshots": [
+        783,
+        785
+      ],
+      "repeated_center_ids": 23006,
+      "examples": [
+        54,
+        107,
+        146,
+        163,
+        172,
+        236,
+        263,
+        272,
+        457,
+        619
+      ]
+    }
+  ],
+  "blockers": [
+    "snapshot 783: scale factor and/or physical time metadata absent",
+    "snapshot 785: scale factor and/or physical time metadata absent",
+    "coordinate frame/origin and simulation periodic-box convention are not embedded; external metadata required",
+    "only the locally discovered snapshots can be inspected; full selected-range coverage must be checked on the input host"
+  ],
+  "scope": "shock-center AMR cell detections, not persistent material cells or aggregated shock objects",
+  "adopted_shock_id_field": "center_index",
+  "id_reference_convention": "(timestep << 32) | center_index",
+  "row_order_join_performed": false,
+  "tree_created": false,
+  "repository_conventions_not_file_metadata": {
+    "normal": "unit temperature-gradient vector, upstream toward downstream; signed cosine must be retained",
+    "position": "ShockFinder uses cell positions in result.position_unit; physical/comoving frame and extraction origin not serialized",
+    "boundary": "repository uses open boundaries for extracted regions; this does not establish the NewCluster periodic box",
+    "dissipation_units": {
+      "flux": "erg/s/kpc2",
+      "total": "erg/s",
+      "area": "kpc2",
+      "efficiency": "dimensionless",
+      "sound_speed": "km/s"
+    },
+    "dissipation_order": "compute_dissipation allocates the same retained-row space as result; the saved files lack a row-ID table or source fingerprint",
+    "shock_id_alias": "user authorized preserving existing result.center_index values in shock_id and (timestep<<32)|center_index in reference fields",
+    "prediction": "upstream velocity is not stored; M*sound_speed cannot establish simulation-frame propagation"
+  }
+}
