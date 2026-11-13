@@ -11,8 +11,9 @@ from . import _profile_geometry
 NATIVE_MODEL = getattr(_profile_geometry, 'profile_model_kernel', None)
 if NATIVE_MODEL is not None and (
         not hasattr(NATIVE_MODEL, 'upstream_policy_version') or
-        NATIVE_MODEL.upstream_policy_version() != 2):
-    raise RuntimeError('Rebuild the v0.6.2 native profile extension before running detection')
+        not hasattr(NATIVE_MODEL, 'pair_support_batch') or
+        NATIVE_MODEL.upstream_policy_version() != 3):
+    raise RuntimeError('Rebuild the v0.6.3 native profile extension before running detection')
 
 DIAGNOSTICS = Counter()
 
@@ -70,12 +71,15 @@ def pressure_mach(ratio, gamma=GAMMA):
 
 
 def upstream_state_errors(s, states, first, last, orders, center, upstream):
-    """Bound upstream model sensitivity at the adopted surface, using fit data.
+    """Evaluate one-sided model sensitivity at the adopted surface.
 
     Returns an error in log density and a relative pressure error. These are
     deterministic sensitivity bounds, not statistical confidence intervals.
     The alternative polynomial and the amplification of the measured fitting
     residual both matter: a small residual far from the surface is insufficient.
+    The historical function name is retained for native ABI compatibility;
+    the same operation is used on both sides. Constant density uses relative
+    spread, while nonconstant density uses log-density sensitivity.
     No additional mesh samples or extra nonlinear fits are needed.
     """
     if hasattr(NATIVE_MODEL, 'upstream_state_errors'):
@@ -121,7 +125,8 @@ def upstream_admissible(error):
 
 
 def reconstruct_batch(s, states, velocities, widths, normals, tolerance=0.01,
-                      closure_tolerance=0.15, gamma=GAMMA):
+                      closure_tolerance=0.15, gamma=GAMMA, *, _validate_downstream=True,
+                      _provisional=False):
     """Batch native work; preserve reference selection and difficult-profile fallback."""
     result = [None] * len(states)
     full = (np.isfinite(states).all(axis=(1,2)) & (states > 0).all(axis=(1,2))
@@ -130,7 +135,8 @@ def reconstruct_batch(s, states, velocities, widths, normals, tolerance=0.01,
         full[:] = False
     for j in np.flatnonzero(~full):
         result[j] = reconstruct(s,states[j],velocities[j],widths[j],np.zeros(3),
-                                normals[j],1.0,tolerance,closure_tolerance,gamma=gamma)
+                                normals[j],1.0,tolerance,closure_tolerance,gamma=gamma,
+                                _validate_downstream=_validate_downstream, _provisional=_provisional)
     rows = np.flatnonzero(full)
     if not len(rows):
         return result
@@ -159,7 +165,11 @@ def reconstruct_batch(s, states, velocities, widths, normals, tolerance=0.01,
         s,np.asfortranarray(states[selected].transpose(1,2,0)),
         np.asfortranarray(velocities[selected].T),np.asfortranarray(widths[selected].T),
         np.asfortranarray(derivative[use].T),peaks[use]+1,slopes[use],tolerance,1.0,
-        gamma,closure_tolerance,native_basis(len(s)),XG,WG)
+        gamma,closure_tolerance,native_basis(len(s)),XG,WG,0)
+    support = NATIVE_MODEL.pair_support_batch(
+        s, np.asfortranarray(states[selected].transpose(1,2,0)), native[0],
+        native[2], native[4], native[6], native[7], native_basis(len(s)), int(not _provisional))
+    native = (*native, support)
     for k,j in enumerate(use):
         item=tuple(a[...,k] for a in native)
         if not item[5].all():
@@ -169,7 +179,8 @@ def reconstruct_batch(s, states, velocities, widths, normals, tolerance=0.01,
         original=int(rows[j])
         result[original]=reconstruct(s,states[original],velocities[original],widths[original],
             np.zeros(3),normals[original],1.0,tolerance,closure_tolerance,gamma=gamma,
-            _prepared=(derivative[j],int(peaks[j]),float(slopes[j]),item))
+            _prepared=(derivative[j],int(peaks[j]),float(slopes[j]),item),
+            _validate_downstream=_validate_downstream, _provisional=_provisional)
     return result
 
 
@@ -186,7 +197,12 @@ def reconstruct(
     fixed_center=None,
     gamma=GAMMA,
     _prepared=None,
+    _recovery=False,
+    _validate_downstream=True,
+    _provisional=False,
 ):
+    if _provisional and _validate_downstream:
+        raise ValueError('Provisional center iterations cannot validate final downstream states')
     good = (
         np.isfinite(states).all(axis=1) & np.isfinite(velocities) & np.isfinite(widths)
     )
@@ -272,7 +288,7 @@ def reconstruct(
                 at = sum(beta[k] * target**k for k in range(degree + 1))
                 next_at = sum(higher[k] * target**k for k in range(degree + 2))
                 uncertainty = abs(next_at - at) / denominator
-                if res <= tolerance and (side < 0 or uncertainty <= tolerance or degree == 2):
+                if res <= tolerance and (_recovery or side < 0 or uncertainty <= tolerance or degree == 2):
                     choice = (
                         physical(beta, center, scale),
                         min(max(res, uncertainty), 1.0),
@@ -308,7 +324,7 @@ def reconstruct(
                 continue
             if s[ix[-1]] - s[ix[0]] + step / 2 < 2 * widths[ix].max():
                 continue
-            if side > 0 and len(result) >= 4 and np.any(
+            if not _recovery and side > 0 and len(result) >= 4 and np.any(
                 np.ptp(states[ix], axis=0) / states[ix].mean(axis=0) > tolerance
             ):
                 continue
@@ -319,19 +335,17 @@ def reconstruct(
                 if sum(not r[3].any() for r in result) >= 2:
                     break
         # Keep four nearby models, plus two stable alternatives on existing
-        # samples. Lower-order upstream fits are tried before adding curvature.
-        flat = [r for r in result if not r[3].any()]
+        # samples. Both sides prefer lower-order, supported alternatives.
         chosen = result[:4]
-        alternatives = flat[:2]
-        if side < 0:
-            def rank(r):
-                ix, coeff, _, orders, _ = r
-                up = np.array([density_at(coeff[0], s[peak]), value(coeff[1], s[peak])])
-                error = upstream_state_errors(s, states, int(ix[0]), int(ix[-1]),
-                                              orders, s[peak], up) if (up > 0).all() else np.full(2, np.inf)
-                return (not upstream_admissible(error), int(max(orders)),
-                        float(np.sum(error)), -int(ix[0]))
-            alternatives = sorted((r for r in result[4:]), key=rank)[:2]
+        def rank(r):
+            ix, coeff, _, orders, _ = r
+            state = np.array([density_at(coeff[0], s[peak]), value(coeff[1], s[peak])])
+            error = upstream_state_errors(s, states, int(ix[0]), int(ix[-1]),
+                                          orders, s[peak], state) if (state > 0).all() else np.full(2, np.inf)
+            return (not upstream_admissible(error), int(max(orders)),
+                    float(np.sum(error)), abs(float(s[ix].mean()-s[peak])))
+        alternatives = (sorted((r for r in result[4:]), key=rank)[:2]
+                        if side < 0 or _recovery else [r for r in result if not r[3].any()][:2])
         for r in alternatives:
             if all(r is not q for q in chosen):
                 chosen.append(r)
@@ -342,7 +356,7 @@ def reconstruct(
             if _prepared is None:
                 coeff,vel,orders,errors,bounds,count = NATIVE_MODEL.fit_windows(
                     s, states, velocities, widths, int(peak)+1, side, pressure_slope,
-                    tolerance, seed_width, native_basis(len(s)))
+                    tolerance, seed_width, native_basis(len(s)), int(_recovery))
             else:
                 k = 0 if side < 0 else 1
                 coeff,vel,orders,errors,bounds = [a[...,k] for a in native[:5]]
@@ -413,8 +427,10 @@ def reconstruct(
         down = np.array([density_at(cr[0], center), value(cr[1], center)])
         if not np.isfinite([*up, *down]).all() or np.min([*up, *down]) <= 0:
             continue
-        support_error = upstream_state_errors(
-            s, states, int(il[0]), int(il[-1]), ol, center, up)
+        support_error = (native[8][:,0,li,ri].copy() if _prepared is not None and fixed_center is None
+                         else upstream_state_errors(s, states, int(il[0]), int(il[-1]), ol, center, up))
+        if _prepared is not None and (abs(support_error[0]-tolerance)<1e-10 or abs(support_error[1]-tolerance)<1e-10 or abs(support_error[1]-1)<1e-10):
+            support_error = upstream_state_errors(s, states, int(il[0]), int(il[-1]), ol, center, up)
         if not upstream_admissible(support_error):
             continue
         r = down[0] / up[0]
@@ -440,6 +456,12 @@ def reconstruct(
         # Density is a QUALITY SCORE, not a hard veto on unresolved Sedov peaks.
         if vl <= vr or dv > closure_tolerance:
             continue
+        downstream_error = None
+        if not _provisional:
+            downstream_error = (native[8][:,1,li,ri].copy() if _prepared is not None and fixed_center is None
+                                else upstream_state_errors(s, states, int(ir[0]), int(ir[-1]), orr, center, down))
+            if _prepared is not None and (abs(downstream_error[0]-tolerance)<1e-10 or abs(downstream_error[1]-tolerance)<1e-10 or abs(downstream_error[1]-1)<1e-10):
+                downstream_error = upstream_state_errors(s, states, int(ir[0]), int(ir[-1]), orr, center, down)
         quality = dr * dr + dv * dv + errl * errl + errr * errr
         candidates.append(
             dict(
@@ -453,6 +475,9 @@ def reconstruct(
                 upstream_state_error=support_error,
                 upstream_reliable=bool(np.all(support_error <= tolerance)),
                 upstream_alternative=bool(li >= 4),
+                downstream_state_error=downstream_error,
+                downstream_reliable=bool(downstream_error is not None and np.all(downstream_error <= tolerance)),
+                downstream_alternative=bool(ri >= 4),
                 entropy_ratio=float(entropy),
                 entropy_margin=float(np.log(entropy) / max((1+gamma)*(errl+errr),1e-30)),
                 normal_velocity=np.array([vl,vr]),
@@ -472,13 +497,59 @@ def reconstruct(
     flat = [r for r in candidates if not r["orders"].any()]
     family = flat or candidates
     reliable = [r for r in family if r['upstream_reliable']]
-    family = reliable or family
-    best = min(family, key=lambda r: r["quality"])
+    preferred = reliable or family
+    initial = min(preferred, key=lambda r: r['quality'])
+    # Preserve supported primary measurements. When the primary pressure is
+    # unsupported, prefer direct pressure support over density-closure ranking;
+    # density peaks are often unresolved in curved strong shocks.
+    if _validate_downstream:
+        family = [r for r in family if upstream_admissible(r['downstream_state_error'])]
+    if not family:
+        if not _recovery:
+            return reconstruct(s, states, velocities, widths, anchor, normal, seed_width,
+                               tolerance, closure_tolerance, fixed_center, gamma, _recovery=True)
+        return fail("unsupported_downstream")
+    admissible = family
+    if not _validate_downstream or upstream_admissible(initial['downstream_state_error']):
+        reliable = [r for r in family if r['upstream_reliable']]
+        family = reliable or family
+        best = min(family, key=lambda r: r['quality'])
+    else:
+        best = min(family, key=lambda r: (max(r['upstream_state_error'][1],
+                                             r['downstream_state_error'][1]), r['quality']))
+    if _provisional:
+        # The first pass only moves the center. No final diagnostics or state
+        # sensitivity arrays escape this pass; its primary offset is identical.
+        return dict(offset=best['offset'])
+    if _prepared is not None:
+        # Save the authoritative diagnostics evaluated with the exact adopted
+        # NumPy states; this also preserves scalar/batch bitwise output.
+        il,ir=best['background_indices'];ol,orr=best['orders'][:2],best['orders'][2:]
+        best['upstream_state_error']=upstream_state_errors(s,states,int(il[0]),int(il[-1]),ol,best['offset'],best['upstream'])
+        best['downstream_state_error']=upstream_state_errors(s,states,int(ir[0]),int(ir[-1]),orr,best['offset'],best['downstream'])
+        best['upstream_reliable']=bool(np.all(best['upstream_state_error']<=tolerance))
+        best['downstream_reliable']=bool(np.all(best['downstream_state_error']<=tolerance))
+    # Intermediate center iterations may retain an unsupported primary model.
+    # Their ranges are never exported. Final ranges omit unsupported pairs even
+    # when the accepted primary was obtained without a recovery call.
+    supported = [r for r in admissible if upstream_admissible(r['downstream_state_error'])]
+    if supported and upstream_admissible(best['downstream_state_error']):
+        admissible = supported
+        family = [r for r in family if upstream_admissible(r['downstream_state_error'])]
     # Ranges are conditional on the resolved, physically admissible background
     # family. They are sensitivity diagnostics, NEVER statistical intervals.
     best['model_count'] = len(family)
     best['mach_range'] = np.array([min(f['mach'] for f in family),max(f['mach'] for f in family)])
     best['offset_range'] = np.array([min(f['offset'] for f in family),max(f['offset'] for f in family)])
+    best['admissible_mach_range'] = np.array([min(f['mach'] for f in admissible),max(f['mach'] for f in admissible)])
+    best['admissible_model_count'] = len(admissible)
+    best['downstream_recovered'] = bool(_recovery)
+    ep1 = best['upstream_state_error'][1]
+    ep2 = best['downstream_state_error'][1]
+    rp = best['downstream'][1] / best['upstream'][1]
+    best['pressure_ratio_range'] = np.array([max(0.,rp*(1-ep2)/(1+ep1)), rp*(1+ep2)/(1-ep1)])
+    best['mach_sensitivity_range'] = pressure_mach(best['pressure_ratio_range'], gamma)
+    best['pressure_jump_supported'] = bool(best['pressure_ratio_range'][0] > 1)
     up,down=best['upstream'],best['downstream']
     contrast=down[0]-up[0]
     best['center_sensitivity'] = float(np.diff(best['window'])[0] *
@@ -496,4 +567,10 @@ def reconstruct(
     h2=gamma/(gamma-1)*down[1]/down[0]
     kinetic=.5*(w1*w1-w2*w2)
     best['energy_residual']=float(abs(h1-h2+kinetic)/max(abs(h1-h2),abs(kinetic),gamma*up[1]/up[0],1e-30))
+    best['flow_mach'] = np.array([w1/np.sqrt(gamma*up[1]/up[0]),
+                                  w2/np.sqrt(gamma*down[1]/down[0])])
+    best['rh_compatible'] = bool(
+        best['flow_mach'][0] > 1 and 0 < best['flow_mach'][1] < 1
+        and max(best[k] for k in ('density_residual','velocity_residual',
+                                  'momentum_residual','energy_residual')) <= closure_tolerance)
     return best

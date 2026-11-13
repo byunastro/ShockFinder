@@ -427,7 +427,7 @@ module profile_model_kernel
   implicit none
 contains
   integer function upstream_policy_version() result(version)
-    version=2
+    version=3
   end function
 
   recursive real(8) function pairwise_sum(a,n) result(v)
@@ -524,11 +524,11 @@ contains
     enddo
   end subroutine
 
-  subroutine screen_one(s,states,u,widths,derivative,peak,slope,tol,seed,gamma,closure,pinv,xg,wg,n, &
+  subroutine screen_one(s,states,u,widths,derivative,peak,slope,tol,seed,gamma,closure,pinv,xg,wg,recovery,n, &
                         coeff,vel,orders,errors,bounds,counts,roots,possible)
     ! This kernel is deliberately a conservative rejection screen. Python
     ! repeats all original physical checks and selection for possible models.
-    integer,intent(in)::n,peak
+    integer,intent(in)::n,peak,recovery
     real(8),intent(in)::s(n),states(n,2),u(n),widths(n),derivative(n),slope,tol,seed,gamma,closure
     real(8),intent(in)::pinv(4,n,n,3),xg(8),wg(8)
     real(8),intent(out)::coeff(3,2,6,2),vel(3,6,2),errors(6,2),roots(6,6)
@@ -539,9 +539,9 @@ contains
     coeff=0;vel=0;errors=0;roots=0;orders=0;bounds=0;counts=0;possible=0
     if(peak<1.or.peak>n)return
     call fit_windows(s,states,u,widths,peak,-1,slope,tol,seed,pinv,n, &
-                     coeff(:,:,:,1),vel(:,:,1),orders(:,:,1),errors(:,1),bounds(:,:,1),counts(1))
+                     coeff(:,:,:,1),vel(:,:,1),orders(:,:,1),errors(:,1),bounds(:,:,1),counts(1),recovery)
     call fit_windows(s,states,u,widths,peak,1,slope,tol,seed,pinv,n, &
-                     coeff(:,:,:,2),vel(:,:,2),orders(:,:,2),errors(:,2),bounds(:,:,2),counts(2))
+                     coeff(:,:,:,2),vel(:,:,2),orders(:,:,2),errors(:,2),bounds(:,:,2),counts(2),recovery)
     do i=1,n-1
       terms(i)=(s(i+1)-s(i))*(states(i+1,1)+states(i,1))/2d0
     enddo
@@ -593,9 +593,9 @@ contains
     enddo
   end subroutine
 
-  subroutine screen_batch(s,states,u,widths,derivative,peaks,slopes,tol,seed,gamma,closure,pinv,xg,wg,n,nb, &
+  subroutine screen_batch(s,states,u,widths,derivative,peaks,slopes,tol,seed,gamma,closure,pinv,xg,wg,recovery,n,nb, &
                           coeff,vel,orders,errors,bounds,counts,roots,possible)
-    integer,intent(in)::n,nb,peaks(nb)
+    integer,intent(in)::n,nb,peaks(nb),recovery
     real(8),intent(in)::s(n),states(n,2,nb),u(n,nb),widths(n,nb),derivative(n,nb),slopes(nb)
     real(8),intent(in)::tol,seed,gamma,closure,pinv(4,n,n,3),xg(8),wg(8)
     real(8),intent(out)::coeff(3,2,6,2,nb),vel(3,6,2,nb),errors(6,2,nb),roots(6,6,nb)
@@ -605,8 +605,37 @@ contains
     !$omp parallel do private(j) schedule(dynamic,1) if(nb>=8)
     do j=1,nb
       call screen_one(s,states(:,:,j),u(:,j),widths(:,j),derivative(:,j),peaks(j),slopes(j), &
-          tol,seed,gamma,closure,pinv,xg,wg,n,coeff(:,:,:,:,j),vel(:,:,:,j),orders(:,:,:,j), &
+          tol,seed,gamma,closure,pinv,xg,wg,recovery,n,coeff(:,:,:,:,j),vel(:,:,:,j),orders(:,:,:,j), &
           errors(:,:,j),bounds(:,:,:,j),counts(:,j),roots(:,:,j),possible(:,:,j))
+    enddo
+    !$omp end parallel do
+  end subroutine
+
+  subroutine pair_support_batch(s,states,coeff,orders,bounds,roots,possible,pinv,downstream,n,nb,support)
+    ! Batch surface sensitivities avoid a Python/F2PY crossing for every pair.
+    integer,intent(in)::n,nb,orders(2,6,2,nb),bounds(2,6,2,nb),possible(6,6,nb),downstream
+    real(8),intent(in)::s(n),states(n,2,nb),coeff(3,2,6,2,nb),roots(6,6,nb),pinv(4,n,n,3)
+    real(8),intent(out)::support(2,2,6,6,nb)
+    real(8)::state(2),center
+    integer::j,l,r,side,k
+    support=ieee_value(0d0,ieee_positive_inf)
+    !$omp parallel do private(j,l,r,side,k,state,center) schedule(dynamic,1) if(nb>=8)
+    do j=1,nb
+      do l=1,6
+        do r=1,6
+          if(possible(l,r,j)==0)cycle
+          center=roots(l,r,j)
+          do side=1,1+downstream
+            k=l
+            if(side==2)k=r
+            state=[exp(max(-700d0,min(700d0,polynomial(coeff(:,1,k,side,j),center)))), &
+                   polynomial(coeff(:,2,k,side,j),center)]
+            if(.not.all(ieee_is_finite(state)).or.minval(state)<=0d0)cycle
+            call upstream_state_errors(s,states(:,:,j),bounds(1,k,side,j),bounds(2,k,side,j), &
+                orders(:,k,side,j),center,state,pinv,n,support(:,side,l,r,j))
+          enddo
+        enddo
+      enddo
     enddo
     !$omp end parallel do
   end subroutine
@@ -619,8 +648,8 @@ contains
   end subroutine
 
   subroutine fit_windows(s,states,u,widths,peak,side,slope,tol,seed,pinv,n, &
-                         coeff,vel,orders,errors,bounds,nfit)
-    integer,intent(in)::n,peak,side
+                         coeff,vel,orders,errors,bounds,nfit,recovery)
+    integer,intent(in)::n,peak,side,recovery
     real(8),intent(in)::s(n),states(n,2),u(n),widths(n),slope,tol,seed,pinv(4,n,n,3)
     real(8),intent(out)::coeff(3,2,6),vel(3,6),errors(6)
     integer,intent(out)::orders(2,6),bounds(2,6),nfit
@@ -645,7 +674,7 @@ contains
       endif
       if(first<1.or.final>n)goto 90
       if(s(final)-s(first)+step/2d0<2d0*maxval(widths(first:final)))goto 90
-      if(side>0.and.count>=4)then
+      if(recovery==0.and.side>0.and.count>=4)then
         do var=1,2
           if((maxval(states(first:final,var))-minval(states(first:final,var))) &
               /(sum(states(first:final,var))/nn)>tol)goto 90
@@ -700,7 +729,7 @@ contains
             nxt=nxt+higher(k)*target**(k-1)
           enddo
           unc=abs(nxt-at)/den
-          if(res<=tol.and.(side<0.or.unc<=tol.or.d==2))then
+          if(res<=tol.and.(recovery/=0.or.side<0.or.unc<=tol.or.d==2))then
             call physical(beta(1:3),ctr,scale,cs(:,var,count+1))
             os(var,count+1)=d;e(var)=min(max(res,unc),1d0)
             accepted=.true.;exit
@@ -729,7 +758,7 @@ contains
     do j=1,nc
       chosen(j)=j
     enddo
-    if(side<0)then
+    if(side<0.or.recovery/=0)then
       ! Rank already sampled alternatives by admissibility, then simplicity
       ! and extrapolation sensitivity. Retain two beyond the nearest four.
       do j=5,count
@@ -768,8 +797,7 @@ contains
       do j=1,count
         if(any(os(:,j)/=0))cycle
         flat=flat+1
-        duplicate=any(chosen(1:nc)==j)
-        if(.not.duplicate)then
+        if(.not.any(chosen(1:nc)==j))then
           nc=nc+1;chosen(nc)=j
         endif
         if(flat==2)exit

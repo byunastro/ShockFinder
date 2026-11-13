@@ -6,6 +6,7 @@ import numpy as np
 from .profile_geometry import make_geometry
 from ._profile_model import reconstruct
 from ._profile_model import basis
+from ._profile_model import upstream_admissible
 from .profile_quality import quality_flags
 from . import _profile_model as profile_model
 
@@ -207,7 +208,8 @@ def scan(context, finder, batch_starts=None, *, best=None, normal_cache=None):
             h, states, u, covering, vector_velocity, complete = profiles(ids, anchors, direction)
             batch_fits = profile_model.reconstruct_batch(
                 offsets, states, u, covering, direction, finder.sampling_tolerance,
-                0.15, gamma=finder.gamma)
+                0.15, gamma=finder.gamma, _validate_downstream=False,
+                _provisional=(iteration == 0))
             again = []
             for j in range(len(ids)):
                 fit = batch_fits[j]
@@ -223,6 +225,23 @@ def scan(context, finder, batch_starts=None, *, best=None, normal_cache=None):
                 consistent = np.allclose(
                     final_normal, direction[j], rtol=1e-12, atol=1e-12
                 )
+                # Assess downstream support at a converged surface, not at a
+                # transient seed position: premature recovery can redirect an
+                # otherwise accurate center/normal iteration.
+                if iteration >= 1 and consistent and not upstream_admissible(fit['downstream_state_error']):
+                    fit = reconstruct(offsets, states[j], u[j], covering[j],
+                                      np.zeros(3), direction[j], 1.0,
+                                      finder.sampling_tolerance, 0.15, gamma=finder.gamma)
+                    if fit is None:
+                        diagnostics['unsupported_downstream'] += 1
+                        continue
+                    point = anchors[j] + fit['offset'] * h[j] * direction[j]
+                    cell = geometry.locate(point[None, :])[0]
+                    final_normal = normal_at([cell])[0] if cell >= 0 else np.zeros(3)
+                    if cell < 0 or not np.any(final_normal):
+                        diagnostics['center_outside_or_undefined'] += 1
+                        continue
+                    consistent = np.allclose(final_normal, direction[j], rtol=1e-12, atol=1e-12)
                 if iteration == 5 and not consistent:
                     fit = reconstruct(
                         offsets,
@@ -268,6 +287,8 @@ def scan(context, finder, batch_starts=None, *, best=None, normal_cache=None):
                         passes=iteration + 1,
                         reference_width=float(h[j]),
                         support_pos=support,
+                        sampling_origin=anchors[j].copy(),
+                        sampling_cell_width=float(dx[ids[j]]),
                         endpoints=endpoints,
                         density=fit["upstream"][0] * density_scale,
                         temperature=fit["upstream"][1]
@@ -332,6 +353,11 @@ def finish(context, best, counts, derivative_cells):
     diagnostics['quality_clear_centers']=sum(f['quality_flags']==0 for f in best.values())
     diagnostics['upstream_sensitive_centers']=sum(not f['upstream_reliable'] for f in best.values())
     diagnostics['upstream_alternative_centers']=sum(f['upstream_alternative'] for f in best.values())
+    diagnostics['downstream_sensitive_centers']=sum(not f['downstream_reliable'] for f in best.values())
+    diagnostics['downstream_alternative_centers']=sum(f['downstream_alternative'] for f in best.values())
+    diagnostics['downstream_recovered_centers']=sum(f['downstream_recovered'] for f in best.values())
+    diagnostics['pressure_jump_uncertain_centers']=sum(not f['pressure_jump_supported'] for f in best.values())
+    diagnostics['rh_incompatible_centers']=sum(not f['rh_compatible'] for f in best.values())
     diagnostics['model_native']=int(profile_model.NATIVE_MODEL is not None)
     diagnostics['model_batch_native']=int(hasattr(profile_model.NATIVE_MODEL,'screen_batch'))
     diagnostics['derivative_cells'] = int(derivative_cells)

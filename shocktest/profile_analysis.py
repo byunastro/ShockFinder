@@ -32,6 +32,10 @@ def save_profiles(path, result, metadata=None):
     ):
         data[name] = s[name]
     for name in ('upstream_state_error','upstream_reliable','upstream_alternative',
+                 'downstream_state_error','downstream_reliable','downstream_alternative',
+                 'downstream_recovered','sampling_origin','sampling_cell_width','background_window_bounds',
+                 'pressure_ratio_range','mach_sensitivity_range','pressure_jump_supported',
+                 'flow_mach','rh_compatible','admissible_mach_range','admissible_model_count',
                  'velocity','entropy_margin','center_sensitivity','momentum_residual','energy_residual',
                  'shock_speed_mass','shock_speed_pressure','mach_model_range','center_model_range',
                  'background_model_count','profile_quality_flags','quality_clear'):
@@ -48,6 +52,7 @@ def save_profiles(path, result, metadata=None):
             mean_molecular_weight=result.mean_molecular_weight,
             profile_quality_definitions={flag.name:int(flag) for flag in ProfileQualityFlag},
             diagnostics=result.diagnostics,
+            measurement_info=getattr(result, 'measurement_info', None),
         ),
         default=lambda a: a.tolist() if isinstance(a, np.ndarray) else a.item(),
     )

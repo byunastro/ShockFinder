@@ -182,6 +182,10 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
                     raw_sampling['relative_temperature_change'][slots, side].copy())
         for name in ('support_pos','reference_width','density_residual','velocity_residual','upstream_state_error',
                      'upstream_reliable','upstream_alternative',
+                     'downstream_state_error','downstream_reliable','downstream_alternative',
+                     'downstream_recovered','sampling_origin','sampling_cell_width','background_window_bounds',
+                     'pressure_ratio_range','mach_sensitivity_range','pressure_jump_supported',
+                     'flow_mach','rh_compatible','admissible_mach_range','admissible_model_count',
                      'center_constraint_active','mass_surface_displacement','profile_passes',
                      'quality','background_orders','velocity','entropy_margin','center_sensitivity',
                      'momentum_residual','energy_residual','shock_speed_mass','shock_speed_pressure',
@@ -222,6 +226,7 @@ def compact_shocks(result, dissipation=None, catalog=None, *, labels=None, timin
         'counts': {'retained': result.mach.size, 'shock': len(rows),
                    'representative': representatives, 'groups': len(groups)},
         'diagnostics': dict(result.diagnostics or {}),
+        'measurement_info': getattr(result, 'measurement_info', None),
         'catalog': {'schema': 'front_dtype', 'bytes_per_row': 78} if catalog is not None else None,
     }
     if sampled is not None:

@@ -278,34 +278,64 @@ no listed diagnostic fired. It does not certify an ideal-gas EOS, physical
 coordinate conversion, completeness, or a galaxy crossing.
 
 Upstream reconstruction first uses a constant background when its spread is
-within `sampling_tolerance`, then a linear fit, and adds quadratic curvature
-only when needed to fit the sampled window. Four nearby windows and up to two
-stable alternative windows are retained, using the existing profile samples.
-For each nonconstant model, the estimator compares the fitted polynomial to
-the next degree and propagates measured fitting residuals through the absolute
-extrapolation weights. Constant models use their measured relative spread.
-At the adopted surface, the pressure must remain positive under this model
-perturbation: relative pressure sensitivity must be strictly below 1. This
-guards against cancellation to a nearly zero upstream pressure. The native
-screen and final checks use the same rule; no new mesh sampling pass is added.
+within `sampling_tolerance`, then linear and, when needed, quadratic fits.
+The primary downstream model retains the established linear/quadratic
+selection. At the final consistent center, **both** reconstructed pressures
+must remain positive under the measured fitting-residual amplification and
+next-degree model perturbation. `upstream_state_error` and
+`downstream_state_error` each have shape `(K,2)`: column 0 is log-density
+sensitivity (relative spread for a constant density model); column 1 is
+relative-pressure sensitivity. These are deterministic model-sensitivity
+indicators, not calibrated confidence intervals or truth labels.
 
-The fitting tolerance is a precision target, not a shock-existence condition.
-Models meeting it for both upstream sensitivities are preferred. If none do,
-an admissible fit may still identify a shock; it is retained with
-`ProfileQualityFlag.UPSTREAM_SENSITIVE` and `sampling['upstream_reliable']=False`.
-`sampling['upstream_alternative']` records use of an alternative window beyond
-the nearest four. These fields separate tentative detections from measurements
-meeting the upstream precision target. They do not prove shock origin or truth.
-`sampling['upstream_state_error']` has shape `(K,2)`, with log-density sensitivity
-in column 0 (relative spread for a constant density model) and relative-pressure
-sensitivity in column 1. These are model
-sensitivity bounds, not statistical confidence intervals or proof of a shock.
-The field is also retained in compact products and profile NPZ exports.
+Supported primary measurements keep their existing center and model priority.
+If a final downstream state is unsupported, other admissible primary pairs are
+considered by pressure support. If none is supported, a bounded recovery stage
+tries lower-order backgrounds and up to two stable downstream alternatives
+on the existing 97 profile samples. The mass surface and states are recomputed
+together, and the containing leaf and its normal are checked again. Testing
+this guard only after center/normal convergence avoids redirecting an accurate
+search because of a transient seed profile. Sensitivity evaluation and recovery fits reuse that tube. A changed final
+normal can require another existing reconstruction pass, within the same
+six-pass limit. No user-selectable detection method is introduced.
 
-This acceptance update can reuse prepared v0.6.0/v0.6.1 workspaces whose mesh,
-normalization, and candidate definitions are unchanged. Rerun detection to
-obtain updated centers and states: filtering an old result cannot recover
-alternative background models or previously rejected seed fits.
+The fitting tolerance is an optional state-sensitivity target, not a blanket
+shock-existence cut. `upstream_reliable` and `downstream_reliable` report that
+target independently; their quality flags are `UPSTREAM_SENSITIVE` and
+`DOWNSTREAM_SENSITIVE`. The corresponding `*_alternative` fields identify
+windows beyond the nearest four. `downstream_recovered` identifies the bounded
+lower-order recovery stage. `sampling_origin`, `sampling_cell_width`, and
+`background_window_bounds` retain the sampling geometry: the last field is
+`(K,2,2)` with signed along-normal distances from the fitted surface, in
+`position_unit`. Together with `reference_width` and `normal`, these permit
+reproducing the selected windows without guessing their extent.
+`result.measurement_info` records the detector version, measurement-source
+digest, and native binary hash; compact/NPZ metadata preserve the same identity.
+It does not replace input-snapshot provenance or a runtime environment manifest.
+
+`pressure_ratio_range` and `mach_sensitivity_range` propagate the two pressure
+sensitivities. `pressure_jump_supported=False` means the sensitivity enclosure
+includes a pressure ratio <=1; the raw tentative detection is retained, while
+the default analysis selection excludes it. These ranges do not bound all
+physical or reconstruction errors. `admissible_mach_range` / `admissible_model_count`
+record the supported pair family before upstream-precision preference;
+`mach_model_range` / `background_model_count` describe the final preferred
+family. Both are conditional on the finite searched windows and constant-pair
+preference, not exhaustive confidence intervals.
+
+`flow_mach` contains the upstream/downstream normal Mach numbers in the
+mass-defined shock frame. `rh_compatible` requires upstream supersonic and
+downstream subsonic flow and all four saved jump residuals <=0.15. It is a
+single ideal-gas model check, not an independent shock-truth test. A failure
+sets `RH_INCOMPATIBLE`; unresolved curved shocks and cooling/complex structures
+need separate interpretation. A small entropy signal sets `ENTROPY_UNCERTAIN`
+even when full dynamical closure permits retaining a weak shock.
+
+The v0.6.3 measurement revision can reuse audited prepared v0.6.0/v0.6.1/v0.6.2
+workspaces: mesh, normalization, and candidate definitions are unchanged.
+Rebuild native extensions and rerun detection to obtain the two-sided
+measurements and diagnostics. Filtering an old result cannot reconstruct
+missing downstream windows or recover previously rejected seeds.
 
 ```python
 from shocktest import ProfileQualityFlag, galaxy_pressure, valid_shock_rows
@@ -313,7 +343,11 @@ s = result.sampling
 rows = s['rows']
 clear_rows = rows[s['quality_clear']]  # Conservative diagnostic subset.
 upstream_sensitive_rows = rows[~s['upstream_reliable']]
-precision_rows = valid_shock_rows(result, require_upstream_reliable=True)
+precision_rows = valid_shock_rows(result, require_measurement_reliable=True)
+rh_rows = valid_shock_rows(result, require_rh_compatible=True)
+research_rows = valid_shock_rows(
+    result, require_measurement_reliable=True, require_rh_compatible=True,
+)
 uncertain = (s['profile_quality_flags'] & int(ProfileQualityFlag.ENTROPY_UNCERTAIN)) != 0
 # Gas and galaxy velocities MUST use the same physical frame and km/s.
 forcing = galaxy_pressure(s, galaxy_velocity, density_factor=1.0)  # g/cc input
@@ -455,22 +489,31 @@ projected quantity divided by pixel area, not total dissipated energy.
 An empty selection produces empty/NaN map pixels. To include all detected
 centers regardless of consistency, pass `valid_mach=result.shock` explicitly.
 
-For profile results, the automatic selection requires `entropy_margin > 1`
-(entropy production larger than the estimated background-model sensitivity,
-not a statistical significance), finite nonnegative jump residuals and a
-normal-velocity residual no larger than 0.15. Density, momentum and energy
-residuals must also be <=0.15 for Mach <=3. Strong-shock downstream density
-peaks can be unresolved even when the pressure Mach is accurate; applying
-these three vetoes at every Mach removed known coarse Sedov shocks in tests.
-Their values remain available as diagnostics at higher Mach.
-Saved `upstream_state_error` values must also be finite and nonnegative, with
-relative pressure sensitivity strictly below 1. Exceeding the upstream
-precision target does not automatically remove a detected shock. To require
-that precision explicitly, use
-`valid_shock_rows(result, require_upstream_reliable=True)` or pass the same
-keyword to `filter_shocks` / `shock_valid_mask`. Earlier v0.6.0 results lack
-the error field: their saved residuals can be checked, but upstream quality
-selection requires rerunning detection.
+For profile results, the automatic selection requires finite nonnegative
+jump residuals and a normal-velocity residual <=0.15. Density, momentum and
+energy residuals must also be <=0.15 for Mach <=3. The entropy criterion is
+`entropy_margin > 1`, **or** positive entropy with all four residuals <=0.15
+and upstream-supersonic/downstream-subsonic flow. This alternative retains
+weak jumps with consistent dynamics and a small entropy signal; the entropy
+uncertainty flag remains set. These conditions measure ideal-gas model
+consistency, not statistical significance or shock origin. Full closure is
+not a default veto at all Mach: unresolved strong-shock downstream density
+peaks can fail it even with an accurate pressure Mach.
+
+Saved one-sided errors must be finite and nonnegative with relative-pressure
+sensitivity <1 on both sides. When available, the pressure-ratio sensitivity
+range must remain above 1. Exceeding the 1% state-sensitivity target alone is
+not a default veto. `require_upstream_reliable=True` keeps its historical
+upstream-only meaning. `require_measurement_reliable=True` applies the fitting
+tolerance to both saved state sensitivities. `require_rh_compatible=True`
+checks all four residuals and sonic states at every Mach using the requested
+`closure_tolerance`. These quality selections can be combined in
+`valid_shock_rows`, `filter_shocks`, and `shock_valid_mask`.
+
+Archives receive only checks supported by their saved fields. Missing new
+diagnostics mean unknown quality, not a successful downstream check.
+Explicit two-sided or sonic quality selection raises an error if required
+fields are missing; rerun detection to obtain them.
 Historical temperature-jump results retain their saved Mach-consistency mask.
 Center/model sensitivity, bounded-normal, incomplete-tube and single-background
 flags are not automatically treated as vetoes.
@@ -511,8 +554,8 @@ selected_analysis = finder.analyze_result(
 dense measurements are shared, so do not edit them in-place. The original
 catalog describes the original detections and must not be reused as a filtered
 catalog. This selection cannot recover alternative backgrounds rejected by an
-earlier detector. Rebuild native extensions and rerun detection for the v0.6.2
-upstream-reconstruction change; unchanged prepared v0.6.0/v0.6.1 meshes remain reusable.
+earlier detector. Rebuild native extensions and rerun detection for the v0.6.3
+two-sided support/recovery change; unchanged audited prepared workspaces remain reusable.
 
 ### 5-2. Build a shock catalog and retrieve its members
 

@@ -374,6 +374,20 @@ class ShockFinder:
             'upstream_state_error':np.array([f['upstream_state_error'] for f in fits]).reshape(-1,2),
             'upstream_reliable':np.array([f['upstream_reliable'] for f in fits],dtype=bool),
             'upstream_alternative':np.array([f['upstream_alternative'] for f in fits],dtype=bool),
+            'downstream_state_error':np.array([f['downstream_state_error'] for f in fits]).reshape(-1,2),
+            'downstream_reliable':np.array([f['downstream_reliable'] for f in fits],dtype=bool),
+            'downstream_alternative':np.array([f['downstream_alternative'] for f in fits],dtype=bool),
+            'downstream_recovered':np.array([f['downstream_recovered'] for f in fits],dtype=bool),
+            'sampling_origin':np.array([f['sampling_origin'] for f in fits]).reshape(-1,3),
+            'sampling_cell_width':np.array([f['sampling_cell_width'] for f in fits]),
+            'background_window_bounds':np.array([(f['background_bounds']-f['offset'])*f['reference_width'] for f in fits]).reshape(-1,2,2),
+            'pressure_ratio_range':np.array([f['pressure_ratio_range'] for f in fits]).reshape(-1,2),
+            'mach_sensitivity_range':np.array([f['mach_sensitivity_range'] for f in fits]).reshape(-1,2),
+            'pressure_jump_supported':np.array([f['pressure_jump_supported'] for f in fits],dtype=bool),
+            'flow_mach':np.array([f['flow_mach'] for f in fits]).reshape(-1,2),
+            'rh_compatible':np.array([f['rh_compatible'] for f in fits],dtype=bool),
+            'admissible_mach_range':np.array([f['admissible_mach_range'] for f in fits]).reshape(-1,2),
+            'admissible_model_count':np.array([f['admissible_model_count'] for f in fits],dtype=np.int32),
             'center_constraint_active':np.array([f['center_constraint_active'] for f in fits],dtype=bool),
             'mass_surface_displacement':np.array([f['mass_surface_displacement']*f['reference_width'] for f in fits]),
             'profile_passes':np.array([f['passes'] for f in fits],dtype=np.int32),
@@ -396,6 +410,8 @@ class ShockFinder:
                            pos=arrays['pos'],center_position=positions,dx=arrays['dx'],normal=normal,
                            level=arrays['level'],zone_width=zone,sampling=sampling,diagnostics=diagnostics)
         result.gamma=float(self.gamma)
+        from ._native import measurement_metadata
+        result.measurement_info = dict(measurement_metadata())
         result.position_unit=self.position_unit;result.temperature_unit=self.temperature_unit
         result.density_unit=self.density_unit;result.sampling_tolerance=self.sampling_tolerance
         result.mach_estimator='profile_pressure'

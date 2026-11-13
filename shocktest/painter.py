@@ -47,9 +47,13 @@ def make_mach_map(
     The default ``method="amr"`` paints each projected AMR cell footprint into
     the image. ``method="point"`` keeps the older center-binning behavior.
     Profile results automatically use :func:`shocktest.valid_shock_rows`:
-    entropy_margin >1, velocity residual <=0.15, density/momentum/energy
-    residuals <=0.15 for Mach <=3, and saved upstream-state errors <=
-    sampling_tolerance when available. Historical results retain
+    entropy_margin >1 or positive entropy with full RH/sonic consistency,
+    velocity residual <=0.15, density/momentum/energy
+    residuals <=0.15 for Mach <=3, supported one-sided pressure estimates,
+    and a positive pressure jump throughout the two-sided sensitivity range
+    when saved. The fitting tolerance is an optional quality target, not a
+    default 1% veto. Archives receive only checks supported by saved fields.
+    Historical results retain
     their saved Mach-consistency selection. Pass ``valid_mach`` explicitly
     to override this display selection; ``result.shock`` shows all detections.
     Empty pixels are returned as NaN. Pass per-cell ``weights`` with

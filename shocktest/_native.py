@@ -8,12 +8,32 @@ import json
 import platform
 import sys
 import sysconfig
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 
 
 _EXTENSIONS = frozenset({"_shockfinder", "_merger_neighbors", "_profile_geometry"})
+
+
+@lru_cache(maxsize=1)
+def measurement_metadata():
+    """Fingerprint the installed measurement sources and loaded native build.
+
+    These identify the measurement implementation, not the input snapshot or
+    runtime environment. Keep the source tree fixed while a job is running.
+    """
+    from . import __version__
+    root = Path(__file__).parent
+    names = ('core.py', 'profile_quality.py', 'profile_reconstruction.py',
+             '_profile_model.py', 'profile_geometry.py', 'fortran/profile_geometry.f90')
+    digest = hashlib.sha256(b''.join((root / name).read_bytes() for name in names)).hexdigest()
+    module = sys.modules.get('shocktest._profile_geometry')
+    binary = Path(module.__file__) if module is not None else None
+    return dict(version=__version__, measurement_digest=digest,
+                selection_digest=hashlib.sha256((root / 'selection.py').read_bytes()).hexdigest(),
+                native_sha256=hashlib.sha256(binary.read_bytes()).hexdigest() if binary else None)
 
 
 def extension_directory() -> Path:

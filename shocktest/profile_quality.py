@@ -15,6 +15,9 @@ class ProfileQualityFlag(IntFlag):
     INCOMPLETE_TUBE = 128
     SINGLE_BACKGROUND = 256
     UPSTREAM_SENSITIVE = 512
+    DOWNSTREAM_SENSITIVE = 1024
+    PRESSURE_JUMP_UNCERTAIN = 2048
+    RH_INCOMPATIBLE = 4096
 
 
 def quality_flags(fit, full_tube=True):
@@ -30,6 +33,9 @@ def quality_flags(fit, full_tube=True):
     if not full_tube: flag |= ProfileQualityFlag.INCOMPLETE_TUBE
     if fit['model_count'] < 2: flag |= ProfileQualityFlag.SINGLE_BACKGROUND
     if not fit.get('upstream_reliable', True): flag |= ProfileQualityFlag.UPSTREAM_SENSITIVE
+    if not fit.get('downstream_reliable', True): flag |= ProfileQualityFlag.DOWNSTREAM_SENSITIVE
+    if not fit.get('pressure_jump_supported', True): flag |= ProfileQualityFlag.PRESSURE_JUMP_UNCERTAIN
+    if not fit.get('rh_compatible', True): flag |= ProfileQualityFlag.RH_INCOMPATIBLE
     return int(flag)
 
 
