@@ -490,15 +490,38 @@ An empty selection produces empty/NaN map pixels. To include all detected
 centers regardless of consistency, pass `valid_mach=result.shock` explicitly.
 
 For profile results, the automatic selection requires finite nonnegative
-jump residuals and a normal-velocity residual <=0.15. Density, momentum and
-energy residuals must also be <=0.15 for Mach <=3. The entropy criterion is
+jump residuals and a normal-velocity residual <=0.15. The same evidence rule
+applies at every Mach; there is no default switch at Mach 3. The entropy criterion is
 `entropy_margin > 1`, **or** positive entropy with all four residuals <=0.15
 and upstream-supersonic/downstream-subsonic flow. This alternative retains
 weak jumps with consistent dynamics and a small entropy signal; the entropy
 uncertainty flag remains set. These conditions measure ideal-gas model
-consistency, not statistical significance or shock origin. Full closure is
-not a default veto at all Mach: unresolved strong-shock downstream density
-peaks can fail it even with an accurate pressure Mach.
+consistency, not statistical significance or shock origin. When the entropy
+signal exceeds its background-model sensitivity, density/momentum/energy
+residuals remain model-quality diagnostics. Unresolved downstream density
+peaks can fail these checks even with an accurate pressure Mach. This default
+is a shock-evidence sample, not a guarantee of precise thermodynamic states
+or of a single steady adiabatic shock. Use the explicit RH/measurement-quality
+subsets below when the research quantity requires those assumptions.
+
+The density jump approaches `(gamma+1)/(gamma-1)` continuously at high Mach;
+there is no physical transition at Mach 3.
+[Schaal et al. (2016, Section 2.3)](https://doi.org/10.1093/mnras/stw1587)
+restrict a density-inferred Mach
+comparison because of this saturation. That does not justify switching all
+momentum/energy residual checks at the same Mach. Version 0.6.4 removes that
+switch while retaining pressure support, velocity closure, and the entropy
+or full-RH/sonic evidence requirement. The 0.15 residual tolerance remains
+an empirical numerical tolerance, not a physical constant.
+
+Re-selecting 38 archived planar/AMR/Sedov outputs preserved the v0.6.3
+selected centers and error metrics. In 384 additional manufactured positive
+profiles, the number retained within 10% Mach error increased from 304 to 309;
+the conditional thermalization-flux error P95 increased from 23.8% to 27.7%.
+No detections passed the selection in 364 manufactured negative controls.
+These finite tests support a coverage/precision trade-off; they do not
+calibrate the false-positive rate in cosmological flows or guarantee precise
+fluxes for every selected center.
 
 Saved one-sided errors must be finite and nonnegative with relative-pressure
 sensitivity <1 on both sides. When available, the pressure-ratio sensitivity
@@ -517,7 +540,7 @@ fields are missing; rerun detection to obtain them.
 Historical temperature-jump results retain their saved Mach-consistency mask.
 Center/model sensitivity, bounded-normal, incomplete-tube and single-background
 flags are not automatically treated as vetoes.
-This is a consistent-measurement subset, not a guarantee of a physical shock
+This is a shock-evidence subset, not a guarantee of a physical shock
 or a complete census of shocks; coarse or curved real shocks may fail.
 
 The maps do not modify the raw result, dissipation arrays, catalog, or labels.
@@ -538,7 +561,17 @@ For a different residual tolerance, pass an explicit mask to both maps, e.g.
 `valid_mach=shocktest.shock_valid_mask(result, closure_tolerance=0.3)`, and use
 the same tolerance in `valid_shock_rows` for matching statistics.
 For strict density/momentum/energy checks at all Mach numbers, set
-`closure_max_mach=None` in these helpers. The default is `3.0`.
+`closure_max_mach=None` in these helpers. The default is `1.0`, which applies
+no additional Mach-gated closure veto to supersonic detections. Explicit
+`closure_max_mach=3.0` reproduces the v0.6.3 analysis policy for comparison.
+Prefer `require_rh_compatible=True` for a full RH/sonic quality subset.
+
+The v0.6.4 update changes Python analysis selection only. Existing v0.6.3
+results can use it immediately after updating the package; neither native
+rebuilding nor rerunning detection is needed. Maps use the installed selection
+policy, even when the archive's measurement metadata records an earlier policy.
+Record the installed version/selection and rebuild catalogs from the same
+selected rows for reproducible comparisons.
 
 To apply this selection before rebuilding a catalog without rerunning detection:
 

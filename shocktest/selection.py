@@ -9,7 +9,7 @@ import numpy as np
 
 
 def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
-                     closure_max_mach=3.0, require_upstream_reliable=False,
+                     closure_max_mach=1.0, require_upstream_reliable=False,
                      require_measurement_reliable=False, require_rh_compatible=False):
     """Return selected retained-row indices, in ascending order.
 
@@ -18,10 +18,14 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
     The latter preserves weak jumps with consistent dynamics but a small entropy
     signal. Archives without sonic diagnostics retain the entropy-margin check.
     All results require finite nonnegative residuals and velocity residual <=0.15.
-    Density/momentum/energy residuals must also be <=0.15 for Mach <=3;
-    unresolved strong-shock downstream peaks can fail these diagnostics even
-    with an accurate pressure Mach. Set closure_max_mach=None to enforce them
-    at every Mach. Saved upstream-state errors must be finite and nonnegative;
+    No additional density/momentum/energy veto changes at Mach 3. These
+    residuals are required for the weak-entropy alternative and are otherwise
+    model-quality diagnostics: unresolved downstream peaks can fail them even
+    with an accurate pressure Mach. The compatibility parameter
+    closure_max_mach=1.0 applies no extra gate to supersonic detections;
+    3.0 reproduces the v0.6.3 gate, and None enforces those residuals at every
+    Mach. require_rh_compatible additionally requires sonic states at every
+    Mach. Saved upstream-state errors must be finite and nonnegative;
     relative pressure sensitivity must be <1 (no pressure cancellation).
     A 1% upstream precision target is not a default shock-existence veto.
     New measurements also require supported downstream pressure and a positive
@@ -68,8 +72,8 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
                 np.any(rows[1:] <= rows[:-1])):
             raise ValueError('sampling rows must be sorted unique retained-row indices')
         keep = shock[rows] & np.isfinite(mach[rows]) & (mach[rows] >= min_mach)
-        weak = (np.ones(len(rows), dtype=bool) if closure_max_mach is None or require_rh_compatible
-                else mach[rows] <= closure_max_mach)
+        closure_required = (np.ones(len(rows), dtype=bool) if closure_max_mach is None or require_rh_compatible
+                            else mach[rows] <= closure_max_mach)
         if 'entropy_margin' not in sampling:
             raise ValueError('Profile selection requires sampling[\'entropy_margin\']')
         entropy = np.asarray(sampling['entropy_margin'])
@@ -87,7 +91,7 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
             keep &= np.isfinite(residual) & (residual >= 0)
             rh &= np.isfinite(residual) & (residual >= 0) & (residual <= closure_tolerance)
             keep &= ((residual <= closure_tolerance) if name == 'velocity_residual'
-                     else (~weak | (residual <= closure_tolerance)))
+                     else (~closure_required | (residual <= closure_tolerance)))
         if 'upstream_state_error' in sampling:
             error = np.asarray(sampling['upstream_state_error'])
             if error.shape != (len(rows), 2):
@@ -156,7 +160,7 @@ def valid_shock_rows(result, *, min_mach=1.0, closure_tolerance=0.15,
 
 
 def shock_valid_mask(result, *, min_mach=1.0, closure_tolerance=0.15,
-                     closure_max_mach=3.0, require_upstream_reliable=False,
+                     closure_max_mach=1.0, require_upstream_reliable=False,
                      require_measurement_reliable=False, require_rh_compatible=False):
     """Dense equivalent of valid_shock_rows; allocates one bool per result row.
 
@@ -173,7 +177,7 @@ def shock_valid_mask(result, *, min_mach=1.0, closure_tolerance=0.15,
 
 
 def filter_shocks(result, *, min_mach=1.0, closure_tolerance=0.15,
-                  closure_max_mach=3.0, require_upstream_reliable=False,
+                  closure_max_mach=1.0, require_upstream_reliable=False,
                   require_measurement_reliable=False, require_rh_compatible=False):
     """Create a selected result for catalog/analysis without rerunning detection.
 

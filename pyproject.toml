@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shocktest"
-version = "0.6.3"
+version = "0.6.4"
 description = "AMR shock detection with conservative local profile reconstruction."
 requires-python = ">=3.10"
 dependencies = ["numpy>=2.0", "scipy>=1.13"]
